@@ -309,7 +309,7 @@ public static class MetadataResolver
             if (GetReceiver(instruction) is not { } receiver || AllocatedType(receiver, definitions) is not { } allocatedType)
                 continue;
 
-            var constructor = candidates.FirstOrDefault(c => !c.IsStatic && c.Name == ".ctor" && ReferenceEquals(c.DeclaringType, allocatedType));
+            var constructor = ResolveConstructorForAllocatedType(candidates, allocatedType);
             if (constructor == null)
                 continue;
 
@@ -319,6 +319,20 @@ public static class MetadataResolver
         }
 
         return changed;
+    }
+
+    internal static MethodAnalysisContext? ResolveConstructorForAllocatedType(IReadOnlyList<MethodAnalysisContext> candidates, TypeAnalysisContext allocatedType)
+    {
+        var constructor = candidates.FirstOrDefault(c => !c.IsStatic && c.Name == ".ctor" && ReferenceEquals(c.DeclaringType, allocatedType));
+        if (constructor != null || allocatedType is not GenericInstanceTypeAnalysisContext { IsDelegate: true } delegateType)
+            return constructor;
+
+        var openConstructor = delegateType.GenericType.Methods.FirstOrDefault(method =>
+            !method.IsStatic
+            && method.Name == ".ctor"
+            && candidates.Any(candidate => ReferenceEquals(BaseMethodOf(candidate), method)));
+
+        return openConstructor?.MakeConcreteGenericMethod(delegateType.GenericArguments, []);
     }
 
     // Follow SSA copies from a local back to the Newobj that produced the value
