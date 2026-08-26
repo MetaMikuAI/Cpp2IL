@@ -34,7 +34,7 @@ public class Instruction : IOperand
     public bool IsFallThrough =>
         OpCode switch
         {
-            OpCode.Return or OpCode.Jump or OpCode.ConditionalJump or OpCode.IndirectJump or OpCode.Throw => false,
+            OpCode.Return or OpCode.Jump or OpCode.ConditionalJump or OpCode.IndirectJump or OpCode.Switch or OpCode.Throw => false,
             _ => true
         };
 
@@ -153,6 +153,8 @@ public class Instruction : IOperand
                 or OpCode.ShiftStack or OpCode.Not or OpCode.Negate
                 or OpCode.Newobj
                 => [_operands[1]],
+
+            OpCode.Switch => [_operands[0]],
 
             OpCode.Box => [_operands[2]],
 

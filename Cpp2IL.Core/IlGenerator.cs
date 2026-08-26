@@ -9,6 +9,7 @@ using AsmResolver.PE.DotNet.Cil;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
+using Cpp2IL.Core.Utils;
 using Cpp2IL.Core.Utils.AsmResolver;
 
 namespace Cpp2IL.Core;
@@ -52,6 +53,14 @@ public static class IlGenerator
         // Change branch targets to instructions
         foreach (var instruction in context.ControlFlowGraph!.Blocks.SelectMany(block => block.Instructions))
         {
+            if (instruction.OpCode == OpCode.Switch)
+            {
+                for (var i = 3; i < instruction.Operands.Count; i++)
+                    if (instruction.Operands[i] is Block switchTarget && switchTarget.Instructions.Count > 0)
+                        instruction.SetOperand(i, switchTarget.Instructions[0]);
+                continue;
+            }
+
             if (instruction.Operands.Count > 0 && instruction.Operands[0] is Block target)
             {
                 if (target.Instructions.Count > 0)
@@ -160,7 +169,7 @@ public static class IlGenerator
                 pendingBlockBranchFixups.Add((bridge, falseSuccessor));
             }
 
-            else if (lastInstruction.OpCode != OpCode.Jump && lastInstruction.OpCode != OpCode.Return && lastInstruction.OpCode != OpCode.IndirectJump)
+            else if (lastInstruction.OpCode is not (OpCode.Jump or OpCode.Return or OpCode.IndirectJump or OpCode.Switch))
             {
                 var successor = block.Successors.FirstOrDefault(s => s != context.ControlFlowGraph.ExitBlock);
                 if (successor == null) continue;
@@ -175,7 +184,16 @@ public static class IlGenerator
             var instruction = kvp.Key;
             var il = kvp.Value;
 
-            if (instruction.OpCode == OpCode.Jump || instruction.OpCode == OpCode.ConditionalJump)
+            if (instruction.OpCode == OpCode.Switch)
+            {
+                var targets = instruction.Operands.Skip(3)
+                    .Cast<Instruction>()
+                    .Select(target => (ICilLabel)new CilInstructionLabel(instructionMap[target][0]))
+                    .ToArray();
+                il.First(candidate => candidate.OpCode == CilOpCodes.Switch).Operand = targets.Skip(1).ToArray();
+                il.First(candidate => candidate.OpCode == CilOpCodes.Br).Operand = targets[0];
+            }
+            else if (instruction.OpCode == OpCode.Jump || instruction.OpCode == OpCode.ConditionalJump)
             {
                 var ilBranch = il.First(i => i.OpCode == CilOpCodes.Br || i.OpCode == CilOpCodes.Brtrue);
 
@@ -718,6 +736,12 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Call, writeLine);
                 break;
 
+            case OpCode.Switch:
+                LoadSwitchSelector(instruction, context, method, locals, writeLine);
+                instructions.Add(CilOpCodes.Switch, Array.Empty<ICilLabel>());
+                instructions.Add(CilOpCodes.Br, new CilInstructionLabel());
+                break;
+
             case OpCode.ShiftStack:
                 instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Stack shift: {instruction} (stack analysis should have removed these)"));
                 instructions.Add(CilOpCodes.Call, writeLine);
@@ -999,6 +1023,30 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Ldnull);
                 break;
         }
+    }
+
+    private static void LoadSwitchSelector(Instruction instruction, MethodAnalysisContext context, MethodDefinition method,
+        Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
+    {
+        var selector = instruction.Operands[0];
+        var offset = (int)((Immediate)instruction.Operands[1]).Value;
+        var size = (int)((Immediate)instruction.Operands[2]).Value;
+
+        if (selector is LocalVariable { Type: { IsValueType: true, IsEnumType: false } type } local
+            && TypeSizes.UnboxedSize(type, context.AppContext.Binary.PointerSizeBytes) != size)
+        {
+            var field = type.Fields.FirstOrDefault(candidate => !candidate.IsStatic
+                && candidate.BackingData?.FieldOffset == offset
+                && TypeSizes.UnboxedSize(candidate.FieldType, context.AppContext.Binary.PointerSizeBytes) == size);
+            if (field != null)
+            {
+                LoadLocal(local, method, locals);
+                method.CilMethodBody!.Instructions.Add(CilOpCodes.Ldfld, field.ToFieldDescriptor());
+                return;
+            }
+        }
+
+        LoadOperand(selector, method, locals, writeLine);
     }
     
     private static bool TryEmitExactTypeComparison(Instruction instruction, MethodDefinition method,

@@ -55,9 +55,29 @@ public class X86InstructionSet : Cpp2IlInstructionSet
     {
         var instructions = new List<ISIL.Instruction>();
         var addresses = new List<ulong>();
+        var machineInstructions = X86Utils.Iterate(context).ToList();
+        var switches = X86SwitchRecognizer.Find(context, machineInstructions);
 
-        foreach (var instruction in X86Utils.Iterate(context))
-            ConvertInstructionStatement(instruction, instructions, addresses, context);
+        for (var i = 0; i < machineInstructions.Count; i++)
+        {
+            if (switches.TryGetValue(i, out var dispatch))
+            {
+                addresses.Add(machineInstructions[i].IP);
+                var operands = new List<ISIL.IOperand>
+                {
+                    new ISIL.Register(null, X86Utils.GetRegisterName(dispatch.Selector)),
+                    Imm(0),
+                    Imm(dispatch.SelectorSize),
+                    Imm(dispatch.DefaultTarget)
+                };
+                operands.AddRange(dispatch.CaseTargets.Select(target => (ISIL.IOperand)Imm(target)));
+                instructions.Add(new ISIL.Instruction(instructions.Count, ISIL.OpCode.Switch, operands));
+                i = dispatch.EndIndex;
+                continue;
+            }
+
+            ConvertInstructionStatement(machineInstructions[i], instructions, addresses, context);
+        }
 
         // Add return if the function doesn't end with one already
         if (instructions.Count > 0 && instructions[^1].OpCode != ISIL.OpCode.Return)
@@ -76,6 +96,25 @@ public class X86InstructionSet : Cpp2IlInstructionSet
         for (var i = 0; i < instructions.Count; i++)
         {
             var instruction = instructions[i];
+
+            if (instruction.OpCode == ISIL.OpCode.Switch)
+            {
+                for (var operandIndex = 3; operandIndex < instruction.Operands.Count; operandIndex++)
+                {
+                    var switchTargetAddress = ((ISIL.Immediate)instruction.Operands[operandIndex]).UnsignedValue;
+                    var switchTargetIndex = addresses.FindIndex(address => address == switchTargetAddress);
+                    if (switchTargetIndex < 0)
+                    {
+                        instruction.OpCode = ISIL.OpCode.Invalid;
+                        instruction.SetOperands(new ISIL.StringLiteral($"Switch target not found in method: 0x{switchTargetAddress:X4}"));
+                        break;
+                    }
+
+                    instruction.SetOperand(operandIndex, instructions[switchTargetIndex]);
+                }
+
+                continue;
+            }
 
             if (instruction.OpCode != ISIL.OpCode.Jump && instruction.OpCode != ISIL.OpCode.ConditionalJump)
                 continue;

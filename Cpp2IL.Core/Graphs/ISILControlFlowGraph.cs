@@ -202,7 +202,7 @@ public class ISILControlFlowGraph
             if (block.Instructions.Count == 0)
             {
                 // jumps into the removed block must be retargeted, which needs an unambiguous successor
-                if (block.Successors.Count != 1 && HasJumpOperandTo(block))
+                if (block.Successors.Count != 1 && HasBranchOperandTo(block))
                     continue;
 
                 var jumpTarget = block.Successors.Count == 1 ? block.Successors[0] : null;
@@ -210,10 +210,8 @@ public class ISILControlFlowGraph
                 // Redirect predecessors to successors
                 foreach (var pred in block.Predecessors)
                 {
-                    if (pred.Instructions.Count > 0
-                        && pred.Instructions[^1] is { OpCode: OpCode.Jump or OpCode.ConditionalJump } jump
-                        && ReferenceEquals(jump.Operands[0], block))
-                        jump.SetOperand(0, jumpTarget!);
+                    if (pred.Instructions.Count > 0 && jumpTarget != null)
+                        RedirectBranchTarget(pred.Instructions[^1], block, jumpTarget);
 
                     pred.Successors.Remove(block);
                     foreach (var succ in block.Successors)
@@ -242,10 +240,22 @@ public class ISILControlFlowGraph
             Blocks.Remove(block);
     }
 
-    private bool HasJumpOperandTo(Block block) =>
+    private static void RedirectBranchTarget(Instruction branch, Block oldTarget, Block newTarget)
+    {
+        if (branch.OpCode is not (OpCode.Jump or OpCode.ConditionalJump or OpCode.Switch))
+            return;
+
+        var firstTarget = branch.OpCode == OpCode.Switch ? 3 : 0;
+        for (var i = firstTarget; i < branch.Operands.Count; i++)
+            if (ReferenceEquals(branch.Operands[i], oldTarget))
+                branch.SetOperand(i, newTarget);
+    }
+
+    private bool HasBranchOperandTo(Block block) =>
         block.Predecessors.Any(pred => pred.Instructions.Count > 0
-            && pred.Instructions[^1] is { OpCode: OpCode.Jump or OpCode.ConditionalJump } jump
-            && ReferenceEquals(jump.Operands[0], block));
+            && pred.Instructions[^1].OpCode is OpCode.Jump or OpCode.ConditionalJump or OpCode.Switch
+            && pred.Instructions[^1].Operands.Skip(pred.Instructions[^1].OpCode == OpCode.Switch ? 3 : 0)
+                .Any(operand => ReferenceEquals(operand, block)));
 
     public void BuildUseDefLists(HashSet<Instruction>? clobberingAddressTakes = null)
     {
@@ -373,6 +383,20 @@ public class ISILControlFlowGraph
 
                     break;
 
+                case OpCode.Switch:
+                    currentBlock.AddInstruction(instructions[i]);
+                    currentBlock.Dirty = true;
+                    currentBlock.CalculateBlockType();
+
+                    if (!isLast)
+                    {
+                        newBlock = new Block() { ID = idCounter++ };
+                        AddBlock(newBlock);
+                        currentBlock = newBlock;
+                    }
+
+                    break;
+
                 case OpCode.Call:
                 case OpCode.CallVoid:
                 case OpCode.Return:
@@ -411,7 +435,12 @@ public class ISILControlFlowGraph
         {
             var node = Blocks[index];
             if (node.Dirty)
-                FixBlock(node);
+            {
+                if (node.BlockType == BlockType.NWay)
+                    FixSwitchBlock(node);
+                else
+                    FixBlock(node);
+            }
         }
 
         // Connect blocks without successors to exit
@@ -424,9 +453,31 @@ public class ISILControlFlowGraph
         // Change branch targets to blocks
         foreach (var instruction in Blocks.SelectMany(block => block.Instructions))
         {
+            if (instruction.OpCode == OpCode.Switch)
+            {
+                for (var i = 3; i < instruction.Operands.Count; i++)
+                    if (instruction.Operands[i] is Instruction switchTarget)
+                        instruction.SetOperand(i, FindBlockByInstruction(switchTarget)!);
+                continue;
+            }
+
             if (instruction.Operands.Count > 0 && instruction.Operands[0] is Instruction target)
                 instruction.SetOperand(0, FindBlockByInstruction(target)!);
         }
+    }
+
+    private void FixSwitchBlock(Block block)
+    {
+        var targets = block.Instructions[^1].Operands.Skip(3).OfType<Instruction>().Distinct();
+
+        foreach (var target in targets)
+        {
+            var destination = FindBlockByInstruction(target);
+            if (destination != null)
+                AddDirectedEdge(block, SplitAndCreate(destination, destination.Instructions.IndexOf(target)));
+        }
+
+        block.Dirty = false;
     }
 
     private void FixBlock(Block block, bool removeJmp = false)

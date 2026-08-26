@@ -47,6 +47,9 @@ public enum OpCode
     /// <summary>Jumps to op 1</summary>
     IndirectJump,
 
+    /// <summary>Jumps to a case target selected by op 1; ops 2/3 describe its byte slice, op 4 is default, and the rest are cases</summary>
+    Switch,
+
     /// <summary><c>If op 2 is true, jumps to op 1</summary>
     ConditionalJump,
 
