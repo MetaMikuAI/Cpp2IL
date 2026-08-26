@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
@@ -221,6 +222,249 @@ public static class IlGenerator
             instructions.Add(CilOpCodes.Ldstr, Diagnostic("Warning: " + warning));
             instructions.Add(CilOpCodes.Call, writeLine);
         }
+
+        NormalizeDelegateConstruction(definition);
+        NormalizeLinqGenericInstantiations(definition);
+        NormalizeLambdaNullChecks(definition);
+    }
+
+    private static readonly HashSet<string> LinqMethodNames =
+    [
+        "Select", "Where", "Any", "All", "First", "FirstOrDefault", "Single", "SingleOrDefault", "Last", "LastOrDefault",
+        "Count", "Min", "Max", "Sum", "Average", "Contains", "ToArray", "ToList", "ElementAt", "ElementAtOrDefault",
+        "Skip", "Take", "Concat", "OrderBy", "OrderByDescending", "SelectMany"
+    ];
+
+    /// <summary>
+    /// Cpp2IL sometimes emits a delegate constructor as an instance call (allocated receiver + ldftn + call .ctor).
+    /// The CLR/ILSpy expect <c>newobj</c>, and the extra receiver breaks ILSpy's cached-lambda pattern recognition.
+    /// </summary>
+    private static void NormalizeDelegateConstruction(MethodDefinition definition)
+    {
+        var instructions = definition.CilMethodBody!.Instructions;
+
+        for (var i = 0; i < instructions.Count; i++)
+        {
+            var ctorCall = instructions[i];
+            if (ctorCall.OpCode != CilOpCodes.Call || ctorCall.Operand is not IMethodDescriptor ctorMethod)
+                continue;
+
+            if (ctorMethod.Name != ".ctor" || !IsDelegateTypeName(ctorMethod.DeclaringType?.Name?.ToString()))
+                continue;
+
+            // Pattern: ldloc receiver / ldsfld <>9 / ldftn lambda / call Delegate::.ctor
+            if (i < 3)
+                continue;
+
+            var ldftn = instructions[i - 1];
+            var singleton = instructions[i - 2];
+            var receiver = instructions[i - 3];
+
+            if (ldftn.OpCode != CilOpCodes.Ldftn
+                || singleton.OpCode != CilOpCodes.Ldsfld
+                || singleton.Operand is not IFieldDescriptor singletonField
+                || singletonField.Name?.ToString() != "<>9"
+                || receiver.OpCode != CilOpCodes.Ldloc)
+                continue;
+
+            // newobj takes only (object, native int); drop the pre-allocated receiver. Only rewrite the
+            // canonical cached-delegate shape: after "stsfld <>9__N" comes either another receiver
+            // load/consumer local or a branch. Anything else (unrelated IL between cache store and
+            // consumer) is left untouched so we don't leave a delegate on the stack.
+            var receiverLocal = receiver.Operand as CilLocalVariable;
+            var afterStoreDuplicate = instructions[i + 1];
+            var cacheStore = instructions[i + 2];
+            var firstAfterCache = i + 3 < instructions.Count ? instructions[i + 3] : null;
+
+            var isCanonicalAfterStore = afterStoreDuplicate.OpCode == CilOpCodes.Ldloc
+                                        && cacheStore.OpCode == CilOpCodes.Stsfld
+                                        && cacheStore.Operand is IFieldDescriptor { } cacheField
+                                        && cacheField.Name?.ToString().StartsWith("<>9__") == true
+                                        && firstAfterCache != null
+                                        && (firstAfterCache.OpCode == CilOpCodes.Br
+                                            || firstAfterCache.OpCode == CilOpCodes.Brtrue
+                                            || firstAfterCache.OpCode == CilOpCodes.Brfalse
+                                            || firstAfterCache.OpCode == CilOpCodes.Ret
+                                            || firstAfterCache.OpCode == CilOpCodes.Nop
+                                            || (firstAfterCache.OpCode == CilOpCodes.Ldloc && ReferenceEquals(firstAfterCache.Operand, receiverLocal)));
+
+            if (!isCanonicalAfterStore)
+                continue;
+
+            receiver.OpCode = CilOpCodes.Nop;
+            receiver.Operand = null;
+            ctorCall.OpCode = CilOpCodes.Newobj;
+
+            afterStoreDuplicate.OpCode = CilOpCodes.Nop;
+            afterStoreDuplicate.Operand = null;
+            instructions.Insert(i + 2, new CilInstruction(CilOpCodes.Dup));
+
+            // Nop every duplicated receiver load between the cache store and the next branch so the
+            // single delegate copy left by dup/stsfld flows into the consumer local.
+            var consumedByStore = false;
+            for (var j = i + 3; j < instructions.Count; j++)
+            {
+                var candidate = instructions[j];
+                if (candidate.OpCode == CilOpCodes.Br || candidate.OpCode == CilOpCodes.Brtrue
+                    || candidate.OpCode == CilOpCodes.Brfalse || candidate.OpCode == CilOpCodes.Ret)
+                {
+                    // No consumer local follows the cache store; discard the copy dup left behind.
+                    if (!consumedByStore)
+                        instructions.Insert(j, new CilInstruction(CilOpCodes.Pop));
+                    break;
+                }
+
+                if (candidate.OpCode == CilOpCodes.Stloc)
+                    consumedByStore = true;
+
+                if (candidate.OpCode == CilOpCodes.Ldloc && ReferenceEquals(candidate.Operand, receiverLocal))
+                {
+                    candidate.OpCode = CilOpCodes.Nop;
+                    candidate.Operand = null;
+                }
+            }
+        }
+    }
+
+    private static bool IsDelegateTypeName(string? name)
+        => name is not null && (name.StartsWith("Func`") || name.StartsWith("Action`"));
+
+    private static TypeSignature? GetFieldType(IFieldDescriptor? field) =>
+        field switch
+        {
+            FieldDefinition fieldDefinition => fieldDefinition.Signature?.FieldType,
+            MemberReference memberReference when memberReference.Signature is FieldSignature signature => signature.FieldType,
+            _ => null
+        };
+
+    private static bool TryGetDelegateTypeArguments(IFieldDescriptor? field, out TypeSignature[] delegateArgs, out TypeSignature? delegateType)
+    {
+        delegateArgs = [];
+        delegateType = GetFieldType(field);
+
+        if (delegateType is GenericInstanceTypeSignature generic
+            && IsDelegateTypeName(generic.GenericType?.Name?.ToString()))
+        {
+            delegateArgs = generic.TypeArguments.ToArray();
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// LINQ extension calls occasionally get instantiated with object placeholders (e.g. <c>Select&lt;object,int&gt;</c>)
+    /// instead of the cached delegate's real argument types. Recover the instantiation from the <c>&lt;&gt;9__N</c>
+    /// cache field that feeds the call, and retype the selector local so ILSpy can fold the delegate back into a lambda.
+    /// </summary>
+    private static void NormalizeLinqGenericInstantiations(MethodDefinition definition)
+    {
+        var instructions = definition.CilMethodBody!.Instructions;
+
+        for (var i = 0; i < instructions.Count; i++)
+        {
+            var call = instructions[i];
+            if (call.OpCode != CilOpCodes.Call || call.Operand is not MethodSpecification specification)
+                continue;
+
+            if (!LinqMethodNames.Contains(specification.Name ?? "") || specification.Signature is not { } signature)
+                continue;
+
+            var selector = i > 0 ? instructions[i - 1] : null;
+            if (selector == null || selector.OpCode != CilOpCodes.Ldloc || selector.Operand is not CilLocalVariable selectorLocal)
+                continue;
+
+            // Walk back over the cached-delegate pattern to find the <>9__N field whose type knows the real args.
+            TypeSignature[]? delegateArgs = null;
+            TypeSignature? delegateType = null;
+
+            for (var j = i - 1; j >= Math.Max(0, i - 60); j--)
+            {
+                if (instructions[j].Operand is not IFieldDescriptor candidateField)
+                    continue;
+
+                var candidateName = candidateField.Name?.ToString();
+                if (string.IsNullOrEmpty(candidateName) || !candidateName.StartsWith("<>9__"))
+                    continue;
+
+                if (!TryGetDelegateTypeArguments(candidateField, out var candidateArgs, out var candidateType))
+                    continue;
+
+                delegateArgs = candidateArgs;
+                delegateType = candidateType;
+                break;
+            }
+
+            if (delegateArgs == null)
+                continue;
+
+            // Func<TArg,TResult> maps to Select<TArg,TResult>; Func<TArg,bool> maps to Where/Any<TArg>.
+            var targetArgCount = signature.TypeArguments.Count;
+            var newArgs = targetArgCount switch
+            {
+                2 when delegateArgs.Length >= 2 => new[] { delegateArgs[0], delegateArgs[1] },
+                1 when delegateArgs.Length >= 1 => new[] { delegateArgs[0] },
+                _ => null
+            };
+
+            if (newArgs == null)
+                continue;
+
+            specification.Signature = new GenericInstanceMethodSignature(newArgs);
+
+            if (delegateType != null)
+                selectorLocal.VariableType = delegateType;
+        }
+    }
+
+    /// <summary>
+    /// IL2CPP null checks can be emitted as "build NullReferenceException, store it, and return the exception
+    /// object as the method's value". Replace the terminal copy with a real throw.
+    /// </summary>
+    private static void NormalizeLambdaNullChecks(MethodDefinition definition)
+    {
+        if (definition.Name?.ToString().Contains("b__") != true)
+            return;
+
+        var instructions = definition.CilMethodBody!.Instructions;
+
+        for (var i = 0; i < instructions.Count; i++)
+        {
+            if (instructions[i].OpCode != CilOpCodes.Newobj || instructions[i].Operand is not IMethodDescriptor ctor)
+                continue;
+
+            if (ctor.Name != ".ctor" || ctor.DeclaringType?.Name != "NullReferenceException")
+                continue;
+
+            ConvertReturnedExceptionToThrow(instructions, i);
+        }
+    }
+
+    /// <summary>
+    /// Fixes the invalid "return the exception object as the method's value" IL that Cpp2IL emits for
+    /// IL2CPP null checks.
+    /// </summary>
+    private static void ConvertReturnedExceptionToThrow(CilInstructionCollection instructions, int newObjIndex)
+    {
+        if (newObjIndex + 3 >= instructions.Count)
+            return;
+
+        var store = instructions[newObjIndex + 1];
+        var load = instructions[newObjIndex + 2];
+        var ret = instructions[newObjIndex + 3];
+
+        if (store.OpCode != CilOpCodes.Stloc || store.Operand is not CilLocalVariable exceptionLocal
+            || load.OpCode != CilOpCodes.Ldloc || load.Operand is not CilLocalVariable loadedLocal
+            || !ReferenceEquals(exceptionLocal, loadedLocal)
+            || ret.OpCode != CilOpCodes.Ret)
+            return;
+
+        store.OpCode = CilOpCodes.Nop;
+        store.Operand = null;
+        load.OpCode = CilOpCodes.Nop;
+        load.Operand = null;
+        ret.OpCode = CilOpCodes.Throw;
+        ret.Operand = null;
     }
 
     // Limit so we don't run into the 16mb limit (see AsmResolver issue #775)
