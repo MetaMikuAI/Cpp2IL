@@ -99,8 +99,18 @@ public static class ThrowHelperRecovery
     private static string? FindExceptionName(ApplicationAnalysisContext appContext, IReadOnlyList<ulong> dataReferences)
     {
         foreach (var address in dataReferences)
-            if (ReadCStringAtVirtualAddress(appContext, address) is { } text && text.EndsWith("Exception", StringComparison.Ordinal))
+        {
+            if (ReadCStringAtVirtualAddress(appContext, address) is not { } text)
+                continue;
+
+            if (text.EndsWith("Exception", StringComparison.Ordinal))
                 return text;
+
+            // The castclass failure helper builds its message from a format string
+            // ("Unable to cast object of type 'X' to type 'Y'.") instead of naming the type.
+            if (text.StartsWith("Unable to cast object of type", StringComparison.Ordinal))
+                return "InvalidCastException";
+        }
 
         return null;
     }

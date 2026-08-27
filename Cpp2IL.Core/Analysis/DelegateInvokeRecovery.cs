@@ -21,13 +21,22 @@ public static class DelegateInvokeRecovery
             if (instruction.OpCode != OpCode.IndirectCall)
                 continue;
 
-            if (GetInvokeImplLoad(instruction, instructions) is not { } memory)
-                continue;
+            LocalVariable? delegateLocal = null;
 
-            if (memory.Addend != invokeImplOffset || memory.Index != null || memory.Scale != 0)
-                continue;
+            if (GetInvokeImplLoad(instruction, instructions) is { } memory)
+            {
+                if (memory.Addend != invokeImplOffset || memory.Index != null || memory.Scale != 0)
+                    continue;
 
-            if (memory.Base is not LocalVariable delegateLocal || delegateLocal.Type is not { IsDelegate: true } delegateType)
+                delegateLocal = memory.Base as LocalVariable;
+            }
+            else if (instruction.Operands[0] is FieldReference { Field.Name: "invoke_impl", Local: { } fieldBase })
+            {
+                // Field resolution already turned [delegate + 0x18] into delegate.invoke_impl
+                delegateLocal = fieldBase;
+            }
+
+            if (delegateLocal?.Type is not { IsDelegate: true } delegateType)
                 continue;
 
             if (delegateType.Methods.FirstOrDefault(m => m.Name == "Invoke") is not { } invoke)
@@ -37,7 +46,8 @@ public static class DelegateInvokeRecovery
         }
     }
 
-    // The address being called, whether it is still a separate load or has been inlined
+    // The address being called, whether it is still a separate load, has been inlined, or has
+    // already been resolved to a field access ([delegate + 0x18] => delegate.invoke_impl)
     private static MemoryOperand? GetInvokeImplLoad(Instruction call, List<Instruction> instructions)
     {
         if (call.Operands.Count == 0)

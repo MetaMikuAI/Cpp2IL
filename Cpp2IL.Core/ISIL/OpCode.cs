@@ -1,4 +1,4 @@
-﻿using Cpp2IL.Core.Analysis;
+using Cpp2IL.Core.Analysis;
 
 namespace Cpp2IL.Core.ISIL;
 
@@ -128,5 +128,11 @@ public enum OpCode
     /// <summary>
     /// Throws a new instance of the exception type described by op 1.
     /// </summary>
-    Throw
+    Throw,
+
+    /// <summary>
+    /// isinst. op 0 is the destination, op 1 is the object, op 2 is the type to test against.
+    /// Yields the object if the cast succeeds, else null.
+    /// </summary>
+    IsInst
 }
