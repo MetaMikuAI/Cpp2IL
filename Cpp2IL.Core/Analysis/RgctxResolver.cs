@@ -37,12 +37,17 @@ public static class RgctxResolver
                 // MethodInfo::klass - the instance the method belongs to, which is what carries the RGCTX
                 RuntimeMethodInfoAnalysisContext info when memory.Addend == klassOffset && info.RepresentedMethod.DeclaringType is { } declaring
                     => new RuntimeClassTypeAnalysisContext(declaring, declaring.DeclaringAssembly),
-                
+
                 RuntimeMethodInfoAnalysisContext { RepresentedMethod: { } owningMethod } when memory.Addend == methodRgctxOffset && HasMethodRgctx(owningMethod)
                     => new MethodRgctxTableTypeAnalysisContext(owningMethod, owningMethod.CustomAttributeAssembly),
 
                 RuntimeClassTypeAnalysisContext { RepresentedType: var owner } when memory.Addend == rgctxOffset
                     => new RgctxTableTypeAnalysisContext(owner, owner.DeclaringAssembly),
+
+                // Il2CppClass::element_class - the element type of an array/pointer type
+                RuntimeClassTypeAnalysisContext { RepresentedType: SzArrayTypeAnalysisContext { ElementType: { } elementType } } klass
+                    when memory.Addend == (is32Bit ? 0x24 : 0x40)
+                    => new RuntimeClassTypeAnalysisContext(elementType, klass.DeclaringAssembly),
 
                 RgctxTableTypeAnalysisContext table when memory.Addend % pointerSize == 0
                     => GetOrResolveEntry(table.ResolvedEntries, (int)(memory.Addend / pointerSize), () => ResolveTypeEntry(table.OwnerType, (int)(memory.Addend / pointerSize))),
@@ -92,7 +97,10 @@ public static class RgctxResolver
         if (definition.Definition is not { } typeDefinition)
             return null;
 
-        var typeArguments = (instance as GenericInstanceTypeAnalysisContext)?.GenericArguments ?? [];
+        // For shared code on the open definition itself, its own generic parameters stand in as
+        // the arguments, so e.g. a rgctx CLASS entry for T0 resolves to the parameter.
+        var typeArguments = (instance as GenericInstanceTypeAnalysisContext)?.GenericArguments
+            ?? (IReadOnlyList<TypeAnalysisContext>)definition.GenericParameters;
 
         return ResolveEntry(typeDefinition.RgctXs, index, typeArguments, [], instance.AppContext);
     }

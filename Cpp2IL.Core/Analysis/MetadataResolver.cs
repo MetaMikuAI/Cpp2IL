@@ -134,6 +134,13 @@ public static class MetadataResolver
     {
         var changed = false;
 
+        // SSA gives every local a single definition, which lets address arithmetic be folded:
+        // [base + addend] where base is Add/Sub(orig, const) collapses to [orig + adjusted].
+        var definitions = new Dictionary<LocalVariable, Instruction>();
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+            if (instruction.Destination is LocalVariable destination)
+                definitions[destination] = instruction;
+
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
             for (var i = 0; i < instruction.Operands.Count; i++)
@@ -142,6 +149,13 @@ public static class MetadataResolver
 
                 if (operand is not MemoryOperand memory)
                     continue;
+
+                if (FoldBaseArithmetic(definitions, memory) is { } folded)
+                {
+                    memory = folded;
+                    instruction.SetOperand(i, memory);
+                    changed = true;
+                }
 
                 // Has to be [base (local) + addend (field offset)]
                 if (memory.Index != null || memory.Scale != 0)
@@ -217,6 +231,30 @@ public static class MetadataResolver
         }
 
         return changed;
+    }
+
+    // [base + addend] where base is a chain of Add/Sub(orig, const) collapses to
+    // [orig + adjusted addend]. Compilers routinely anchor a pointer mid-struct and then
+    // address fields with negative offsets.
+    private static MemoryOperand? FoldBaseArithmetic(Dictionary<LocalVariable, Instruction> definitions, MemoryOperand memory)
+    {
+        if (memory.Index != null)
+            return null;
+
+        var visited = new HashSet<LocalVariable>();
+        var changedAny = false;
+
+        while (memory.Base is LocalVariable baseLocal
+               && visited.Add(baseLocal)
+               && definitions.TryGetValue(baseLocal, out var definition)
+               && definition is { OpCode: OpCode.Add or OpCode.Subtract, Operands: [_, LocalVariable original, Immediate adjustment] })
+        {
+            memory.Base = original;
+            memory.Addend += definition.OpCode == OpCode.Add ? adjustment.Value : -adjustment.Value;
+            changedAny = true;
+        }
+
+        return changedAny ? memory : null;
     }
 
     /// <summary>

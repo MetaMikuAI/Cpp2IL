@@ -10,6 +10,7 @@ using Cpp2IL.Core.Utils;
 using Iced.Intel;
 using Instruction = Cpp2IL.Core.ISIL.Instruction;
 using MemoryOperand = Cpp2IL.Core.ISIL.MemoryOperand;
+using Register = Cpp2IL.Core.ISIL.Register;
 
 namespace Cpp2IL.Core.Analysis;
 
@@ -85,11 +86,82 @@ public static class RuntimeHelperRecovery
         // call GetInterfaceInvokeDataFromVTableSlowPath(obj, interface, slot); call [result].
         // The call-site pattern (interface type + constant slot + result used as [x]) is specific
         // enough to resolve without identifying the slow path function itself.
-        foreach (var instruction in method.ControlFlowGraph.Instructions)
+        foreach (var block in method.ControlFlowGraph.Blocks)
         {
-            if (instruction.OpCode == OpCode.IndirectCall)
-                ResolveInterfaceSlowPathCall(method, instruction, definitions);
+            foreach (var instruction in block.Instructions)
+            {
+                if (instruction.OpCode == OpCode.IndirectCall)
+                {
+                    ResolveInterfaceSlowPathCall(method, instruction, definitions);
+                    ResolveMethodInfoPointerCall(instruction, definitions);
+                }
+                else if (instruction.OpCode == OpCode.IndirectJump)
+                {
+                    ResolveMethodInfoPointerJump(method, instruction, block, definitions);
+                }
+            }
         }
+    }
+
+    // A tail call (jmp) through a MethodInfo pointer: rewrite to a regular call followed by a return.
+    private static void ResolveMethodInfoPointerJump(MethodAnalysisContext method, Instruction dispatch, Graphs.Block block, Dictionary<LocalVariable, Instruction> definitions)
+    {
+        var pointerLoad = dispatch.Operands[0] switch
+        {
+            MemoryOperand { Index: null, Scale: 0, Addend: 0 or 8, Base: LocalVariable memoryBase } => memoryBase,
+            LocalVariable target => ChaseCopies(definitions, target) is { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Index: null, Scale: 0, Addend: 0 or 8, Base: LocalVariable chaseBase }] }
+                ? chaseBase
+                : null,
+            _ => null,
+        };
+
+        if (pointerLoad?.Type is not RuntimeMethodInfoAnalysisContext { RepresentedMethod: { } resolved })
+            return;
+
+        var callingConventions = resolved.AppContext.InstructionSet.CallingConventionResolver;
+
+        // an IndirectJump's return register operand is a stale use rather than a return slot, so rebuild from scratch
+        var operands = new List<IOperand> { resolved };
+
+        if (!resolved.IsVoid)
+            operands.Add(new LocalVariable("methodInfoTailCallResult", callingConventions?.ReturnRegister(resolved) ?? new Register(null, "rax")));
+
+        operands.AddRange(dispatch.Operands.Skip(2));
+
+        dispatch.SetOperands(operands);
+        dispatch.OpCode = resolved.IsVoid ? OpCode.CallVoid : OpCode.Call;
+        callingConventions?.RemapRawArguments(dispatch, resolved);
+
+        var returnOperands = !method.IsVoid && !resolved.IsVoid
+            ? new List<IOperand> { dispatch.Operands[1] }
+            : [];
+
+        block.AddInstruction(new Instruction(-1, OpCode.Return, returnOperands));
+        block.CalculateBlockType();
+    }
+
+    // Shared generic code invokes virtual methods via MethodInfo::virtualMethodPointer (+8), or
+    // calls them directly via methodPointer (+0). The MethodInfo local already names the method.
+    private static void ResolveMethodInfoPointerCall(Instruction dispatch, Dictionary<LocalVariable, Instruction> definitions)
+    {
+        var pointerLoad = dispatch.Operands[0] switch
+        {
+            MemoryOperand { Index: null, Scale: 0, Addend: 0 or 8, Base: LocalVariable memoryBase } => memoryBase,
+            LocalVariable target => ChaseCopies(definitions, target) is { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Index: null, Scale: 0, Addend: 0 or 8, Base: LocalVariable chaseBase }] }
+                ? chaseBase
+                : null,
+            _ => null,
+        };
+
+        if (pointerLoad?.Type is not RuntimeMethodInfoAnalysisContext { RepresentedMethod: { } resolved })
+            return;
+
+        if (resolved.IsVoid)
+            dispatch.RemoveOperandAt(1);
+
+        dispatch.OpCode = resolved.IsVoid ? OpCode.CallVoid : OpCode.Call;
+        dispatch.SetOperand(0, resolved);
+        resolved.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(dispatch, resolved);
     }
 
     private static void ResolveInterfaceSlowPathCall(MethodAnalysisContext method, Instruction dispatch, Dictionary<LocalVariable, Instruction> definitions)
