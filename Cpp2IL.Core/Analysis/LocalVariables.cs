@@ -487,7 +487,7 @@ public static class LocalVariables
         var type = operand switch
         {
             LocalVariable { Type: { } localType } => localType,
-            FieldReference field => field.Field.FieldType,
+            FieldReference field => field.LeafType,
             _ => null,
         };
 
@@ -522,11 +522,11 @@ public static class LocalVariables
         // Move local, field: a field load types its result with the field's type. This is the edge
         // that lets the loaded value go on to be the base of a further field access.
         if (destination is LocalVariable loadDest && source is FieldReference loadField)
-            return SetTypeIfUnknown(loadDest, loadField.Field.FieldType);
+            return SetTypeIfUnknown(loadDest, loadField.LeafType);
 
         // Move field, local: a field store types the stored value with the field's type.
         if (destination is FieldReference storeField && source is LocalVariable storeSource)
-            return SetTypeIfUnknown(storeSource, storeField.Field.FieldType);
+            return SetTypeIfUnknown(storeSource, storeField.LeafType);
 
         // An element of T[] is a T, whether we loaded it (reference arrays) or only computed its address
         if (destination is LocalVariable { Type: null } elementDest

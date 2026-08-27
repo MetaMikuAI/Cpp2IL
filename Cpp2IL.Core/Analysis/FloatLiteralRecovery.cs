@@ -16,7 +16,7 @@ public static class FloatLiteralRecovery
         foreach (var instruction in method.ControlFlowGraph!.Blocks.SelectMany(block => block.Instructions))
         {
             if (instruction.OpCode == OpCode.Move && instruction.Operands is [FieldReference field, _])
-                TryConvert(instruction, 1, field.Field.FieldType);
+                TryConvert(instruction, 1, field.LeafType);
             else if (instruction.IsCall && instruction.Operands is [MethodAnalysisContext target, ..])
                 ConvertArguments(instruction, target);
         }

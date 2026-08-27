@@ -552,11 +552,24 @@ public static class IlGenerator
             case OpCode.Move:
                 if (instruction.Operands[0] is FieldReference field) // stfld takes instance before value so LoadOperand StoreToOperand doesn't work
                 {
-                    if (!field.Field.IsStatic)
-                        LoadLocal(field.Local, method, locals);
+                    if (field.NestedFields.Length == 0)
+                    {
+                        if (!field.Field.IsStatic)
+                            LoadLocal(field.Local, method, locals);
 
-                    LoadOperand(instruction.Operands[1], method, locals, writeLine, field.Field.FieldType);
-                    instructions.Add(field.Field.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld, field.Field.ToFieldDescriptor());
+                        LoadOperand(instruction.Operands[1], method, locals, writeLine, field.Field.FieldType);
+                        instructions.Add(field.Field.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld, field.Field.ToFieldDescriptor());
+                        break;
+                    }
+
+                    // Nested value-type store: address into the intermediates, store the leaf
+                    LoadLocal(field.Local, method, locals);
+                    instructions.Add(CilOpCodes.Ldflda, field.Field.ToFieldDescriptor());
+                    for (var i = 0; i < field.NestedFields.Length - 1; i++)
+                        instructions.Add(CilOpCodes.Ldflda, field.NestedFields[i].ToFieldDescriptor());
+
+                    LoadOperand(instruction.Operands[1], method, locals, writeLine, field.LeafType);
+                    instructions.Add(CilOpCodes.Stfld, field.NestedFields[^1].ToFieldDescriptor());
                     break;
                 }
 
@@ -970,6 +983,8 @@ public static class IlGenerator
 
                 LoadLocal(field.Local, method, locals);
                 instructions.Add(CilOpCodes.Ldfld, field.Field.ToFieldDescriptor());
+                foreach (var nested in field.NestedFields)
+                    instructions.Add(CilOpCodes.Ldfld, nested.ToFieldDescriptor());
                 break;
             case MemoryOperand memory:
                 if (memory.Index == null && memory.Addend == 0 && memory.Scale == 0
@@ -1140,7 +1155,7 @@ public static class IlGenerator
         destination switch
         {
             LocalVariable local => local.Type,
-            FieldReference field => field.Field.FieldType,
+            FieldReference field => field.LeafType,
             ArrayAccess { Array.Type: SzArrayTypeAnalysisContext array } => array.ElementType,
             _ => null
         };

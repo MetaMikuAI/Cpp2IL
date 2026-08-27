@@ -158,12 +158,10 @@ public static class MetadataResolver
                 FieldAnalysisContext? field;
                 if (genericOwner != null && staticOwner == null)
                 {
-                    // metadata has all-0 offsets for generic definitions, so recompute layout
-                    // TODO support user-defined value types
-                    if (genericOwner.GenericArguments.Any(a => a.IsValueType))
-                        continue;
-
-                    field = GenericInstanceFieldLayout.FindFieldAtOffset(genericOwner.GenericType, memory.Addend);
+                    // metadata has all-0 offsets for generic definitions, so recompute layout.
+                    // The layout pass resolves bare-T fields against the actual arguments, so
+                    // value-type arguments are fine as long as no user-defined struct is involved.
+                    field = GenericInstanceFieldLayout.FindFieldAtOffset(genericOwner.GenericType, memory.Addend, genericOwner.GenericArguments);
                 }
                 else if (staticOwner == null && owner.GenericParameters.Count > 0)
                 {
@@ -181,7 +179,33 @@ public static class MetadataResolver
                 }
 
                 if (field == null) // TODO: Support nested fields (Field1.Field2.Field3)
+                {
+                    // Nested value-type field: [base + X] where X lands inside a struct field
+                    // (e.g. a save-data struct embedded in another). Resolve to a field chain.
+                    if (staticOwner == null && genericOwner == null
+                        && FindNestedFieldPath(method, owner, memory.Addend) is { Count: > 0 } chain)
+                    {
+                        instruction.SetOperand(i, new FieldReference(chain[0], local!, (int)memory.Addend)
+                        {
+                            NestedFields = chain.Skip(1).ToArray(),
+                        });
+                        changed = true;
+                        continue;
+                    }
+
+                    // [array + max_length] is the array's Length. It sits inside the runtime object
+                    // header, not in the managed field list, so field resolution can't name it.
+                    if (staticOwner == null
+                        && owner is SzArrayTypeAnalysisContext
+                        && memory.Addend == (method.AppContext.Binary.PointerSizeBytes == 8 ? 0x18 : 0xC)
+                        && local != null)
+                    {
+                        instruction.SetOperand(i, new ArrayLength(local));
+                        changed = true;
+                    }
+
                     continue;
+                }
 
                 // make sure we have a full GIT for field access. open type is bad.
                 if (genericOwner != null)
@@ -193,6 +217,61 @@ public static class MetadataResolver
         }
 
         return changed;
+    }
+
+    /// <summary>
+    /// Finds the field path for [base + offset] when offset doesn't land exactly on a field but
+    /// inside a nested value-type field. Returns the chain from the outermost field to the leaf,
+    /// or null if no such path exists. Only value-type intermediates are followed, since a
+    /// reference-type field points elsewhere in memory.
+    /// </summary>
+    private static List<FieldAnalysisContext>? FindNestedFieldPath(MethodAnalysisContext method, TypeAnalysisContext owner, long offset)
+    {
+        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+
+        for (var type = owner; type != null; type = type.BaseType)
+        {
+            foreach (var candidate in type.Fields)
+            {
+                if (candidate.IsStatic || (candidate.Attributes & FieldAttributes.Literal) != 0)
+                    continue;
+
+                var fieldOffset = candidate.BackingData?.FieldOffset ?? -1;
+                if (fieldOffset < 0 || fieldOffset >= offset)
+                    continue;
+
+                if (!candidate.FieldType.IsValueType)
+                    continue;
+
+                var size = TypeSizes.UnboxedSize(candidate.FieldType, pointerSize);
+                if (size <= 0 || offset >= fieldOffset + size)
+                    continue;
+
+                // offset lands inside this struct field; resolve the leaf within it.
+                // One level of nesting only — deeper chains are rare and left unresolved.
+                if (FindExactFieldAtOffset(candidate.FieldType, offset - fieldOffset) is not { } leaf)
+                    return null;
+
+                return [candidate, leaf];
+            }
+        }
+
+        return null;
+    }
+
+    private static FieldAnalysisContext? FindExactFieldAtOffset(TypeAnalysisContext type, long offset)
+    {
+        for (var t = type; t != null; t = t.BaseType)
+        {
+            var field = t.Fields.FirstOrDefault(f => !f.IsStatic
+                && (f.Attributes & FieldAttributes.Literal) == 0
+                && f.BackingData?.FieldOffset == offset);
+
+            if (field != null)
+                return field;
+        }
+
+        return null;
     }
 
     private static void ResolveCalls(MethodAnalysisContext method)

@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System.Linq;
 using Cpp2IL.Core.Model.Contexts;
 
@@ -6,7 +7,7 @@ namespace Cpp2IL.Core.Analysis;
 //Resolves field offsets on generic types, which are all 0 in the metadata.
 public static class GenericInstanceFieldLayout
 {
-    public static FieldAnalysisContext? FindFieldAtOffset(TypeAnalysisContext definition, long targetOffset)
+    public static FieldAnalysisContext? FindFieldAtOffset(TypeAnalysisContext definition, long targetOffset, IReadOnlyList<TypeAnalysisContext>? genericArguments = null)
     {
         var pointerSize = definition.AppContext.Binary.PointerSizeBytes;
 
@@ -15,14 +16,15 @@ public static class GenericInstanceFieldLayout
             if (baseType.Fields.Any(f => !f.IsStatic))
                 return null;
 
-        var offset = 2L * pointerSize;
+        // Value types have no object header; fields start at offset 0.
+        var offset = definition.IsValueType ? 0 : 2L * pointerSize;
 
         foreach (var field in definition.Fields)
         {
             if (field.IsStatic)
                 continue;
 
-            if (GetSizeAndAlignment(field.FieldType, pointerSize) is not var (size, alignment))
+            if (GetSizeAndAlignment(field.FieldType, pointerSize, genericArguments) is not var (size, alignment))
                 return null;
 
             offset = (offset + alignment - 1) & ~(alignment - 1);
@@ -36,14 +38,22 @@ public static class GenericInstanceFieldLayout
         return null;
     }
 
-    private static (long Size, long Alignment)? GetSizeAndAlignment(TypeAnalysisContext fieldType, int pointerSize)
+    private static (long Size, long Alignment)? GetSizeAndAlignment(TypeAnalysisContext fieldType, int pointerSize, IReadOnlyList<TypeAnalysisContext>? genericArguments)
     {
+        // A bare T field is laid out as the generic argument it stands for: inlined when the
+        // argument is a value type (e.g. List<int> still stores T[] _items by reference, but
+        // KeyValuePair<int, int> inlines both), a pointer otherwise.
+        if (fieldType is GenericParameterTypeAnalysisContext genericParameter
+            && genericArguments != null
+            && genericParameter.Index < genericArguments.Count)
+            fieldType = genericArguments[genericParameter.Index];
+
         // TODO support user-defined value types
         if (fieldType is GenericParameterTypeAnalysisContext or PointerTypeAnalysisContext || !fieldType.IsValueType)
             return (pointerSize, pointerSize);
 
         if (fieldType.IsEnumType && fieldType.Fields.FirstOrDefault(f => !f.IsStatic) is { } underlying)
-            return GetSizeAndAlignment(underlying.FieldType, pointerSize);
+            return GetSizeAndAlignment(underlying.FieldType, pointerSize, genericArguments);
 
         return fieldType.FullName switch
         {
