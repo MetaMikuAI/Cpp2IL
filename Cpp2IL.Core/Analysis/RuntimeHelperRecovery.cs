@@ -90,19 +90,23 @@ public static class RuntimeHelperRecovery
         // call GetInterfaceInvokeDataFromVTableSlowPath(obj, interface, slot); call [result].
         // The call-site pattern (interface type + constant slot + result used as [x]) is specific
         // enough to resolve without identifying the slow path function itself.
-        foreach (var block in method.ControlFlowGraph.Blocks)
+        // Snapshot first: tail-call rewriting appends a Return to the block, which would
+        // otherwise modify the collection being enumerated.
+        var indirectDispatches = method.ControlFlowGraph.Blocks
+            .SelectMany(block => block.Instructions.Select(instruction => (block, instruction)))
+            .Where(pair => pair.instruction.OpCode is OpCode.IndirectCall or OpCode.IndirectJump)
+            .ToList();
+
+        foreach (var (block, instruction) in indirectDispatches)
         {
-            foreach (var instruction in block.Instructions)
+            if (instruction.OpCode == OpCode.IndirectCall)
             {
-                if (instruction.OpCode == OpCode.IndirectCall)
-                {
-                    ResolveInterfaceSlowPathCall(method, instruction, definitions);
-                    ResolveMethodInfoPointerCall(instruction, definitions);
-                }
-                else if (instruction.OpCode == OpCode.IndirectJump)
-                {
-                    ResolveMethodInfoPointerJump(method, instruction, block, definitions);
-                }
+                ResolveInterfaceSlowPathCall(method, instruction, definitions);
+                ResolveMethodInfoPointerCall(instruction, definitions);
+            }
+            else
+            {
+                ResolveMethodInfoPointerJump(method, instruction, block, definitions);
             }
         }
     }
