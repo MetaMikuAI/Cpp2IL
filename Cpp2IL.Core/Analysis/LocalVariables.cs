@@ -659,14 +659,17 @@ public static class LocalVariables
         if (destination is LocalVariable destLocal && source is LocalVariable sourceLocal)
             return SetTypeIfUnknown(destLocal, sourceLocal.Type) || SetTypeIfUnknown(sourceLocal, destLocal.Type);
 
-        // Move local, &local: a byref-typed pointer tells us the pointee's type. The reverse
-        // (typing the pointer as byref-to-pointee) is deliberately not done - an address-of local
-        // is often a raw buffer/memcpy target rather than a managed byref, and mistyping it
-        // sends field resolution down the wrong layout.
+        // Move local, &local: a byref-typed pointer tells us the pointee's type. The reverse is
+        // done only for value-type pointees: &local of a struct is the ((T*)&local)->field
+        // pattern IL2CPP emits for ref struct locals, while a reference-type address-of is a
+        // reference slot or raw buffer where byref typing misdirects field resolution.
         if (destination is LocalVariable ptrDest && source is AddressOf { Target: LocalVariable pointee })
         {
             if (ptrDest.Type is ByRefTypeAnalysisContext { ElementType: { } pointeeElement })
                 return SetTypeIfUnknown(pointee, pointeeElement);
+
+            if (pointee.Type is { IsValueType: true } pointeeType)
+                return SetTypeIfUnknown(ptrDest, new ByRefTypeAnalysisContext(pointeeType));
 
             return false;
         }
