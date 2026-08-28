@@ -157,6 +157,15 @@ public static class MetadataResolver
                     changed = true;
                 }
 
+                // [index + array + elements] or [array + index + elements]: a one-dimensional
+                // array element access, with the array local in either addressing position.
+                if (TryMakeArrayAccess(method, memory) is { } arrayAccess)
+                {
+                    instruction.SetOperand(i, arrayAccess);
+                    changed = true;
+                    continue;
+                }
+
                 // Has to be [base (local) + addend (field offset)]
                 if (memory.Index != null || memory.Scale != 0)
                     continue;
@@ -280,6 +289,24 @@ public static class MetadataResolver
         }
 
         return changedAny ? memory : null;
+    }
+
+    // [index + array + elements] or [array + index + elements]: a one-dimensional array element
+    // access. The array local can sit in either addressing position (x86 folds them freely).
+    private static ArrayAccess? TryMakeArrayAccess(MethodAnalysisContext method, MemoryOperand memory)
+    {
+        var elementsOffset = method.AppContext.Binary.PointerSizeBytes == 8 ? 0x20 : 0x10;
+
+        if (memory.Addend != elementsOffset)
+            return null;
+
+        if (memory.Base is LocalVariable { Type: SzArrayTypeAnalysisContext } arrayInBase && memory.Index != null)
+            return new ArrayAccess(arrayInBase, memory.Index);
+
+        if (memory.Index is LocalVariable { Type: SzArrayTypeAnalysisContext } arrayInIndex && memory.Base is LocalVariable indexLocal)
+            return new ArrayAccess(arrayInIndex, indexLocal);
+
+        return null;
     }
 
     // Dictionary<K,V>.Entry in 64-bit il2cpp: int hashCode @0, int next @4, K key @8, then V

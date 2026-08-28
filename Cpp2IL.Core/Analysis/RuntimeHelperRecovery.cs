@@ -102,7 +102,7 @@ public static class RuntimeHelperRecovery
             if (instruction.OpCode == OpCode.IndirectCall)
             {
                 ResolveInterfaceSlowPathCall(method, instruction, definitions);
-                ResolveMethodInfoPointerCall(instruction, definitions);
+                ResolveMethodInfoPointerCall(method, instruction, definitions);
             }
             else
             {
@@ -151,7 +151,7 @@ public static class RuntimeHelperRecovery
     // Shared generic code invokes methods via MethodInfo: methodPointer (+0), virtualMethodPointer
     // (+8) for virtual dispatch, and invoker_method (+0x10) for generic instances. The MethodInfo
     // local already names the method in every case.
-    private static void ResolveMethodInfoPointerCall(Instruction dispatch, Dictionary<LocalVariable, Instruction> definitions)
+    private static void ResolveMethodInfoPointerCall(MethodAnalysisContext method, Instruction dispatch, Dictionary<LocalVariable, Instruction> definitions)
     {
         var pointerLoad = dispatch.Operands[0] switch
         {
@@ -165,12 +165,39 @@ public static class RuntimeHelperRecovery
         if (pointerLoad?.Type is not RuntimeMethodInfoAnalysisContext { RepresentedMethod: { } resolved })
             return;
 
+        // A large-struct callee reads its return buffer from rcx. That slot is dropped by
+        // RemapRawArguments, so type the stack slot it points at now.
+        TypeHiddenReturnBuffer(method, dispatch, definitions, resolved);
+
         if (resolved.IsVoid)
             dispatch.RemoveOperandAt(1);
 
         dispatch.OpCode = resolved.IsVoid ? OpCode.CallVoid : OpCode.Call;
         dispatch.SetOperand(0, resolved);
         resolved.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(dispatch, resolved);
+    }
+
+    // rcx (operand slot 2 on a raw-layout call) may carry lea rsp+N for the hidden return buffer.
+    // Resolve that to the named stack slot and give it the callee's return type.
+    private static void TypeHiddenReturnBuffer(MethodAnalysisContext method, Instruction dispatch, Dictionary<LocalVariable, Instruction> definitions, MethodAnalysisContext resolved)
+    {
+        if (resolved.AppContext.InstructionSet.CallingConventionResolver?.ReturnsViaHiddenBuffer(resolved) != true
+            || resolved.ReturnType == method.AppContext.SystemTypes.SystemVoidType)
+            return;
+
+        if (dispatch.Operands.Count <= 2 || dispatch.Operands[2] is not LocalVariable rcxLocal)
+            return;
+
+        if (!definitions.TryGetValue(rcxLocal, out var rcxDefinition)
+            || rcxDefinition is not { OpCode: OpCode.Add or OpCode.Subtract, Operands: [_, { } rspSource, Immediate offset] }
+            || rspSource is not LocalVariable { Register.Name: "rsp" })
+            return;
+
+        var slotOffset = rcxDefinition.OpCode == OpCode.Add ? offset.Value : -offset.Value;
+        var slot = method.Locals.FirstOrDefault(l => l.Register.Name == $"stack_{Math.Abs(slotOffset):X}");
+
+        if (slot is { Type: null })
+            slot.Type = resolved.ReturnType;
     }
 
     private static void ResolveInterfaceSlowPathCall(MethodAnalysisContext method, Instruction dispatch, Dictionary<LocalVariable, Instruction> definitions)

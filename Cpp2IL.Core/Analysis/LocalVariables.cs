@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using Cpp2IL.Core.ISIL;
@@ -383,14 +384,14 @@ public static class LocalVariables
                 // A callee returning a large struct takes a hidden return buffer in rcx, which is
                 // not in the operand list; the buffer's type is the callee's return type.
                 if (calledMethod.AppContext.InstructionSet.CallingConventionResolver?.ReturnsViaHiddenBuffer(calledMethod) == true)
-                    changed |= TypeHiddenReturnBuffer(block, instruction, calledMethod);
+                    changed |= TypeHiddenReturnBuffer(method, block, instruction, calledMethod);
             }
         }
 
         return changed;
     }
 
-    private static bool TypeHiddenReturnBuffer(Graphs.Block block, Instruction call, MethodAnalysisContext calledMethod)
+    private static bool TypeHiddenReturnBuffer(MethodAnalysisContext method, Graphs.Block block, Instruction call, MethodAnalysisContext calledMethod)
     {
         for (var j = block.Instructions.IndexOf(call) - 1; j >= 0; j--)
         {
@@ -399,13 +400,30 @@ public static class LocalVariables
             if (candidate.OpCode is OpCode.Call or OpCode.CallVoid or OpCode.IndirectCall)
                 return false; // rcx belongs to an earlier call, don't guess across it
 
+            // SSA versioning renames registers (rcx -> rcx_v5)
+            static bool IsRcx(IOperand operand) =>
+                operand is LocalVariable { Register.Name: { } registerName }
+                && (registerName is "rcx" or "ecx"
+                    || registerName.StartsWith("rcx_v") || registerName.StartsWith("ecx_v"));
+
+            if (candidate.OpCode is OpCode.Add or OpCode.Subtract
+                && candidate.Operands is [LocalVariable dest, { } rspSource, ISIL.Immediate offset]
+                && IsRcx(dest)
+                && rspSource is LocalVariable { Register.Name: "rsp" })
+            {
+                // lea rcx, [rsp +/- N] - the buffer is the stack slot at that offset, which the
+                // stack analyzer names stack_NN
+                var slotOffset = candidate.OpCode == OpCode.Add ? offset.Value : -offset.Value;
+                var slotName = $"stack_{Math.Abs(slotOffset):X}";
+                var slot = method.Locals.FirstOrDefault(l => l.Register.Name == slotName);
+
+                return slot != null && SetTypeIfUnknown(slot, calledMethod.ReturnType);
+            }
+
             if (candidate.OpCode != OpCode.Move || candidate.Operands.Count < 2)
                 continue;
 
-            // SSA versioning renames registers (rcx -> rcx_v5)
-            if (candidate.Operands[0] is not LocalVariable { Register.Name: { } registerName }
-                || registerName is not ("rcx" or "ecx")
-                && !registerName.StartsWith("rcx_v") && !registerName.StartsWith("ecx_v"))
+            if (!IsRcx(candidate.Operands[0]))
                 continue;
 
             return candidate.Operands[1] is AddressOf { Target: LocalVariable buffer }
@@ -733,6 +751,12 @@ public static class LocalVariables
                     && Addressed(instruction.Operands[i]) is { } referenced)
                 {
                     changed |= SetTypeIfUnknown(referenced, referencedType);
+
+                    // The pointer local itself is confirmed to be a managed byref here (not a
+                    // raw buffer), so [ptr + X] can resolve through the pointee layout.
+                    if (instruction.Operands[i] is LocalVariable pointerLocal)
+                        changed |= SetTypeIfUnknown(pointerLocal, parameterType);
+
                     continue;
                 }
 
