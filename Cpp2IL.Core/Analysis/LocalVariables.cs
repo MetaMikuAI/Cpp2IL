@@ -555,11 +555,32 @@ public static class LocalVariables
             switch (instruction.OpCode)
             {
                 case OpCode.Move:
-                    changed |= PropagateMove(instruction, method.AppContext.Binary.PointerSizeBytes);
+                    changed |= PropagateMove(instruction, method);
                     break;
                 case OpCode.Unbox:
                     if (instruction.Operands is [LocalVariable { Type: null } unboxedDest, _, TypeAnalysisContext unboxedType])
                         changed |= SetTypeIfUnknown(unboxedDest, unboxedType);
+                    break;
+                case OpCode.Box:
+                    if (instruction.Operands is [LocalVariable { Type: null } boxDest, TypeAnalysisContext boxType, _])
+                        changed |= SetTypeIfUnknown(boxDest, boxType);
+                    break;
+                case OpCode.IsInst:
+                    // isinst(x, T) yields an instance of T or null: the result type is T, which
+                    // may be narrower than the propagated source type (object / a base class).
+                    // Narrowing here is what lets subsequent field access on the cast result work.
+                    if (instruction.Operands is [LocalVariable isinstDest, _, TypeAnalysisContext isinstType]
+                        && !isinstType.IsValueType
+                        && !ReferenceEquals(isinstDest.Type, isinstType)
+                        && IsBroaderThan(isinstDest.Type, isinstType))
+                    {
+                        isinstDest.Type = isinstType;
+                        changed = true;
+                    }
+                    break;
+                case >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual:
+                    if (instruction.Operands[0] is LocalVariable { Type: null } checkDest)
+                        changed |= SetTypeIfUnknown(checkDest, method.AppContext.SystemTypes.SystemBooleanType);
                     break;
                 case OpCode.Phi:
                     changed |= PropagatePhi(instruction);
@@ -650,14 +671,37 @@ public static class LocalVariables
             _ => null,
         };
 
-    private static bool PropagateMove(Instruction move, int pointerSize)
+    // Whether 'current' is a supertype of 'narrow' (or unknown), so an isinst result may be
+    // narrowed to it. Interfaces are always considered broader - the isinst result implements
+    // them by construction, and the concrete type is the more useful label.
+    private static bool IsBroaderThan(TypeAnalysisContext? current, TypeAnalysisContext narrow)
     {
+        if (current == null)
+            return true;
+
+        if (current.IsInterface)
+            return true;
+
+        for (var t = narrow.BaseType; t != null; t = t.BaseType)
+            if (ReferenceEquals(t, current))
+                return true;
+
+        return false;
+    }
+
+    private static bool PropagateMove(Instruction move, MethodAnalysisContext method)
+    {
+        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
         var destination = move.Operands[0];
         var source = move.Operands[1];
 
         // Move local, local: copy a known type in whichever direction is missing it.
         if (destination is LocalVariable destLocal && source is LocalVariable sourceLocal)
             return SetTypeIfUnknown(destLocal, sourceLocal.Type) || SetTypeIfUnknown(sourceLocal, destLocal.Type);
+
+        // Move local, array.Length: the length is always an int
+        if (destination is LocalVariable { Type: null } lengthDest && source is ArrayLength)
+            return SetTypeIfUnknown(lengthDest, method.AppContext.SystemTypes.SystemInt32Type);
 
         // Move local, &local: a byref-typed pointer tells us the pointee's type. The reverse is
         // done only for value-type pointees: &local of a struct is the ((T*)&local)->field
