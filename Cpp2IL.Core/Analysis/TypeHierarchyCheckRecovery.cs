@@ -45,9 +45,38 @@ public static class TypeHierarchyCheckRecovery
         }
 
         var definitions = new Dictionary<LocalVariable, Instruction>();
-        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        foreach (var instruction in method.ControlFlowGraph.Instructions)
             if (instruction.Destination is LocalVariable destination)
                 definitions[destination] = instruction;
+
+        // Fold bit tests on klass->bitflags1/2 where the tested bit is a compile-time property of
+        // the type: valuetype (0x132&1), enumtype (0x132&4), nullabletype (0x132&8), is_interface
+        // (0x133&0x10). Other bits (initialized, cctor flags) are runtime state and left alone.
+        foreach (var instruction in method.ControlFlowGraph.Instructions)
+        {
+            if (instruction.OpCode != OpCode.And || instruction.Operands.Count < 3)
+                continue;
+
+            for (var side = 1; side <= 2; side++)
+            {
+                if (instruction.Operands[side] is not Immediate { Value: var mask })
+                    continue;
+
+                var bitflagsMemory = instruction.Operands[side == 1 ? 2 : 1] switch
+                {
+                    MemoryOperand inline => inline,
+                    LocalVariable local when ChaseCopies(definitions, local) is { OpCode: OpCode.Move, Operands: [_, MemoryOperand loaded] } => loaded,
+                    _ => (MemoryOperand?)null,
+                };
+
+                if (FoldBitTest(bitflagsMemory, mask) is not { } folded)
+                    continue;
+
+                instruction.OpCode = OpCode.Move;
+                instruction.SetOperands(instruction.Operands[0], new Immediate(folded));
+                break;
+            }
+        }
 
         foreach (var block in method.ControlFlowGraph.Blocks)
         {
@@ -73,6 +102,27 @@ public static class TypeHierarchyCheckRecovery
             }
         }
     }
+
+    private static long? FoldBitTest(MemoryOperand? memory, long mask)
+    {
+        if (memory is not { Index: null, Scale: 0, Base: LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: { } type } } })
+            return null;
+
+        long? bit = (memory.Value.Addend, mask) switch
+        {
+            (0x132, 1) => type.IsValueType ? 1 : 0,
+            (0x132, 4) => type.IsEnumType ? 1 : 0,
+            (0x132, 8) => IsNullable(type) ? 1 : 0,
+            (0x133, 0x10) => type.IsInterface ? 1 : 0,
+            _ => null,
+        };
+
+        return bit == 1 ? mask : bit == 0 ? 0 : null;
+    }
+
+    private static bool IsNullable(TypeAnalysisContext type) =>
+        type is GenericInstanceTypeAnalysisContext { GenericType.FullName: "System.Nullable`1" }
+        || type.Definition is { Name: "Nullable`1" };
 
     private static (LocalVariable Object, TypeAnalysisContext Type)? TryMatch(Instruction check, Dictionary<LocalVariable, Instruction> definitions)
     {

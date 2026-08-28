@@ -195,9 +195,9 @@ public static class MetadataResolver
                 if (field == null) // TODO: Support nested fields (Field1.Field2.Field3)
                 {
                     // Nested value-type field: [base + X] where X lands inside a struct field
-                    // (e.g. a save-data struct embedded in another). Resolve to a field chain.
-                    if (staticOwner == null && genericOwner == null
-                        && FindNestedFieldPath(method, owner, memory.Addend) is { Count: > 0 } chain)
+                    // (e.g. a save-data struct embedded in another, or the .y of static Vector2.zero).
+                    if (genericOwner == null
+                        && FindNestedFieldPath(method, owner, memory.Addend, staticOwner != null) is { Count: > 0 } chain)
                     {
                         instruction.SetOperand(i, new FieldReference(chain[0], local!, (int)memory.Addend)
                         {
@@ -263,7 +263,7 @@ public static class MetadataResolver
     /// or null if no such path exists. Only value-type intermediates are followed, since a
     /// reference-type field points elsewhere in memory.
     /// </summary>
-    private static List<FieldAnalysisContext>? FindNestedFieldPath(MethodAnalysisContext method, TypeAnalysisContext owner, long offset)
+    private static List<FieldAnalysisContext>? FindNestedFieldPath(MethodAnalysisContext method, TypeAnalysisContext owner, long offset, bool isStatic = false)
     {
         var pointerSize = method.AppContext.Binary.PointerSizeBytes;
 
@@ -271,7 +271,7 @@ public static class MetadataResolver
         {
             foreach (var candidate in type.Fields)
             {
-                if (candidate.IsStatic || (candidate.Attributes & FieldAttributes.Literal) != 0)
+                if (candidate.IsStatic != isStatic || (candidate.Attributes & FieldAttributes.Literal) != 0)
                     continue;
 
                 var fieldOffset = candidate.BackingData?.FieldOffset ?? -1;
@@ -287,7 +287,7 @@ public static class MetadataResolver
 
                 // offset lands inside this struct field; resolve the leaf within it.
                 // One level of nesting only — deeper chains are rare and left unresolved.
-                if (FindExactFieldAtOffset(candidate.FieldType, offset - fieldOffset) is not { } leaf)
+                if (FindExactFieldAtOffset(candidate.FieldType, offset - fieldOffset, isStatic: false) is not { } leaf)
                     return null;
 
                 return [candidate, leaf];
@@ -297,11 +297,11 @@ public static class MetadataResolver
         return null;
     }
 
-    private static FieldAnalysisContext? FindExactFieldAtOffset(TypeAnalysisContext type, long offset)
+    private static FieldAnalysisContext? FindExactFieldAtOffset(TypeAnalysisContext type, long offset, bool isStatic)
     {
         for (var t = type; t != null; t = t.BaseType)
         {
-            var field = t.Fields.FirstOrDefault(f => !f.IsStatic
+            var field = t.Fields.FirstOrDefault(f => f.IsStatic == isStatic
                 && (f.Attributes & FieldAttributes.Literal) == 0
                 && f.BackingData?.FieldOffset == offset);
 

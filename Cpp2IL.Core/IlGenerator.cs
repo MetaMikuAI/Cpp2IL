@@ -563,8 +563,14 @@ public static class IlGenerator
                     }
 
                     // Nested value-type store: address into the intermediates, store the leaf
-                    LoadLocal(field.Local, method, locals);
-                    instructions.Add(CilOpCodes.Ldflda, field.Field.ToFieldDescriptor());
+                    if (field.Field.IsStatic)
+                        instructions.Add(CilOpCodes.Ldsflda, field.Field.ToFieldDescriptor());
+                    else
+                    {
+                        LoadLocal(field.Local, method, locals);
+                        instructions.Add(CilOpCodes.Ldflda, field.Field.ToFieldDescriptor());
+                    }
+
                     for (var i = 0; i < field.NestedFields.Length - 1; i++)
                         instructions.Add(CilOpCodes.Ldflda, field.NestedFields[i].ToFieldDescriptor());
 
@@ -978,6 +984,8 @@ public static class IlGenerator
                 if (field.Field.IsStatic)
                 {
                     instructions.Add(CilOpCodes.Ldsfld, field.Field.ToFieldDescriptor());
+                    foreach (var nested in field.NestedFields)
+                        instructions.Add(CilOpCodes.Ldfld, nested.ToFieldDescriptor());
                     break;
                 }
 
