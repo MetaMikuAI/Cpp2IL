@@ -103,26 +103,37 @@ public class ApplicationAnalysisContext : ContextWithDataStorage
     // Lazily built map of type -> direct subclasses, for resolving field accesses where the
     // receiver is typed as a base class but the field only exists on a subclass.
     private Dictionary<TypeAnalysisContext, List<TypeAnalysisContext>>? _subclassesByBaseType;
+    private readonly object _subclassMapLock = new();
 
     public List<TypeAnalysisContext> GetSubclasses(TypeAnalysisContext baseType)
     {
         if (_subclassesByBaseType == null)
         {
-            _subclassesByBaseType = new();
-
-            foreach (var type in AllTypes)
+            lock (_subclassMapLock)
             {
-                for (var parent = type.BaseType; parent != null; parent = parent.BaseType)
-                {
-                    if (!_subclassesByBaseType.TryGetValue(parent, out var list))
-                        _subclassesByBaseType[parent] = list = [];
-
-                    list.Add(type);
-                }
+                _subclassesByBaseType ??= BuildSubclassMap();
             }
         }
 
         return _subclassesByBaseType.TryGetValue(baseType, out var subclasses) ? subclasses : [];
+    }
+
+    private Dictionary<TypeAnalysisContext, List<TypeAnalysisContext>> BuildSubclassMap()
+    {
+        var map = new Dictionary<TypeAnalysisContext, List<TypeAnalysisContext>>();
+
+        foreach (var type in AllTypes)
+        {
+            for (var parent = type.BaseType; parent != null; parent = parent.BaseType)
+            {
+                if (!map.TryGetValue(parent, out var list))
+                    map[parent] = list = [];
+
+                list.Add(type);
+            }
+        }
+
+        return map;
     }
 
     /// <summary>

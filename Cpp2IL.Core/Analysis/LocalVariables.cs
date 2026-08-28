@@ -566,6 +566,18 @@ public static class LocalVariables
         if (destination is LocalVariable destLocal && source is LocalVariable sourceLocal)
             return SetTypeIfUnknown(destLocal, sourceLocal.Type) || SetTypeIfUnknown(sourceLocal, destLocal.Type);
 
+        // Move local, &local: a byref-typed pointer tells us the pointee's type. The reverse
+        // (typing the pointer as byref-to-pointee) is deliberately not done - an address-of local
+        // is often a raw buffer/memcpy target rather than a managed byref, and mistyping it
+        // sends field resolution down the wrong layout.
+        if (destination is LocalVariable ptrDest && source is AddressOf { Target: LocalVariable pointee })
+        {
+            if (ptrDest.Type is ByRefTypeAnalysisContext { ElementType: { } pointeeElement })
+                return SetTypeIfUnknown(pointee, pointeeElement);
+
+            return false;
+        }
+
         // Move local, field: a field load types its result with the field's type. This is the edge
         // that lets the loaded value go on to be the base of a further field access.
         if (destination is LocalVariable loadDest && source is FieldReference loadField)

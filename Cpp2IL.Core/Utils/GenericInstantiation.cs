@@ -14,10 +14,13 @@ internal static class GenericInstantiation
             case GenericParameterTypeAnalysisContext genericParameterTypeAnalysisContext:
             {
                 var index = genericParameterTypeAnalysisContext.Index;
+                // Partial instantiations (e.g. a generic method on a constructed type with no
+                // method arguments supplied) leave the parameter lists short - keep the bare
+                // parameter rather than indexing past the end.
                 return genericParameterTypeAnalysisContext.Type switch
                 {
-                    Il2CppTypeEnum.IL2CPP_TYPE_VAR => genericTypeParameters[index],
-                    _ => genericMethodParameters[index],
+                    Il2CppTypeEnum.IL2CPP_TYPE_VAR => index < genericTypeParameters.Count ? genericTypeParameters[index] : genericParameterTypeAnalysisContext,
+                    _ => index < genericMethodParameters.Count ? genericMethodParameters[index] : genericParameterTypeAnalysisContext,
                 };
             }
             case SzArrayTypeAnalysisContext szArrayTypeAnalysisContext:
