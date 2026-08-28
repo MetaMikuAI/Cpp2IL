@@ -911,6 +911,56 @@ public static class IlGenerator
         return null;
     }
 
+    // [ptr + idx] / [idx + ptr] element access through a raw pointer local (e.g. a fixed char*
+    // over string chars). The x86 addressing folds the scaling into the index register already,
+    // so we just add, apply any constant addend, and load the element.
+    private static bool TryEmitPointerElementLoad(MemoryOperand memory, MethodDefinition method,
+        Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
+    {
+        var ptrLocal = memory.Base as LocalVariable;
+        var idxLocal = memory.Index as LocalVariable;
+        TypeAnalysisContext? elementType = null;
+
+        if (ptrLocal?.Type is PointerTypeAnalysisContext { ElementType: { IsValueType: true } baseElement })
+        {
+            elementType = baseElement;
+        }
+        else
+        {
+            // maybe the base is the index and the index register holds the pointer
+            (ptrLocal, idxLocal) = (idxLocal, ptrLocal);
+
+            if (ptrLocal?.Type is PointerTypeAnalysisContext { ElementType: { IsValueType: true } indexElement })
+                elementType = indexElement;
+        }
+
+        if (elementType == null || ptrLocal == null || idxLocal == null)
+            return false;
+
+        var instructions = method.CilMethodBody!.Instructions;
+
+        LoadLocal(ptrLocal, method, locals);
+        LoadOperand(idxLocal, method, locals, writeLine);
+        instructions.Add(CilOpCodes.Conv_I);
+
+        if (memory.Scale > 1)
+        {
+            instructions.Add(CilOpCodes.Ldc_I4, memory.Scale);
+            instructions.Add(CilOpCodes.Mul);
+        }
+
+        instructions.Add(CilOpCodes.Add);
+
+        if (memory.Addend != 0)
+        {
+            instructions.Add(CilOpCodes.Ldc_I8, memory.Addend);
+            instructions.Add(CilOpCodes.Add);
+        }
+
+        instructions.Add(new CilInstruction(CilOpCodes.Ldobj, elementType.ToTypeSignature().ToTypeDefOrRef()));
+        return true;
+    }
+
     private static CilOpCode? FloatArithmeticConversion(Instruction instruction)
     {
         if (instruction.OpCode is not (OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.Modulo))
@@ -1007,6 +1057,12 @@ public static class IlGenerator
                             : new CilInstruction(CilOpCodes.Ldind_Ref));
                     break;
                 }
+
+                // Pointer arithmetic over a raw pointer local (e.g. fixed char* from a string):
+                // [ptr + idx] or [idx + ptr], element load through the computed address.
+                if (TryEmitPointerElementLoad(memory, method, locals, writeLine))
+                    break;
+
                 instructions.Add(CilOpCodes.Ldstr, Diagnostic("Unmanaged memory load: " + operand));
                 instructions.Add(CilOpCodes.Call, writeLine);
                 instructions.Add(CilOpCodes.Ldc_I4_0);
