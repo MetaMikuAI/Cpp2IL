@@ -129,24 +129,38 @@ public static class X86Utils
         bool foundTable = false;
         startIndex = 0;
         jumpTableElements = [];
+
         for (int i = (int)(methodPtr % 4); i < methodBytes.Length; i += 4)
         {
-            var result = (ulong)methodBytes.ReadUInt(i);
-            var possibleJumpAddress = result + 0x180000000; // image base
-            if (possibleJumpAddress > methodPtr && possibleJumpAddress < nextMethodPtr)
-            {
-                // Sound the alarms, we've more than likely ran into a jump table  
-                if (!foundTable)
-                {
-                    startIndex = i;
-                    foundTable = true;
-                }
+            if (!JumpTableEntryMatches(methodBytes, i, methodPtr, nextMethodPtr))
+                continue;
 
-                jumpTableElements.Add(result);
+            // A lone matching dword is far more likely an immediate that happens to look like an
+            // image offset than a jump table; require a matching neighbour so we don't truncate
+            // the method body (and lose real branch targets) on a coincidence.
+            if (!JumpTableEntryMatches(methodBytes, i - 4, methodPtr, nextMethodPtr)
+                && !JumpTableEntryMatches(methodBytes, i + 4, methodPtr, nextMethodPtr))
+                continue;
+
+            if (!foundTable)
+            {
+                startIndex = i;
+                foundTable = true;
             }
+
+            jumpTableElements.Add((ulong)methodBytes.ReadUInt(i));
         }
 
         return foundTable;
+    }
+
+    private static bool JumpTableEntryMatches(ReadOnlySpan<byte> methodBytes, int index, ulong methodPtr, ulong nextMethodPtr)
+    {
+        if (index < 0 || index + 4 > methodBytes.Length)
+            return false;
+
+        var possibleJumpAddress = (ulong)methodBytes.ReadUInt(index) + 0x180000000; // image base
+        return possibleJumpAddress > methodPtr && possibleJumpAddress < nextMethodPtr;
     }
 
     public static InstructionList GetMethodBodyAtVirtAddressNew(ulong addr, bool peek, Il2CppBinary binary, int peekLength = DefaultPeekLength) => GetMethodBodyAtVirtAddressNew(addr, peek, binary, out _, peekLength);
