@@ -40,6 +40,7 @@ public static class RuntimeHelperRecovery
         InterfaceDispatch,
         EmptyBody,
         IsInst,
+        InterlockedCmpxchg,
     }
 
     private static readonly ConcurrentDictionary<ulong, HelperKind> HelperKindCache = new();
@@ -78,6 +79,9 @@ public static class RuntimeHelperRecovery
                     break;
                 case HelperKind.IsInst:
                     RewriteIsInst(instruction, definitions);
+                    break;
+                case HelperKind.InterlockedCmpxchg:
+                    RewriteCompareExchange(method, instruction);
                     break;
             }
         }
@@ -178,32 +182,89 @@ public static class RuntimeHelperRecovery
         };
 
         if (invokeData == null)
+        {
             return;
+        }
 
         // The InvokeData comes from the slow path call's return value, e.g.
         // Move invokeData_v, rax_v <- Call slowPath, rax_v, obj(rcx), interface(rdx), slot(r8), ...
-        if (ChaseCopies(definitions, invokeData) is not { OpCode: OpCode.Call, Operands: [Immediate slowPathAddress, ..] } slowCall)
+        // With the fast path inlined, the merge block holds a phi(fastEntry, slowCallResult)
+        // instead - the slow call is then one of the phi's inputs.
+        var invokeDataDef = ChaseCopies(definitions, invokeData);
+
+        Instruction? slowCall = null;
+        Immediate? slowPathAddress = null;
+
+        if (invokeDataDef is { OpCode: OpCode.Call, Operands: [Immediate directAddress, ..] })
+        {
+            slowCall = invokeDataDef;
+            slowPathAddress = directAddress;
+        }
+        else if (invokeDataDef is { OpCode: OpCode.Phi })
+        {
+            foreach (var phiOperand in invokeDataDef.Operands.Skip(1))
+            {
+                if (phiOperand is not LocalVariable phiLocal
+                    || ChaseCopies(definitions, phiLocal) is not { OpCode: OpCode.Call, Operands: [Immediate phiAddress, ..] } candidate)
+                    continue;
+
+                slowCall = candidate;
+                slowPathAddress = phiAddress;
+                break;
+            }
+        }
+
+        if (slowCall == null || slowPathAddress == null)
+        {
             return;
+        }
 
         // Only handle unresolved targets; a managed callee needs no recovery
-        if (method.AppContext.MethodsByAddress.ContainsKey(slowPathAddress.UnsignedValue))
+        if (method.AppContext.MethodsByAddress.ContainsKey(slowPathAddress.Value.UnsignedValue))
+        {
             return;
+        }
 
         if (slowCall.Operands.Count < 5)
+        {
             return;
+        }
 
-        if (ChaseCopies(definitions, slowCall.Operands[3]) is not { OpCode: OpCode.Move, Operands: [_, TypeAnalysisContext declaringInterface] })
+        // interface argument (rdx): either a direct typeof operand or a local holding one
+        var declaringInterface = slowCall.Operands[3] switch
+        {
+            TypeAnalysisContext direct => direct,
+            LocalVariable interfaceLocal when ChaseCopies(definitions, interfaceLocal) is { OpCode: OpCode.Move, Operands: [_, TypeAnalysisContext loaded] } => loaded,
+            _ => null,
+        };
+
+        if (declaringInterface == null)
+        {
             return;
+        }
 
         if (declaringInterface is not (GenericInstanceTypeAnalysisContext { GenericType.IsInterface: true } or { IsInterface: true }))
+        {
             return;
+        }
 
-        if (ChaseCopies(definitions, slowCall.Operands[4]) is not { OpCode: OpCode.Move, Operands: [_, Immediate slotImmediate] }
-            || slotImmediate.Value is < 0 or > ushort.MaxValue)
-            return;
+        // slot argument (r8): usually a literal 0/N, directly or via a local
+        var slotValue = slowCall.Operands[4] switch
+        {
+            Immediate directImm => (long?)directImm.Value,
+            LocalVariable slotLocal when ChaseCopies(definitions, slotLocal) is { OpCode: OpCode.Move, Operands: [_, Immediate loadedImm] } => loadedImm.Value,
+            _ => null,
+        };
 
-        if (ResolveInterfaceSlot(declaringInterface, (int)slotImmediate.Value) is not { } resolved)
+        if (slotValue is not { } slot || slot is < 0 or > ushort.MaxValue)
+        {
             return;
+        }
+
+        if (ResolveInterfaceSlot(declaringInterface, (int)slot) is not { } resolved)
+        {
+            return;
+        }
 
         // Kill the slow path call; its return value dies with the rewrite below
         slowCall.OpCode = OpCode.Nop;
@@ -268,6 +329,10 @@ public static class RuntimeHelperRecovery
         {
             var insn = body[i];
 
+            // Interlocked.CompareExchange implementation: a lock-prefixed cmpxchg
+            if (insn.Mnemonic == Mnemonic.Cmpxchg && insn.HasLockPrefix)
+                return HelperKind.InterlockedCmpxchg;
+
             // Interface dispatch helper: movzx rXX, word [klass + interface_offsets_count]
             if (insn.Mnemonic == Mnemonic.Movzx
                 && insn.Op1Kind == OpKind.Memory
@@ -331,6 +396,42 @@ public static class RuntimeHelperRecovery
         }
 
         return callsAssignableFrom && testsResult;
+    }
+
+    // A lock cmpxchg [rcx], rdx with the new value in r8 is Interlocked.CompareExchange<T>'s
+    // shared body: (ref T location, T value, T comparand), old value returned in rax. The class
+    // form (reference types) is what gets called through wrappers and inlined into collections.
+    private static void RewriteCompareExchange(MethodAnalysisContext method, Instruction call)
+    {
+        if (call.OpCode != OpCode.Call || call.Operands.Count < 5)
+            return;
+
+        if (GetCompareExchangeMethod(method.AppContext) is not { } resolved)
+            return;
+
+        // unmanaged layout: [target, ret, rcx(ref), rdx(value), r8(comparand), ...]
+        call.SetOperands(resolved, call.Operands[1], call.Operands[2], call.Operands[3], call.Operands[4]);
+    }
+
+    private static MethodAnalysisContext? _compareExchange;
+
+    private static MethodAnalysisContext? GetCompareExchangeMethod(ApplicationAnalysisContext appContext)
+    {
+        if (_compareExchange != null)
+            return _compareExchange;
+
+        foreach (var assembly in appContext.Assemblies)
+        {
+            var interlocked = assembly.Types.FirstOrDefault(t => t.FullName == "System.Threading.Interlocked");
+            var cmpxchg = interlocked?.Methods.FirstOrDefault(m => m.Name == "CompareExchange" && m.GenericParameters.Count == 1);
+
+            if (cmpxchg == null)
+                continue;
+
+            return _compareExchange = new ConcreteGenericMethodAnalysisContext(cmpxchg, [], [appContext.SystemTypes.SystemObjectType]);
+        }
+
+        return null;
     }
 
     // isinst(obj, klass) has the managed layout (obj in rcx, type token in rdx), returning
