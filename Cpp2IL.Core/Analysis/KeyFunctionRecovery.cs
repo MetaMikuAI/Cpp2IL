@@ -36,6 +36,13 @@ public static class KeyFunctionRecovery
         nameof(BaseKeyFunctionAddresses.il2cpp_vm_object_box),
     ];
 
+    //Both take the boxed object and the class to unbox to.
+    private static readonly HashSet<string> UnboxFunctions =
+    [
+        nameof(BaseKeyFunctionAddresses.il2cpp_object_unbox),
+        nameof(BaseKeyFunctionAddresses.il2cpp_vm_object_unbox),
+    ];
+
     public static void Run(MethodAnalysisContext method)
     {
         foreach (var instruction in method.ControlFlowGraph!.Blocks.SelectMany(block => block.Instructions))
@@ -51,6 +58,8 @@ public static class KeyFunctionRecovery
                 RewriteRaiseException(instruction);
             else if (BoxFunctions.Contains(keyFunction))
                 RewriteBox(instruction);
+            else if (UnboxFunctions.Contains(keyFunction))
+                RewriteUnbox(instruction);
             else if (keyFunction == nameof(BaseKeyFunctionAddresses.il2cpp_vm_reflection_get_type_object))
                 RewriteTypeObject(instruction);
             else if (keyFunction == nameof(BaseKeyFunctionAddresses.InternalCalls_Resolve))
@@ -86,6 +95,29 @@ public static class KeyFunctionRecovery
 
         instruction.OpCode = OpCode.Box;
         instruction.SetOperands(result, boxedType, value);
+    }
+
+    private static void RewriteUnbox(Instruction instruction)
+    {
+        // function name, result, object, klass. The runtime returns a pointer to the value data;
+        // we surface it as unbox.any, which yields the value itself. The target value type appears
+        // as a typeof operand in the klass slot (rdx) or right after it (r8), or the klass local
+        // carries it as a runtime class.
+        if (instruction.OpCode != OpCode.Call || instruction.Operands.Count < 4)
+            return;
+
+        var unboxedType = instruction.Operands.Skip(3).OfType<TypeAnalysisContext>().FirstOrDefault()
+            ?? (instruction.Operands[3] as LocalVariable)?.Type switch
+            {
+                RuntimeClassTypeAnalysisContext { RepresentedType: { } represented } => represented,
+                _ => null,
+            };
+
+        if (unboxedType == null)
+            return;
+
+        instruction.OpCode = OpCode.Unbox;
+        instruction.SetOperands(instruction.Operands[1], instruction.Operands[2], unboxedType);
     }
 
     private static void RewriteTypeObject(Instruction instruction)

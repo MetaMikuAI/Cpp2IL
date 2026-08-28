@@ -457,6 +457,10 @@ public static class LocalVariables
                 case OpCode.Move:
                     changed |= PropagateMove(instruction, method.AppContext.Binary.PointerSizeBytes);
                     break;
+                case OpCode.Unbox:
+                    if (instruction.Operands is [LocalVariable { Type: null } unboxedDest, _, TypeAnalysisContext unboxedType])
+                        changed |= SetTypeIfUnknown(unboxedDest, unboxedType);
+                    break;
                 case OpCode.Phi:
                     changed |= PropagatePhi(instruction);
                     break;

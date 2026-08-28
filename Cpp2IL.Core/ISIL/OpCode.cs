@@ -134,5 +134,10 @@ public enum OpCode
     /// isinst. op 0 is the destination, op 1 is the object, op 2 is the type to test against.
     /// Yields the object if the cast succeeds, else null.
     /// </summary>
-    IsInst
+    IsInst,
+
+    /// <summary>
+    /// unbox.any. op 0 is the destination, op 1 is the boxed object, op 2 is the value type.
+    /// </summary>
+    Unbox
 }

@@ -661,6 +661,18 @@ public static class IlGenerator
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine);
                 break;
 
+            case OpCode.Unbox:
+                if (instruction.Operands is [_, var boxedObject, TypeAnalysisContext unboxedType])
+                {
+                    LoadOperand(boxedObject, method, locals, writeLine);
+                    instructions.Add(CilOpCodes.Unbox_Any, unboxedType.ToTypeSignature().ToTypeDefOrRef());
+                }
+                else
+                    instructions.Add(CilOpCodes.Ldnull);
+
+                StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+                break;
+
             case OpCode.Throw:
                 if (instruction.Operands is [TypeAnalysisContext exceptionType]
                     && exceptionType.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 0) is { } exceptionCtor)
