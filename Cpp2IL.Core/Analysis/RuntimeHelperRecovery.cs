@@ -41,6 +41,8 @@ public static class RuntimeHelperRecovery
         EmptyBody,
         IsInst,
         InterlockedCmpxchg,
+        ReferenceEquals,
+        ReferenceNotEquals,
     }
 
     private static readonly ConcurrentDictionary<ulong, HelperKind> HelperKindCache = new();
@@ -82,6 +84,12 @@ public static class RuntimeHelperRecovery
                     break;
                 case HelperKind.InterlockedCmpxchg:
                     RewriteCompareExchange(method, instruction);
+                    break;
+                case HelperKind.ReferenceEquals:
+                    RewriteReferenceCompare(instruction, OpCode.CheckEqual);
+                    break;
+                case HelperKind.ReferenceNotEquals:
+                    RewriteReferenceCompare(instruction, OpCode.CheckNotEqual);
                     break;
             }
         }
@@ -309,6 +317,52 @@ public static class RuntimeHelperRecovery
         resolved.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(dispatch, resolved);
     }
 
+    // cmp rcx, rdx; setne|sete al; (movzx eax, al;) ret - optionally with a not after the set.
+    private static bool IsReferenceCompare(InstructionList body, out bool isEquality)
+    {
+        isEquality = false;
+
+        if (body.Count < 3)
+            return false;
+
+        if (body[0].Mnemonic != Mnemonic.Cmp
+            || body[0].Op0Kind != OpKind.Register || body[0].Op0Register != Iced.Intel.Register.RCX
+            || body[0].Op1Kind != OpKind.Register || body[0].Op1Register != Iced.Intel.Register.RDX)
+            return false;
+
+        var index = 1;
+
+        // setne (a != b) or sete (a == b); setne is the common form
+        if (body[index].Mnemonic == Mnemonic.Setne)
+            isEquality = false;
+        else if (body[index].Mnemonic == Mnemonic.Sete)
+            isEquality = true;
+        else
+            return false;
+
+        if (body[index].Op0Kind != OpKind.Register || body[index].Op0Register != Iced.Intel.Register.AL)
+            return false;
+
+        index++;
+
+        // optional: movzx eax, al
+        if (index < body.Count && body[index].Mnemonic == Mnemonic.Movzx
+            && body[index].Op0Kind == OpKind.Register && body[index].Op0Register == Iced.Intel.Register.EAX)
+            index++;
+
+        return index < body.Count && body[index].Mnemonic == Mnemonic.Ret;
+    }
+
+    // a != b / a == b as a comparison instruction instead of a call.
+    private static void RewriteReferenceCompare(Instruction call, OpCode comparison)
+    {
+        if (call.OpCode != OpCode.Call || call.Operands.Count < 4)
+            return;
+
+        call.OpCode = comparison;
+        call.SetOperands(call.Operands[1], call.Operands[2], call.Operands[3]);
+    }
+
     private static HelperKind Classify(ApplicationAnalysisContext appContext, ulong address)
         => HelperKindCache.GetOrAdd(address, addr => ClassifyUncached(appContext, addr));
 
@@ -353,6 +407,11 @@ public static class RuntimeHelperRecovery
         // stubs such as System.Object::.ctor.
         if (body[0].Mnemonic == Mnemonic.Ret)
             return HelperKind.EmptyBody;
+
+        // Reference comparison helper (object.ReferenceEquals / record op_Inequality shared
+        // bodies): cmp rcx, rdx; setne|sete al; ret - the call is just a != b / a == b.
+        if (IsReferenceCompare(body, out var isEquality))
+            return isEquality ? HelperKind.ReferenceEquals : HelperKind.ReferenceNotEquals;
 
         var scanLength = Math.Min(body.Count, 32);
 
