@@ -655,7 +655,16 @@ public static class MetadataResolver
 
                 if (hiddenParamIndex >= instruction.Operands.Count
                     || AsMethodInfo(instruction.Operands[hiddenParamIndex]) == null)
-                    continue;
+                {
+                    // The managed index doesn't line up with the raw register layout (large struct
+                    // args shift slots), but the methodof operand itself is strong evidence the
+                    // call passes the hidden MethodInfo parameter for this callee.
+                    var argumentCount = instruction.Operands.Count - firstArg;
+                    var expectedArguments = (representedMethod.IsStatic ? 0 : 1) + representedMethod.Parameters.Count + 1;
+
+                    if (argumentCount < expectedArguments)
+                        continue;
+                }
 
                 instruction.SetOperand(0, representedMethod);
                 representedMethod.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, representedMethod);

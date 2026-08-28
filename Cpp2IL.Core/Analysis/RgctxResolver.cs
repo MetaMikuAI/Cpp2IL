@@ -38,6 +38,10 @@ public static class RgctxResolver
                 RuntimeMethodInfoAnalysisContext info when memory.Addend == klassOffset && info.RepresentedMethod.DeclaringType is { } declaring
                     => new RuntimeClassTypeAnalysisContext(declaring, declaring.DeclaringAssembly),
 
+                // MethodInfo::return_type
+                RuntimeMethodInfoAnalysisContext info2 when memory.Addend == (is32Bit ? 0x14 : 0x28) && info2.RepresentedMethod.ReturnType is { } returnType
+                    => new RuntimeClassTypeAnalysisContext(returnType, returnType.DeclaringAssembly ?? info2.DeclaringAssembly),
+
                 RuntimeMethodInfoAnalysisContext { RepresentedMethod: { } owningMethod } when memory.Addend == methodRgctxOffset && HasMethodRgctx(owningMethod)
                     => new MethodRgctxTableTypeAnalysisContext(owningMethod, owningMethod.CustomAttributeAssembly),
 

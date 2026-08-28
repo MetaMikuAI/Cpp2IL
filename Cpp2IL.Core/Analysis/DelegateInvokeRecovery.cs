@@ -14,7 +14,9 @@ public static class DelegateInvokeRecovery
         var instructions = method.ControlFlowGraph!.Blocks.SelectMany(block => block.Instructions).ToList();
 
         // Il2CppObject is two pointers (klass, monitor), then method_ptr, then invoke_impl.
-        var invokeImplOffset = (method.AppContext.Binary.is32Bit ? 4 : 8) * 3;
+        var pointerSize = method.AppContext.Binary.is32Bit ? 4 : 8;
+        var methodPtrOffset = pointerSize * 2;
+        var invokeImplOffset = pointerSize * 3;
 
         foreach (var instruction in instructions)
         {
@@ -25,14 +27,15 @@ public static class DelegateInvokeRecovery
 
             if (GetInvokeImplLoad(instruction, instructions) is { } memory)
             {
-                if (memory.Addend != invokeImplOffset || memory.Index != null || memory.Scale != 0)
+                if (memory.Index != null || memory.Scale != 0
+                    || memory.Addend != invokeImplOffset && memory.Addend != methodPtrOffset)
                     continue;
 
                 delegateLocal = memory.Base as LocalVariable;
             }
-            else if (instruction.Operands[0] is FieldReference { Field.Name: "invoke_impl", Local: { } fieldBase })
+            else if (instruction.Operands[0] is FieldReference { Field.Name: "invoke_impl" or "method_ptr", Local: { } fieldBase })
             {
-                // Field resolution already turned [delegate + 0x18] into delegate.invoke_impl
+                // Field resolution already turned the load into delegate.invoke_impl / .method_ptr
                 delegateLocal = fieldBase;
             }
 

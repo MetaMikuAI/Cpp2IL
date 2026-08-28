@@ -126,6 +126,9 @@ public static class LocalVariables
                 continue;
 
             local.Name = method.Parameters[i].ParameterName;
+            // Typing the unversioned parameter slot lets struct-typed parameters (UniTask,
+            // awaiters, vectors) resolve field accesses through their stack copies.
+            SetTypeIfUnknown(local, method.Parameters[i].ParameterType);
             paramLocals.Add(local);
         }
 
