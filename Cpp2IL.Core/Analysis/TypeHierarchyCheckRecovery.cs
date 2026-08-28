@@ -29,6 +29,10 @@ public static class TypeHierarchyCheckRecovery
         {
             for (var i = 0; i < instruction.Operands.Count; i++)
             {
+                // never fold a store target - only loads
+                if (instruction.OpCode == OpCode.Move && i == 0 && instruction.Operands[0] is MemoryOperand)
+                    continue;
+
                 if (instruction.Operands[i] is not MemoryOperand { Index: null, Scale: 0, Addend: TypeHierarchyDepthOffset64, Base: LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: { } represented } } })
                     continue;
 
@@ -44,6 +48,20 @@ public static class TypeHierarchyCheckRecovery
             }
         }
 
+        // Fold [methodInfo + slot] to the constant vtable slot: for a methodof-loaded MethodInfo
+        // the slot is compile-time known, which then lets vtable-indexed dispatch resolve.
+        foreach (var instruction in method.ControlFlowGraph.Instructions)
+        {
+            for (var i = 0; i < instruction.Operands.Count; i++)
+            {
+                if (instruction.OpCode == OpCode.Move && i == 0 && instruction.Operands[0] is MemoryOperand)
+                    continue;
+
+                if (instruction.Operands[i] is MemoryOperand { Index: null, Scale: 0, Addend: 0x50, Base: LocalVariable { Type: RuntimeMethodInfoAnalysisContext { RepresentedMethod: { Definition: { } methodDef } } } })
+                    instruction.SetOperand(i, new Immediate(methodDef.slot));
+            }
+        }
+
         var definitions = new Dictionary<LocalVariable, Instruction>();
         foreach (var instruction in method.ControlFlowGraph.Instructions)
             if (instruction.Destination is LocalVariable destination)
@@ -56,6 +74,9 @@ public static class TypeHierarchyCheckRecovery
         {
             for (var i = 0; i < instruction.Operands.Count; i++)
             {
+                if (instruction.OpCode == OpCode.Move && i == 0 && instruction.Operands[0] is MemoryOperand)
+                    continue;
+
                 if (instruction.Operands[i] is MemoryOperand { Index: null, Scale: 0, Addend: 0xD8 or 0xE0, Base: LocalVariable { Type: RuntimeClassTypeAnalysisContext } })
                     instruction.SetOperand(i, new Immediate(1));
             }
