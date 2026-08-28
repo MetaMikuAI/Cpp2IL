@@ -368,8 +368,15 @@ public static class LocalVariables
                     if (parameterIndex > calledMethod.Parameters.Count - 1) // Probably MethodInfo*
                         continue;
 
+                    // For concrete generic callees, substitute the actual type arguments so e.g.
+                    // ref TAwaiter lands as ref UniTask<T>.Awaiter instead of the bare parameter.
+                    var parameterType = calledMethod.Parameters[parameterIndex].ParameterType;
+
+                    if (calledMethod is ConcreteGenericMethodAnalysisContext concrete)
+                        parameterType = GenericInstantiation.Instantiate(parameterType, concrete.TypeGenericParameters, concrete.MethodGenericParameters);
+
                     if (instruction.Operands[i] is AddressOf { Target: LocalVariable referenced }
-                        && calledMethod.Parameters[parameterIndex].ParameterType is ByRefTypeAnalysisContext { ElementType: { } referencedType })
+                        && parameterType is ByRefTypeAnalysisContext { ElementType: { } referencedType })
                         changed |= SetTypeIfUnknown(referenced, referencedType);
                 }
 
@@ -659,6 +666,11 @@ public static class LocalVariables
             if (instruction.Destination is LocalVariable returnValue)
             {
                 var producedType = calledMethod.Name is ".ctor" or ".cctor" ? calledMethod.DeclaringType : calledMethod.ReturnType;
+
+                // Substitute actual type arguments for concrete generic callees (TResult -> the
+                // instantiated type), so the result isn't typed as a bare generic parameter.
+                if (calledMethod is ConcreteGenericMethodAnalysisContext concreteCallee)
+                    producedType = GenericInstantiation.Instantiate(producedType, concreteCallee.TypeGenericParameters, concreteCallee.MethodGenericParameters);
 
                 if (producedType != method.AppContext.SystemTypes.SystemVoidType)
                     changed |= SetTypeIfUnknown(returnValue, producedType);
