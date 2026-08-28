@@ -953,10 +953,14 @@ public class X86InstructionSet : Cpp2IlInstructionSet
                 {
                     var jumpTarget = instruction.NearBranchTarget;
 
-                    var methodEnd = instruction.IP + (ulong)context.RawBytes.Length;
                     var methodStart = context.UnderlyingPointer;
+                    var methodEnd = methodStart + (ulong)context.RawBytes.Length;
 
-                    if (jumpTarget < methodStart || jumpTarget > methodEnd)
+                    // A jmp landing on another function's entry point is a tail call, not an
+                    // in-method branch - the method length can overestimate when the following
+                    // function isn't in the known-starts list.
+                    if (jumpTarget < methodStart || jumpTarget > methodEnd
+                        || jumpTarget != methodStart && context.AppContext.MethodsByAddress.ContainsKey(jumpTarget))
                     {
                         callNoReturn = true;
                         goto case Mnemonic.Call;
