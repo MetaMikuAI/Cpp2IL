@@ -164,9 +164,9 @@ public static class MetadataResolver
                 if (memory.Base is not LocalVariable local || local?.Type == null)
                     continue;
 
-                // check if static field access
+                // check if static field access; a byref local dereferences to its element type
                 var staticOwner = (local.Type as StaticFieldStorageTypeAnalysisContext)?.OwnerType;
-                var owner = staticOwner ?? local.Type;
+                var owner = staticOwner ?? (local.Type as ByRefTypeAnalysisContext)?.ElementType ?? local.Type;
                 var genericOwner = owner as GenericInstanceTypeAnalysisContext;
 
                 FieldAnalysisContext? field;
@@ -460,6 +460,22 @@ public static class MetadataResolver
     private static bool AreInterchangeable(List<MethodAnalysisContext> candidates)
     {
         var first = candidates[0];
+
+        // Candidates share one body by definition (same address), so their behavior is identical.
+        // For static methods from the same assembly the declaring type is then irrelevant to the
+        // call's semantics - e.g. Environment.get_CurrentManagedThreadId and
+        // TraceEventCache.GetThreadId (both corlib) compile to the same body, and either name
+        // decompiles correctly. Shared generic bodies behave differently per instance (different
+        // rgctx), so those are never interchangeable.
+        if (first.IsStatic
+            && candidates.All(c => c.IsStatic
+                && c is not ConcreteGenericMethodAnalysisContext
+                && ReferenceEquals(c.DeclaringType?.DeclaringAssembly, first.DeclaringType?.DeclaringAssembly)))
+        {
+            return candidates.All(c => ReferenceEquals(c.ReturnType, first.ReturnType)
+                && c.Parameters.Count == first.Parameters.Count
+                && SameParameterTypes(c, first));
+        }
 
         return candidates.All(c => c.IsStatic == first.IsStatic
             && ReferenceEquals(c.DeclaringType, first.DeclaringType)

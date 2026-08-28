@@ -49,6 +49,18 @@ public static class TypeHierarchyCheckRecovery
             if (instruction.Destination is LocalVariable destination)
                 definitions[destination] = instruction;
 
+        // Fold cctor guard loads ([klass + cctor_finished/_or_no_cctor]) to "initialized". The
+        // conditional class-init call then goes dead and is cleaned up, matching C# where the
+        // static constructor runs implicitly.
+        foreach (var instruction in method.ControlFlowGraph.Instructions)
+        {
+            for (var i = 0; i < instruction.Operands.Count; i++)
+            {
+                if (instruction.Operands[i] is MemoryOperand { Index: null, Scale: 0, Addend: 0xD8 or 0xE0, Base: LocalVariable { Type: RuntimeClassTypeAnalysisContext } })
+                    instruction.SetOperand(i, new Immediate(1));
+            }
+        }
+
         // Fold bit tests on klass->bitflags1/2 where the tested bit is a compile-time property of
         // the type: valuetype (0x132&1), enumtype (0x132&4), nullabletype (0x132&8), is_interface
         // (0x133&0x10). Other bits (initialized, cctor flags) are runtime state and left alone.

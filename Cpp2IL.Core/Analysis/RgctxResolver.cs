@@ -49,6 +49,11 @@ public static class RgctxResolver
                     when memory.Addend == (is32Bit ? 0x24 : 0x40)
                     => new RuntimeClassTypeAnalysisContext(elementType, klass.DeclaringAssembly),
 
+                // Il2CppClass::static_fields - the type's static field storage block
+                RuntimeClassTypeAnalysisContext { RepresentedType: { } staticsOwner } klass2
+                    when memory.Addend == (is32Bit ? 0x5C : 0xB8)
+                    => new StaticFieldStorageTypeAnalysisContext(staticsOwner, klass2.DeclaringAssembly),
+
                 RgctxTableTypeAnalysisContext table when memory.Addend % pointerSize == 0
                     => GetOrResolveEntry(table.ResolvedEntries, (int)(memory.Addend / pointerSize), () => ResolveTypeEntry(table.OwnerType, (int)(memory.Addend / pointerSize))),
 

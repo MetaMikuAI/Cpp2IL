@@ -342,34 +342,67 @@ public static class LocalVariables
     {
         var changed = false;
 
-        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        foreach (var block in method.ControlFlowGraph!.Blocks)
         {
-            if (!instruction.IsCall || instruction.Operands[0] is not MethodAnalysisContext calledMethod)
-                continue;
-
-            var firstArg = instruction.OpCode == OpCode.CallVoid ? 1 : 2;
-
-            // the receiver of a value type's instance method is a pointer to the value
-            if (!calledMethod.IsStatic && firstArg < instruction.Operands.Count
-                && instruction.Operands[firstArg] is AddressOf { Target: LocalVariable receiver }
-                && calledMethod.DeclaringType is { IsValueType: true } declaringType)
-                changed |= SetTypeIfUnknown(receiver, declaringType);
-
-            var paramOffset = firstArg + (calledMethod.IsStatic ? 0 : 1);
-
-            for (var i = paramOffset; i < instruction.Operands.Count; i++)
+            foreach (var instruction in block.Instructions)
             {
-                var parameterIndex = i - paramOffset;
-                if (parameterIndex > calledMethod.Parameters.Count - 1) // Probably MethodInfo*
+                if (!instruction.IsCall || instruction.Operands[0] is not MethodAnalysisContext calledMethod)
                     continue;
 
-                if (instruction.Operands[i] is AddressOf { Target: LocalVariable referenced }
-                    && calledMethod.Parameters[parameterIndex].ParameterType is ByRefTypeAnalysisContext { ElementType: { } referencedType })
-                    changed |= SetTypeIfUnknown(referenced, referencedType);
+                var firstArg = instruction.OpCode == OpCode.CallVoid ? 1 : 2;
+
+                // the receiver of a value type's instance method is a pointer to the value
+                if (!calledMethod.IsStatic && firstArg < instruction.Operands.Count
+                    && instruction.Operands[firstArg] is AddressOf { Target: LocalVariable receiver }
+                    && calledMethod.DeclaringType is { IsValueType: true } declaringType)
+                    changed |= SetTypeIfUnknown(receiver, declaringType);
+
+                var paramOffset = firstArg + (calledMethod.IsStatic ? 0 : 1);
+
+                for (var i = paramOffset; i < instruction.Operands.Count; i++)
+                {
+                    var parameterIndex = i - paramOffset;
+                    if (parameterIndex > calledMethod.Parameters.Count - 1) // Probably MethodInfo*
+                        continue;
+
+                    if (instruction.Operands[i] is AddressOf { Target: LocalVariable referenced }
+                        && calledMethod.Parameters[parameterIndex].ParameterType is ByRefTypeAnalysisContext { ElementType: { } referencedType })
+                        changed |= SetTypeIfUnknown(referenced, referencedType);
+                }
+
+                // A callee returning a large struct takes a hidden return buffer in rcx, which is
+                // not in the operand list; the buffer's type is the callee's return type.
+                if (calledMethod.AppContext.InstructionSet.CallingConventionResolver?.ReturnsViaHiddenBuffer(calledMethod) == true)
+                    changed |= TypeHiddenReturnBuffer(block, instruction, calledMethod);
             }
         }
 
         return changed;
+    }
+
+    private static bool TypeHiddenReturnBuffer(Graphs.Block block, Instruction call, MethodAnalysisContext calledMethod)
+    {
+        for (var j = block.Instructions.IndexOf(call) - 1; j >= 0; j--)
+        {
+            var candidate = block.Instructions[j];
+
+            if (candidate.OpCode is OpCode.Call or OpCode.CallVoid or OpCode.IndirectCall)
+                return false; // rcx belongs to an earlier call, don't guess across it
+
+            if (candidate.OpCode != OpCode.Move || candidate.Operands.Count < 2)
+                continue;
+
+            // SSA versioning renames registers (rcx -> rcx_v5)
+            if (candidate.Operands[0] is not LocalVariable { Register.Name: { } registerName }
+                || registerName is not ("rcx" or "ecx")
+                && !registerName.StartsWith("rcx_v") && !registerName.StartsWith("ecx_v"))
+                continue;
+
+            return candidate.Operands[1] is AddressOf { Target: LocalVariable buffer }
+                   && SetTypeIfUnknown(buffer, calledMethod.ReturnType);
+        }
+
+        return false;
     }
 
     // Fills in a local's type only when it is currently unknown, keeping propagation monotonic (a
