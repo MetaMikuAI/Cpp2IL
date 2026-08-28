@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using Cpp2IL.Core.Model.Contexts;
@@ -55,14 +56,43 @@ public static class GenericInstanceFieldLayout
         if (fieldType.IsEnumType && fieldType.Fields.FirstOrDefault(f => !f.IsStatic) is { } underlying)
             return GetSizeAndAlignment(underlying.FieldType, pointerSize, genericArguments);
 
-        return fieldType.FullName switch
+        var primitive = fieldType.FullName switch
         {
-            "System.Boolean" or "System.Byte" or "System.SByte" => (1, 1),
+            "System.Boolean" or "System.Byte" or "System.SByte" => ((long Size, long Alignment)?)(1, 1),
             "System.Int16" or "System.UInt16" or "System.Char" => (2, 2),
             "System.Int32" or "System.UInt32" or "System.Single" => (4, 4),
             "System.Int64" or "System.UInt64" or "System.Double" => (8, 8),
             "System.IntPtr" or "System.UIntPtr" => (pointerSize, pointerSize),
-            _ => null // an arbitrary struct needs its own layout computed, bail rather than guess
+            _ => null
         };
+
+        if (primitive != null)
+            return primitive;
+
+        // A user-defined struct: compute its layout from its fields. Size is the aligned sum,
+        // alignment is the largest field alignment - matching the CLI's sequential layout.
+        long size = 0;
+        long alignment = 1;
+
+        for (var type = fieldType; type != null; type = type.BaseType)
+        {
+            foreach (var field in type.Fields)
+            {
+                if (field.IsStatic)
+                    continue;
+
+                if (GetSizeAndAlignment(field.FieldType, pointerSize, genericArguments) is not var (fieldSize, fieldAlign))
+                    return null;
+
+                alignment = Math.Max(alignment, fieldAlign);
+                size = (size + fieldAlign - 1) & ~(fieldAlign - 1);
+                size += fieldSize;
+            }
+        }
+
+        if (size == 0)
+            return null;
+
+        return ((size + alignment - 1) & ~(alignment - 1), alignment);
     }
 }
