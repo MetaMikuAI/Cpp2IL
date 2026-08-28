@@ -1,0 +1,144 @@
+using System.Collections.Generic;
+using Cpp2IL.Core.ISIL;
+using Cpp2IL.Core.Model.Contexts;
+
+namespace Cpp2IL.Core.Analysis;
+
+/// <summary>
+/// Recovers <c>obj is T</c> / <c>as T</c> checks that il2cpp inlines as a typeHierarchy probe:
+/// <code>
+///   srcKlass = [obj]; th = [srcKlass + 0xC8]; entry = [th + T.depth*8 - 8]; check = entry == klass(T)
+/// </code>
+/// The comparison is equivalent to <c>isinst(obj, T) != null</c>, which the IL layer already
+/// knows how to emit, so the whole probe collapses to an IsInst plus a null test.
+/// </summary>
+public static class TypeHierarchyCheckRecovery
+{
+    private const long TypeHierarchyOffset64 = 0xC8;
+    private const long TypeHierarchyDepthOffset64 = 0x12C;
+    private const long InterfaceOffsetsOffset64 = 0xB0;
+
+    public static void Run(MethodAnalysisContext method)
+    {
+        if (method.AppContext.Binary.PointerSizeBytes != 8)
+            return;
+
+        // Fold [klass + typeHierarchyDepth] to a constant: unlike cctor flags, the depth is fixed
+        // at compile time, so both sides of the depth guard collapse and the whole probe dies.
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
+            for (var i = 0; i < instruction.Operands.Count; i++)
+            {
+                if (instruction.Operands[i] is not MemoryOperand { Index: null, Scale: 0, Addend: TypeHierarchyDepthOffset64, Base: LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: { } represented } } })
+                    continue;
+
+                if (represented.IsInterface)
+                    continue;
+
+                var depth = 0L;
+                for (var t = represented; t != null; t = t.BaseType)
+                    depth++;
+
+                if (depth > 0)
+                    instruction.SetOperand(i, new Immediate(depth));
+            }
+        }
+
+        var definitions = new Dictionary<LocalVariable, Instruction>();
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+            if (instruction.Destination is LocalVariable destination)
+                definitions[destination] = instruction;
+
+        foreach (var block in method.ControlFlowGraph.Blocks)
+        {
+            for (var i = 0; i < block.Instructions.Count; i++)
+            {
+                var instruction = block.Instructions[i];
+
+                if (instruction.OpCode is not (OpCode.CheckEqual or OpCode.CheckNotEqual) || instruction.Operands.Count < 3)
+                    continue;
+
+                if (TryMatch(instruction, definitions) is not { } match)
+                    continue;
+
+                var isinstLocal = new LocalVariable("isinstResult", new Register(null, "rax"));
+                method.Locals.Add(isinstLocal);
+                block.Instructions.Insert(i, new Instruction(instruction.Index, OpCode.IsInst, isinstLocal, match.Object, match.Type));
+                i++; // skip over the inserted instruction
+
+                // entry == klass(T)  <=>  isinst(obj, T) != null
+                instruction.SetOperand(1, isinstLocal);
+                instruction.SetOperand(2, new Immediate(0));
+                instruction.OpCode = instruction.OpCode == OpCode.CheckEqual ? OpCode.CheckNotEqual : OpCode.CheckEqual;
+            }
+        }
+    }
+
+    private static (LocalVariable Object, TypeAnalysisContext Type)? TryMatch(Instruction check, Dictionary<LocalVariable, Instruction> definitions)
+    {
+        for (var side = 1; side <= 2; side++)
+        {
+            var type = ResolveTypeOperand(check.Operands[side], definitions);
+            var entryOperand = check.Operands[side == 1 ? 2 : 1];
+
+            if (type == null || type.IsValueType)
+                continue;
+
+            // entry = [th + idx*8 - 8]  (th[targetDepth - 1]), either inline in the comparison
+            // (cmp [mem], reg) or loaded into a local first
+            var entryMemory = entryOperand switch
+            {
+                MemoryOperand inline => inline,
+                LocalVariable entryLocal when ChaseCopies(definitions, entryLocal) is { OpCode: OpCode.Move, Operands: [_, MemoryOperand loaded] } => loaded,
+                _ => (MemoryOperand?)null,
+            };
+
+            if (entryMemory is not { Scale: 8, Base: LocalVariable thLocal, Index: not null } mem
+                || mem.Addend is not (0 or -8 or 0xFFFFFFF8L)) // th[depth-1]; 32-bit displacement may be kept unsigned
+                continue;
+
+            // th = [srcKlass + typeHierarchy] for class checks, or [srcKlass + interfaceOffsets]
+            // for interface checks; both mean "obj's type hierarchy contains T"
+            if (ChaseCopies(definitions, thLocal) is not { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Index: null, Scale: 0, Base: LocalVariable srcKlass } thMem] }
+                || thMem.Addend is not (TypeHierarchyOffset64 or InterfaceOffsetsOffset64))
+                continue;
+
+            // srcKlass = [obj]  (obj->klass)
+            if (ChaseCopies(definitions, srcKlass) is not { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Index: null, Scale: 0, Addend: 0, Base: LocalVariable objLocal }] })
+                continue;
+
+            return (objLocal, type);
+        }
+
+        return null;
+    }
+
+    private static TypeAnalysisContext? ResolveTypeOperand(IOperand operand, Dictionary<LocalVariable, Instruction> definitions) =>
+        operand switch
+        {
+            TypeAnalysisContext type => type,
+            LocalVariable local when ChaseCopies(definitions, local) is { OpCode: OpCode.Move, Operands: [_, TypeAnalysisContext type] } => type,
+            _ => null,
+        };
+
+    private static Instruction? ChaseCopies(Dictionary<LocalVariable, Instruction> definitions, LocalVariable local)
+    {
+        var visited = new HashSet<LocalVariable>();
+
+        while (visited.Add(local))
+        {
+            if (!definitions.TryGetValue(local, out var definition))
+                return null;
+
+            if (definition is { OpCode: OpCode.Move, Operands: [_, LocalVariable source] })
+            {
+                local = source;
+                continue;
+            }
+
+            return definition;
+        }
+
+        return null;
+    }
+}

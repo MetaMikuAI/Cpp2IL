@@ -416,6 +416,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Needs type resolved for delegate locals
         DelegateInvokeRecovery.Run(this);
         RuntimeHelperRecovery.Run(this);
+        TypeHierarchyCheckRecovery.Run(this);
         BooleanFlagSimplifier.Run(this);
         DeadCodeEliminator.Run(this);
 

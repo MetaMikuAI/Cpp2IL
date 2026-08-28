@@ -108,8 +108,8 @@ public static class RuntimeHelperRecovery
     {
         var pointerLoad = dispatch.Operands[0] switch
         {
-            MemoryOperand { Index: null, Scale: 0, Addend: 0 or 8, Base: LocalVariable memoryBase } => memoryBase,
-            LocalVariable target => ChaseCopies(definitions, target) is { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Index: null, Scale: 0, Addend: 0 or 8, Base: LocalVariable chaseBase }] }
+            MemoryOperand { Index: null, Scale: 0, Addend: 0 or 8 or 0x10, Base: LocalVariable memoryBase } => memoryBase,
+            LocalVariable target => ChaseCopies(definitions, target) is { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Index: null, Scale: 0, Addend: 0 or 8 or 0x10, Base: LocalVariable chaseBase }] }
                 ? chaseBase
                 : null,
             _ => null,
@@ -140,14 +140,15 @@ public static class RuntimeHelperRecovery
         block.CalculateBlockType();
     }
 
-    // Shared generic code invokes virtual methods via MethodInfo::virtualMethodPointer (+8), or
-    // calls them directly via methodPointer (+0). The MethodInfo local already names the method.
+    // Shared generic code invokes methods via MethodInfo: methodPointer (+0), virtualMethodPointer
+    // (+8) for virtual dispatch, and invoker_method (+0x10) for generic instances. The MethodInfo
+    // local already names the method in every case.
     private static void ResolveMethodInfoPointerCall(Instruction dispatch, Dictionary<LocalVariable, Instruction> definitions)
     {
         var pointerLoad = dispatch.Operands[0] switch
         {
-            MemoryOperand { Index: null, Scale: 0, Addend: 0 or 8, Base: LocalVariable memoryBase } => memoryBase,
-            LocalVariable target => ChaseCopies(definitions, target) is { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Index: null, Scale: 0, Addend: 0 or 8, Base: LocalVariable chaseBase }] }
+            MemoryOperand { Index: null, Scale: 0, Addend: 0 or 8 or 0x10, Base: LocalVariable memoryBase } => memoryBase,
+            LocalVariable target => ChaseCopies(definitions, target) is { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Index: null, Scale: 0, Addend: 0 or 8 or 0x10, Base: LocalVariable chaseBase }] }
                 ? chaseBase
                 : null,
             _ => null,
