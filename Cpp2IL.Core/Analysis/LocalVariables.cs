@@ -266,6 +266,7 @@ public static class LocalVariables
             changed |= RgctxResolver.Run(method);
             changed |= PropagateStaticFieldStorage(method);
             changed |= TypeAddressedLocals(method);
+            changed |= PropagateStackSlotTypes(method);
             changed |= PropagateTypesOnce(method);
         }
     }
@@ -468,6 +469,80 @@ public static class LocalVariables
         }
 
         return changed;
+    }
+
+    // Locals and parameters stored to a frame slot carry their declared type; a load from the
+    // same slot inherits it. This is the main way async state-machine locals (awaiters, tuples,
+    // big structs spilled to the frame) get their types.
+    public static bool PropagateStackSlotTypes(MethodAnalysisContext method)
+    {
+        var changed = false;
+        var slotTypes = new Dictionary<(string Kind, long Offset), TypeAnalysisContext>();
+
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
+            if (instruction.OpCode != OpCode.Move || instruction.Operands.Count < 2)
+                continue;
+
+            if (instruction.Operands[0] is not MemoryOperand { Base: LocalVariable storeBase, Index: null, Scale: 0 } storeMemory)
+                continue;
+
+            if (!TryGetStackSlotKey(storeBase, storeMemory.Addend, out var key))
+                continue;
+
+            var sourceType = instruction.Operands[1] switch
+            {
+                LocalVariable { Type: { } localType } => localType,
+                FieldReference field => field.LeafType,
+                _ => null,
+            };
+
+            if (sourceType != null && !slotTypes.ContainsKey(key))
+                slotTypes.Add(key, sourceType);
+        }
+
+        if (slotTypes.Count == 0)
+            return false;
+
+        foreach (var instruction in method.ControlFlowGraph.Instructions)
+        {
+            if (instruction.OpCode != OpCode.Move || instruction.Operands.Count < 2)
+                continue;
+
+            if (instruction.Operands[0] is not LocalVariable { Type: null } loadDest)
+                continue;
+
+            if (instruction.Operands[1] is not MemoryOperand { Base: LocalVariable loadBase, Index: null, Scale: 0 } loadMemory)
+                continue;
+
+            if (TryGetStackSlotKey(loadBase, loadMemory.Addend, out var loadKey)
+                && slotTypes.TryGetValue(loadKey, out var slotType))
+                changed |= SetTypeIfUnknown(loadDest, slotType);
+        }
+
+        return changed;
+    }
+
+    private static bool TryGetStackSlotKey(LocalVariable baseLocal, long addend, out (string Kind, long Offset) key)
+    {
+        var name = baseLocal.Register.Name;
+
+        if (name is "rsp" or "rbp")
+        {
+            key = (name, addend);
+            return true;
+        }
+
+        if (name is { Length: > 6 } && name.StartsWith("stack_")
+            && long.TryParse(name[6..], System.Globalization.NumberStyles.AllowHexSpecifier | System.Globalization.NumberStyles.AllowLeadingSign,
+                System.Globalization.CultureInfo.InvariantCulture, out var slotOffset))
+        {
+            key = ("stack", slotOffset + addend);
+            return true;
+        }
+
+        key = default;
+        return false;
     }
 
     // A single propagation sweep over every move and phi. Returns whether it filled in any type.
