@@ -48,10 +48,20 @@ public static class RgctxResolver
                 RuntimeClassTypeAnalysisContext { RepresentedType: var owner } when memory.Addend == rgctxOffset
                     => new RgctxTableTypeAnalysisContext(owner, owner.DeclaringAssembly),
 
-                // Il2CppClass::element_class - the element type of an array/pointer type
-                RuntimeClassTypeAnalysisContext { RepresentedType: SzArrayTypeAnalysisContext { ElementType: { } elementType } } klass
-                    when memory.Addend == (is32Bit ? 0x24 : 0x40)
-                    => new RuntimeClassTypeAnalysisContext(elementType, klass.DeclaringAssembly),
+                // Il2CppClass::element_class - the element type of an array/pointer type.
+                // For everything else il2cpp points element_class at the klass itself
+                // (vm::Class::Init), so the load folds back to the same runtime class.
+                RuntimeClassTypeAnalysisContext klass when memory.Addend == (is32Bit ? 0x24 : 0x40)
+                    => klass.RepresentedType switch
+                    {
+                        SzArrayTypeAnalysisContext { ElementType: { } elementType }
+                            => new RuntimeClassTypeAnalysisContext(elementType, klass.DeclaringAssembly),
+                        ByRefTypeAnalysisContext { ElementType: { } referent }
+                            => new RuntimeClassTypeAnalysisContext(referent, klass.DeclaringAssembly),
+                        PointerTypeAnalysisContext { ElementType: { } pointedTo }
+                            => new RuntimeClassTypeAnalysisContext(pointedTo, klass.DeclaringAssembly),
+                        _ => new RuntimeClassTypeAnalysisContext(klass.RepresentedType, klass.DeclaringAssembly),
+                    },
 
                 // Il2CppClass::static_fields - the type's static field storage block
                 RuntimeClassTypeAnalysisContext { RepresentedType: { } staticsOwner } klass2
