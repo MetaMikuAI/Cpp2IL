@@ -275,18 +275,19 @@ public static class MetadataResolver
     // (transitively) has a field at the offset, so we never guess between multiple layouts.
     private static List<FieldAnalysisContext>? FindFieldInSingleSubclass(MethodAnalysisContext method, TypeAnalysisContext owner, long offset)
     {
+        // 'this' inside a subclass method is that subclass: prefer the method's own declaring
+        // type when it descends from the receiver's type and has a field at the offset.
+        if (method.DeclaringType is { } declaringType
+            && !ReferenceEquals(declaringType, owner)
+            && IsDescendantOf(declaringType, owner)
+            && FindFieldAtOffsetOrNested(method, declaringType, offset) is { } ownField)
+            return ownField;
+
         List<FieldAnalysisContext>? found = null;
 
         foreach (var subclass in method.AppContext.GetSubclasses(owner))
         {
-            List<FieldAnalysisContext>? candidate = null;
-
-            if (FindExactFieldAtOffset(subclass, offset, isStatic: false) is { } exact)
-                candidate = [exact];
-            else if (FindNestedFieldPath(method, subclass, offset) is { Count: > 0 } nested)
-                candidate = nested;
-
-            if (candidate == null)
+            if (FindFieldAtOffsetOrNested(method, subclass, offset) is not { } candidate)
                 continue;
 
             if (found != null)
@@ -296,6 +297,26 @@ public static class MetadataResolver
         }
 
         return found;
+    }
+
+    private static List<FieldAnalysisContext>? FindFieldAtOffsetOrNested(MethodAnalysisContext method, TypeAnalysisContext type, long offset)
+    {
+        if (FindExactFieldAtOffset(type, offset, isStatic: false) is { } exact)
+            return [exact];
+
+        if (FindNestedFieldPath(method, type, offset) is { Count: > 0 } nested)
+            return nested;
+
+        return null;
+    }
+
+    private static bool IsDescendantOf(TypeAnalysisContext type, TypeAnalysisContext ancestor)
+    {
+        for (var t = type.BaseType; t != null; t = t.BaseType)
+            if (ReferenceEquals(t, ancestor))
+                return true;
+
+        return false;
     }
 
     /// <summary>
