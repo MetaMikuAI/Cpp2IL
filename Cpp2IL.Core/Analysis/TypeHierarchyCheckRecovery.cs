@@ -17,6 +17,7 @@ public static class TypeHierarchyCheckRecovery
     private const long TypeHierarchyOffset64 = 0xC8;
     private const long TypeHierarchyDepthOffset64 = 0x12C;
     private const long InterfaceOffsetsOffset64 = 0xB0;
+    private const long InterfaceOffsetsCountOffset64 = 0x12A;
 
     public static void Run(MethodAnalysisContext method)
     {
@@ -45,6 +46,20 @@ public static class TypeHierarchyCheckRecovery
 
                 if (depth > 0)
                     instruction.SetOperand(i, new Immediate(depth));
+            }
+        }
+
+        // Fold [klass + interface_offsets_count] to a constant: the implemented-interface count
+        // is metadata-fixed, so interface-scan loop bounds become compile-time constants.
+        foreach (var instruction in method.ControlFlowGraph.Instructions)
+        {
+            for (var i = 0; i < instruction.Operands.Count; i++)
+            {
+                if (instruction.OpCode == OpCode.Move && i == 0 && instruction.Operands[0] is MemoryOperand)
+                    continue;
+
+                if (instruction.Operands[i] is MemoryOperand { Index: null, Scale: 0, Addend: InterfaceOffsetsCountOffset64, Base: LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: { Definition: { } interfaceOwner } } } })
+                    instruction.SetOperand(i, new Immediate((long)interfaceOwner.InterfaceOffsetsCount));
             }
         }
 
