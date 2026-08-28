@@ -220,6 +220,18 @@ public static class MetadataResolver
                         continue;
                     }
 
+                    // KeyValuePair<K,V>-typed locals in shared enumerator code actually address
+                    // the Dictionary<K,V>.Entry layout (hashCode@0, next@4, key@8, value after
+                    // the 8-aligned key). Map those slots back to the KVP key/value they are.
+                    if (staticOwner == null
+                        && genericOwner is { GenericType.FullName: "System.Collections.Generic.KeyValuePair`2" } kvpOwner
+                        && MapEntrySlotToKvpField(method, kvpOwner, memory.Addend) is { } kvpField)
+                    {
+                        instruction.SetOperand(i, new FieldReference(kvpField, local!, (int)memory.Addend));
+                        changed = true;
+                        continue;
+                    }
+
                     // [array + max_length] is the array's Length. It sits inside the runtime object
                     // header, not in the managed field list, so field resolution can't name it.
                     if (staticOwner == null
@@ -268,6 +280,30 @@ public static class MetadataResolver
         }
 
         return changedAny ? memory : null;
+    }
+
+    // Dictionary<K,V>.Entry in 64-bit il2cpp: int hashCode @0, int next @4, K key @8, then V
+    // value at the next 8-byte boundary. Shared enumerator code reads these directly even though
+    // the value's managed type is KeyValuePair<K,V>; the entry's key/value ARE the KVP's.
+    // Only the value slot is mapped: it always lies past the KVP's own layout, while offset 8
+    // is ambiguous (it is both the entry's key and the KVP's own value field).
+    private static FieldAnalysisContext? MapEntrySlotToKvpField(MethodAnalysisContext method, GenericInstanceTypeAnalysisContext kvp, long offset)
+    {
+        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+
+        var keyType = kvp.GenericArguments[0];
+        var keySize = keyType.IsValueType ? TypeSizes.UnboxedSize(keyType, pointerSize) : pointerSize;
+
+        if (keySize <= 0)
+            return null;
+
+        const long keyOffset = 8;
+        var valueOffset = keyOffset + ((keySize + pointerSize - 1) & ~(pointerSize - 1));
+
+        if (offset != valueOffset)
+            return null;
+
+        return kvp.GenericType.Fields.FirstOrDefault(f => f.Name == "value" && !f.IsStatic);
     }
 
     // The receiver's declared type may be narrower than the runtime type: a base-typed local
