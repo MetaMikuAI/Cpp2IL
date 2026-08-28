@@ -12,6 +12,13 @@ public class ISILControlFlowGraph
     public int Count => Blocks.Count;
     public List<Block> Blocks;
 
+    /// <summary>
+    /// SSA clobber versions introduced by address-takes, mapped to the slot version that reached
+    /// them (populated by <see cref="Analysis.SsaForm"/>). Type propagation only - an out/ref callee
+    /// can genuinely replace the slot, so values must never be forwarded along these links.
+    /// </summary>
+    public Dictionary<Register, Register>? ClobberInheritance;
+
     public List<Instruction> Instructions
     {
         get

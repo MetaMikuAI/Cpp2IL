@@ -267,6 +267,7 @@ public static class LocalVariables
             changed |= PropagateStaticFieldStorage(method);
             changed |= TypeAddressedLocals(method);
             changed |= PropagateStackSlotTypes(method);
+            changed |= PropagateClobberTypes(method);
             changed |= PropagateTypesOnce(method);
         }
     }
@@ -544,6 +545,31 @@ public static class LocalVariables
         key = default;
         return false;
     }
+
+    // A clobbering address-take's fresh slot version inherits the TYPE of the version that reached
+    // it (see SsaForm.ClobberInheritance). Types only, never values: an out/ref callee can replace
+    // the slot's contents, but whatever it writes serves the same purpose the slot always had.
+    private static bool PropagateClobberTypes(MethodAnalysisContext method)
+    {
+        if (method.ClobberInheritance is not { Count: > 0 } inheritance)
+            return false;
+
+        var changed = false;
+
+        foreach (var link in inheritance)
+        {
+            var clobberedLocal = FindLocal(method, link.Key);
+            var previousLocal = FindLocal(method, link.Value);
+
+            if (clobberedLocal != null && previousLocal != null)
+                changed |= SetTypeIfUnknown(clobberedLocal, previousLocal.Type);
+        }
+
+        return changed;
+    }
+
+    private static LocalVariable? FindLocal(MethodAnalysisContext method, ISIL.Register register) =>
+        method.Locals.FirstOrDefault(l => l.Register.Number == register.Number && l.Register.Version == register.Version);
 
     // A single propagation sweep over every move and phi. Returns whether it filled in any type.
     private static bool PropagateTypesOnce(MethodAnalysisContext method)

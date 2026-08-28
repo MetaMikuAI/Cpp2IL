@@ -22,6 +22,50 @@ public static class DeadCodeEliminator
 
     public static void Run(ISILControlFlowGraph cfg)
     {
+        // A clobbering address-take's fresh version inherits the reaching slot version for type
+        // purposes (see SsaForm.ClobberInheritance). That link is a use of the old version even
+        // though no instruction reads it - without this, the store that carried its type looks dead.
+        List<ISIL.LocalVariable>? extraUses = null;
+
+        if (cfg.ClobberInheritance is { Count: > 0 } inheritance)
+        {
+            var byRegister = new Dictionary<ISIL.Register, ISIL.LocalVariable>();
+            foreach (var block in cfg.Blocks)
+                foreach (var instruction in block.Instructions)
+                    foreach (var local in EnumerateAllLocals(instruction))
+                        if (!byRegister.ContainsKey(local.Register))
+                            byRegister.Add(local.Register, local);
+
+            extraUses = [];
+            foreach (var previous in inheritance.Values)
+                if (byRegister.TryGetValue(previous, out var previousLocal))
+                    extraUses.Add(previousLocal);
+        }
+
+        Run(cfg, extraUses);
+    }
+
+    private static IEnumerable<ISIL.LocalVariable> EnumerateAllLocals(Instruction instruction)
+    {
+        foreach (var operand in instruction.Operands)
+        {
+            switch (operand)
+            {
+                case ISIL.LocalVariable local:
+                    yield return local;
+                    break;
+                case MemoryOperand memory:
+                    if (memory.Base is ISIL.LocalVariable baseLocal)
+                        yield return baseLocal;
+                    if (memory.Index is ISIL.LocalVariable indexLocal)
+                        yield return indexLocal;
+                    break;
+            }
+        }
+    }
+
+    private static void Run(ISILControlFlowGraph cfg, List<ISIL.LocalVariable>? extraUses)
+    {
         // Removing a dead definition can make its operands dead in turn, so iterate to a fixpoint.
         // This is monotonic (each pass only nops instructions) and therefore always terminates.
         var changed = true;
@@ -30,6 +74,10 @@ public static class DeadCodeEliminator
             changed = false;
 
             var useCounts = CountUses(cfg);
+
+            if (extraUses != null)
+                foreach (var extra in extraUses)
+                    useCounts[extra] = 1;
 
             foreach (var block in cfg.Blocks)
             {

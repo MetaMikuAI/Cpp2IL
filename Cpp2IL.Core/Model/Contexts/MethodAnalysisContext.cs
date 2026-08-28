@@ -64,6 +64,13 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
     public ISILControlFlowGraph? ControlFlowGraph;
 
     /// <summary>
+    /// SSA clobber versions introduced by address-takes, mapped to the slot version that reached
+    /// them. Used for type propagation only - an out/ref callee can genuinely replace the slot, so
+    /// values must never be forwarded along these links.
+    /// </summary>
+    public Dictionary<ISIL.Register, ISIL.Register>? ClobberInheritance;
+
+    /// <summary>
     /// Dominance info for the control flow graph.
     /// </summary>
     public DominatorInfo? DominatorInfo;
@@ -373,6 +380,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         StackAnalyzer.Analyze(this);
 
+        DebugDumpIfRequested("post-stack");
+
         // Dominator info must be computed after stack analysis, which removes unreachable/empty
         // blocks and would otherwise leave the dominator tree out of sync with the graph SSA sees.
         DominatorInfo = new DominatorInfo(ControlFlowGraph);
@@ -381,23 +390,33 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         SsaForm.Build(this);
         LocalVariables.CreateAll(this);
 
+        DebugDumpIfRequested("post-ssa");
+
         // Fold the explicit per-comparison flag arithmetic back into single relational comparisons,
         // then eliminate the now-dead flag computations. Both run in SSA form, where each
         // flag/temporary has a single, version-stable definition.
         FlagConditionRecovery.Run(this);
         DeadCodeEliminator.Run(this);
 
+        DebugDumpIfRequested("post-dce");
+
         // Resolve call targets, strings and getters, then run the combined type-propagation and
         // field-resolution fixpoint - all while still in SSA form, so every local is
         // single-assignment and a type, once known, is stable for that value.
         MetadataResolver.ResolveAll(this);
 
+        DebugDumpIfRequested("post-resolveall");
+
         // Resolve KeyFunctionAddress calls, then collect what removing the write barriers left dead.
         KeyFunctionRecovery.Run(this);
         DeadCodeEliminator.Run(this);
 
+        DebugDumpIfRequested("post-keyfunc");
+
         // Delete any il2cpp_codegen_initialize_runtime_metadata/il2cpp_codegen_initialize_method
         MetadataInitGuardRemover.Run(this);
+
+        DebugDumpIfRequested("post-guardremover");
 
         // Delete inlined GC write barriers
         WriteBarrierRecovery.Run(this);
@@ -407,6 +426,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         InterfaceDispatchRecovery.Run(this);
 
         LocalVariables.ResolveTypesAndFields(this);
+
+        DebugDumpIfRequested();
 
         // Needs the MethodInfo* receivers typed, so runs after resolution unlike the class-init guards
         MetadataInitGuardRemover.RunRgctx(this);
@@ -463,6 +484,43 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
     }
 
     public void AddWarning(string warning) => AnalysisWarnings.Add(warning);
+
+    // Debug hook: CPP2IL_DEBUG_METHOD=<hex rva or pointer, comma-separated> dumps ISIL + local types
+    // for matching methods right after the type-resolution fixpoint.
+    private void DebugDumpIfRequested(string? stage = null)
+    {
+        if (Environment.GetEnvironmentVariable("CPP2IL_DEBUG_METHOD") is not { Length: > 0 } filter)
+            return;
+
+        if (Environment.GetEnvironmentVariable("CPP2IL_DEBUG_STAGE") is { Length: > 0 } stageFilter
+            && !(stage != null && stageFilter.Split(',').Select(s => s.Trim()).Contains(stage)))
+            return;
+
+        var wanted = filter.Split(',').Select(w => w.Trim()).Where(w => w.Length > 0);
+        var matches = wanted.Any(w =>
+            (ulong.TryParse(w, System.Globalization.NumberStyles.HexNumber, null, out var parsed)
+             && (parsed == UnderlyingPointer || parsed == Rva)));
+        if (!matches)
+            return;
+
+        Console.Error.WriteLine($"=== DEBUG {this} ptr=0x{UnderlyingPointer:X} rva=0x{Rva:X} stage={stage ?? "post-types"} ===");
+        if (Locals != null)
+            foreach (var local in Locals)
+                Console.Error.WriteLine($"  local {local} reg={local.Register.Name} v={local.Register.Version} type={local.Type?.GetType().Name ?? "null"}:{local.Type}");
+        foreach (var block in ControlFlowGraph!.Blocks)
+        {
+            Console.Error.WriteLine($" block {block.ID}");
+            foreach (var instruction in block.Instructions)
+                Console.Error.WriteLine($"   {instruction.OpCode} {string.Join(", ", instruction.Operands.Select(DescribeOperand))}");
+        }
+    }
+
+    private static string DescribeOperand(ISIL.IOperand operand) => operand switch
+    {
+        ISIL.LocalVariable l => $"{l}<{l.Type?.GetType().Name ?? "null"}>",
+        ISIL.MemoryOperand m => $"[{(m.Base is ISIL.LocalVariable b ? $"{b}<{b.Type?.GetType().Name ?? "null"}>" : m.Base?.ToString())}{(m.Index != null ? "+" + m.Index + "*" + m.Scale : "")}+0x{m.Addend:X}]",
+        _ => operand.ToString() ?? "?",
+    };
 
     public void ReleaseAnalysisData()
     {

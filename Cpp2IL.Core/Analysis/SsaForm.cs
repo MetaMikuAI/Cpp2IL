@@ -26,9 +26,9 @@ public class SsaForm
     private readonly Dictionary<int, Register> _repr = new();
 
     public static void Build(MethodAnalysisContext method)
-        => Build(method.ControlFlowGraph!, method.DominatorInfo!);
+        => method.ClobberInheritance = Build(method.ControlFlowGraph!, method.DominatorInfo!);
 
-    public static void Build(ISILControlFlowGraph graph, DominatorInfo dominatorInfo)
+    public static Dictionary<Register, Register> Build(ISILControlFlowGraph graph, DominatorInfo dominatorInfo)
     {
         var ssa = new SsaForm();
         ssa.FindClobberingAddressTakes(graph);
@@ -38,10 +38,21 @@ public class SsaForm
         ssa.CollectRegisters(graph);
         ssa.InsertPhiFunctions(graph, dominatorInfo);
         ssa.Rename(graph.EntryBlock, dominatorInfo);
+
+        graph.ClobberInheritance = ssa.ClobberInheritance;
+        return ssa.ClobberInheritance;
     }
 
     // The address-takes whose slot is read again afterwards, and so have to be treated as definitions.
     private readonly HashSet<Instruction> _clobbering = [];
+
+    /// <summary>
+    /// Maps the fresh version a clobbering address-take introduces to the version of the same slot
+    /// that reached it. The address-take only *may* write through the pointer, so the new version
+    /// often still holds the old value - but this link must be used for TYPE propagation only, never
+    /// value forwarding, because an out/ref callee really can replace the contents.
+    /// </summary>
+    public readonly Dictionary<Register, Register> ClobberInheritance = [];
 
     private void FindClobberingAddressTakes(ISILControlFlowGraph graph)
     {
@@ -281,10 +292,20 @@ public class SsaForm
                 {
                     // Taking a slot's address lets the callee assign it, so the slot stops holding anything that reached this point, UNLESS
                     // nothing reads it afterwards, in which case any write is unobservable and the callee is only reading the value it has now
-                    if (instruction.Operands[i] is AddressOf { Target: Register addressed })
-                        instruction.SetOperand(i, new AddressOf(_clobbering.Contains(instruction)
-                            ? NewName(addressed, definedHere)
-                            : CurrentVersion(addressed.Number)));
+                    if (instruction.Operands[i] is not AddressOf { Target: Register addressed })
+                        continue;
+
+                    if (_clobbering.Contains(instruction))
+                    {
+                        var previous = CurrentVersion(addressed.Number);
+                        var clobberedVersion = NewName(addressed, definedHere);
+                        ClobberInheritance[clobberedVersion] = previous;
+                        instruction.SetOperand(i, new AddressOf(clobberedVersion));
+                    }
+                    else
+                    {
+                        instruction.SetOperand(i, new AddressOf(CurrentVersion(addressed.Number)));
+                    }
                 }
             }
 
