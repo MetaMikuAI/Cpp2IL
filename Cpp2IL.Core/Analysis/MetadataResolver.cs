@@ -207,6 +207,19 @@ public static class MetadataResolver
                         continue;
                     }
 
+                    // The receiver may be typed as a base class while the field only exists on a
+                    // subclass. Usable only when exactly one subclass has a field at this offset.
+                    if (staticOwner == null && genericOwner == null
+                        && FindFieldInSingleSubclass(method, owner, memory.Addend) is { Count: > 0 } subclassChain)
+                    {
+                        instruction.SetOperand(i, new FieldReference(subclassChain[0], local!, (int)memory.Addend)
+                        {
+                            NestedFields = subclassChain.Skip(1).ToArray(),
+                        });
+                        changed = true;
+                        continue;
+                    }
+
                     // [array + max_length] is the array's Length. It sits inside the runtime object
                     // header, not in the managed field list, so field resolution can't name it.
                     if (staticOwner == null
@@ -255,6 +268,34 @@ public static class MetadataResolver
         }
 
         return changedAny ? memory : null;
+    }
+
+    // The receiver's declared type may be narrower than the runtime type: a base-typed local
+    // accessing a field that only exists on a subclass. Resolvable only when exactly one subclass
+    // (transitively) has a field at the offset, so we never guess between multiple layouts.
+    private static List<FieldAnalysisContext>? FindFieldInSingleSubclass(MethodAnalysisContext method, TypeAnalysisContext owner, long offset)
+    {
+        List<FieldAnalysisContext>? found = null;
+
+        foreach (var subclass in method.AppContext.GetSubclasses(owner))
+        {
+            List<FieldAnalysisContext>? candidate = null;
+
+            if (FindExactFieldAtOffset(subclass, offset, isStatic: false) is { } exact)
+                candidate = [exact];
+            else if (FindNestedFieldPath(method, subclass, offset) is { Count: > 0 } nested)
+                candidate = nested;
+
+            if (candidate == null)
+                continue;
+
+            if (found != null)
+                return null; // more than one subclass matches - ambiguous, don't guess
+
+            found = candidate;
+        }
+
+        return found;
     }
 
     /// <summary>
