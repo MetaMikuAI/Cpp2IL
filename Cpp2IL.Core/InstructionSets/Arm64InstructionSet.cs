@@ -6,6 +6,7 @@ using Cpp2IL.Core.Il2CppApiFunctions;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
+using Gee.External.Capstone.Arm64;
 
 namespace Cpp2IL.Core.InstructionSets;
 
@@ -40,6 +41,45 @@ public class Arm64InstructionSet : Cpp2IlInstructionSet
     public override List<IOperand> GetParameterOperandsFromMethod(MethodAnalysisContext context)
     {
         return [];
+    }
+
+    public override ulong GetInternalCallTarget(MethodAnalysisContext method)
+    {
+        var start = GetPointerForMethod(method);
+        var length = method.RawBytes.Length;
+
+        if (start == 0 || length < 4)
+            return 0;
+
+        List<Arm64Instruction> instructions;
+        try
+        {
+            instructions = Arm64Utils.GetArm64MethodBodyAtVirtualAddress(method.AppContext.Binary, start);
+        }
+        catch
+        {
+            return 0;
+        }
+
+        var end = start + (ulong)length;
+        var target = 0ul;
+
+        foreach (var instruction in instructions)
+        {
+            if (instruction.Mnemonic != "b" || !instruction.Details.Operands.Any())
+                continue;
+
+            var branch = (ulong)instruction.Details.Operands[0].Immediate;
+            if (branch >= start && branch < end)
+                continue;
+
+            if (target != 0 && target != branch)
+                return 0;
+
+            target = branch;
+        }
+
+        return target;
     }
 
     public override BaseKeyFunctionAddresses CreateKeyFunctionAddressesInstance() => new Arm64KeyFunctionAddresses();

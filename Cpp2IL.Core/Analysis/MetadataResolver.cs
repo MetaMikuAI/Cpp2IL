@@ -132,6 +132,11 @@ public static class MetadataResolver
     /// </summary>
     public static bool ResolveFieldOffsets(MethodAnalysisContext method)
     {
+        var definitions = new Dictionary<LocalVariable, Instruction>();
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+            if (instruction.Destination is LocalVariable destination)
+                definitions[destination] = instruction;
+
         var changed = false;
 
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
@@ -147,12 +152,22 @@ public static class MetadataResolver
                 if (memory.Index != null || memory.Scale != 0)
                     continue;
 
-                if (memory.Base is not LocalVariable local || local?.Type == null)
+                if (memory.Base is not LocalVariable local)
+                    continue;
+
+                // ARM64 pre/post-indexed stores are represented as an Add updating the base
+                // register followed by a zero-offset memory access. Follow that address update
+                // so the effective offset can still be matched to a managed field.
+                var fieldLocal = local;
+                var fieldOffset = memory.Addend;
+                UnwrapAddressUpdate(ref fieldLocal, ref fieldOffset, definitions);
+
+                if (fieldLocal.Type == null)
                     continue;
 
                 // check if static field access
-                var staticOwner = (local.Type as StaticFieldStorageTypeAnalysisContext)?.OwnerType;
-                var owner = staticOwner ?? local.Type;
+                var staticOwner = (fieldLocal.Type as StaticFieldStorageTypeAnalysisContext)?.OwnerType;
+                var owner = staticOwner ?? fieldLocal.Type;
                 var genericOwner = owner as GenericInstanceTypeAnalysisContext;
 
                 FieldAnalysisContext? field;
@@ -163,11 +178,11 @@ public static class MetadataResolver
                     if (genericOwner.GenericArguments.Any(a => a.IsValueType))
                         continue;
 
-                    field = GenericInstanceFieldLayout.FindFieldAtOffset(genericOwner.GenericType, memory.Addend);
+                    field = GenericInstanceFieldLayout.FindFieldAtOffset(genericOwner.GenericType, fieldOffset);
                 }
                 else if (staticOwner == null && owner.GenericParameters.Count > 0)
                 {
-                    field = GenericInstanceFieldLayout.FindFieldAtOffset(owner, memory.Addend);
+                    field = GenericInstanceFieldLayout.FindFieldAtOffset(owner, fieldOffset);
                 }
                 else
                 {
@@ -177,7 +192,7 @@ public static class MetadataResolver
                     for (var candidateOwner = genericOwner?.GenericType ?? owner; candidateOwner != null && field == null; candidateOwner = candidateOwner.BaseType)
                         field = candidateOwner.Fields.FirstOrDefault(f => f.IsStatic == (staticOwner != null)
                             && (f.Attributes & FieldAttributes.Literal) == 0 // consts have no storage but their metadata offset is 0, which would match
-                            && f.BackingData?.FieldOffset == memory.Addend);
+                            && f.BackingData?.FieldOffset == fieldOffset);
                 }
 
                 if (field == null) // TODO: Support nested fields (Field1.Field2.Field3)
@@ -187,12 +202,45 @@ public static class MetadataResolver
                 if (genericOwner != null)
                     field = new ConcreteGenericFieldAnalysisContext(field, genericOwner);
 
-                instruction.SetOperand(i, new FieldReference(field, local, (int)memory.Addend));
+                instruction.SetOperand(i, new FieldReference(field, fieldLocal, (int)fieldOffset));
                 changed = true;
             }
         }
 
         return changed;
+    }
+
+    private static void UnwrapAddressUpdate(ref LocalVariable local, ref long offset,
+        Dictionary<LocalVariable, Instruction> definitions)
+    {
+        var visited = new HashSet<LocalVariable>();
+
+        while (visited.Add(local)
+            && definitions.TryGetValue(local, out var definition)
+            && definition.OpCode == OpCode.Add
+            && definition.Operands.Count >= 3)
+        {
+            LocalVariable? source = null;
+            Immediate addend;
+
+            if (definition.Operands[1] is LocalVariable left && definition.Operands[2] is Immediate right)
+            {
+                source = left;
+                addend = right;
+            }
+            else if (definition.Operands[1] is Immediate leftImmediate && definition.Operands[2] is LocalVariable rightLocal)
+            {
+                source = rightLocal;
+                addend = leftImmediate;
+            }
+            else
+            {
+                break;
+            }
+
+            offset = unchecked(offset + addend.Value);
+            local = source;
+        }
     }
 
     private static void ResolveCalls(MethodAnalysisContext method)
@@ -311,7 +359,21 @@ public static class MetadataResolver
                 continue;
 
             // Prefer picking base ctor if we are a ctor
-            var callerIsCtor = method.Name == ".ctor" && receiver.IsThis;
+            // SSA copies of the implicit `this` parameter do not retain IsThis. Their type still
+            // matches the constructor's declaring type, which is enough to identify a base-ctor call.
+            var callerIsCtor = method.Name == ".ctor"
+                && (receiver.IsThis || IsSameType(receiverType, method.DeclaringType));
+
+            // Generic base constructors are commonly emitted as one shared object/object body.
+            // The receiver still carries the concrete base instantiation, so recover that method
+            // from the generic definition instead of comparing the shared object/object arguments.
+            if (callerIsCtor && FindConcreteGenericConstructor(receiverType, candidates) is { } concreteConstructor)
+            {
+                instruction.SetOperand(0, concreteConstructor);
+                concreteConstructor.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, concreteConstructor);
+                changed = true;
+                continue;
+            }
 
             // Handle methods with shared bodies
             var match = default(MethodAnalysisContext);
@@ -338,6 +400,32 @@ public static class MetadataResolver
         }
 
         return changed;
+    }
+
+    private static MethodAnalysisContext? FindConcreteGenericConstructor(TypeAnalysisContext receiverType, List<MethodAnalysisContext> candidates)
+    {
+        var candidateParameterCounts = candidates
+            .Where(c => !c.IsStatic && c.Name == ".ctor")
+            .Select(c => c.Parameters.Count)
+            .ToHashSet();
+
+        if (candidateParameterCounts.Count == 0)
+            return null;
+
+        for (var type = receiverType; type != null; type = type.BaseType)
+        {
+            if (type is not GenericInstanceTypeAnalysisContext instance)
+                continue;
+
+            var matches = instance.GenericType.Methods
+                .Where(m => !m.IsStatic && m.Name == ".ctor" && candidateParameterCounts.Contains(m.Parameters.Count))
+                .ToList();
+
+            if (matches is [{ } match])
+                return new ConcreteGenericMethodAnalysisContext(match, instance.GenericArguments, []);
+        }
+
+        return null;
     }
 
     private static bool AreInterchangeable(List<MethodAnalysisContext> candidates)

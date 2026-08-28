@@ -78,6 +78,48 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         return CallingConventions.ResolveForManaged(context).ToList();
     }
 
+    public override ulong GetInternalCallTarget(MethodAnalysisContext method)
+    {
+        var start = GetPointerForMethod(method);
+        var length = method.RawBytes.Length;
+
+        if (start == 0 || length < 4)
+            return 0;
+
+        List<Arm64Instruction> instructions;
+        try
+        {
+            instructions = Disassembler.Disassemble(method.RawBytes.AsSpan(), start, new Disassembler.Options(true, true, false)).ToList();
+        }
+        catch
+        {
+            return 0;
+        }
+
+        var end = start + (ulong)length;
+        var target = 0ul;
+
+        foreach (var instruction in instructions)
+        {
+            // Internal calls are emitted as small stubs which tail-branch to the runtime.
+            // Ignore ordinary branches inside the method and require a single external target.
+            if (instruction.Mnemonic != Arm64Mnemonic.B
+                || instruction.MnemonicConditionCode is not (Arm64ConditionCode.NONE or Arm64ConditionCode.AL))
+                continue;
+
+            var branch = instruction.BranchTarget;
+            if (branch >= start && branch < end)
+                continue;
+
+            if (target != 0 && target != branch)
+                return 0;
+
+            target = branch;
+        }
+
+        return target;
+    }
+
     public override (IReadOnlyList<ulong> DataReferences, IReadOnlyList<ulong> CallTargets) InspectPotentialThrowHelper(ApplicationAnalysisContext context, ulong address)
     {
         //Deliberately not calling NewArm64Utils here, it's too slow

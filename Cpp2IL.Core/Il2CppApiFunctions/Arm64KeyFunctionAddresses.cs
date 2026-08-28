@@ -14,6 +14,15 @@ namespace Cpp2IL.Core.Il2CppApiFunctions;
 
 public class Arm64KeyFunctionAddresses : BaseKeyFunctionAddresses
 {
+    private static readonly (string Namespace, string Type, string Method)[] WriteBarrierAnchors =
+    [
+        ("System.Threading.Tasks", "Task`1", "GetAwaiter"),
+        ("System.Threading.Tasks", "Task", "GetAwaiter"),
+        ("System.Threading", "ExecutionContext", "get_LogicalCallContext"),
+        ("System.Threading", "CancellationTokenSource", "get_Token"),
+        ("System", "BadImageFormatException", "get_Message"),
+    ];
+
     private List<Arm64Instruction> _allInstructions = [];
 
     protected override void Init(ApplicationAnalysisContext context)
@@ -219,6 +228,80 @@ public class Arm64KeyFunctionAddresses : BaseKeyFunctionAddresses
 
         Logger.VerboseNewline($"Success. IsInst found at 0x{lastCall.Details.Operands[0].Immediate:X}");
         return (ulong)lastCall.Details.Operands[0].Immediate;
+    }
+
+    protected override ulong GetWriteBarrier()
+    {
+        Logger.Verbose("\tLooking for Il2CppCodeGenWriteBarrier via corlib reference-field stores...");
+
+        var votes = new Dictionary<ulong, int>();
+        foreach (var (@namespace, typeName, methodName) in WriteBarrierAnchors)
+        {
+            var method = ReflectionCache.GetType(typeName, @namespace)?.Methods?.FirstOrDefault(m => m.Name == methodName);
+            if (method == null || method.MethodPointer == 0)
+                continue;
+
+            List<Arm64Instruction> body;
+            try
+            {
+                body = Arm64Utils.GetArm64MethodBodyAtVirtualAddress(_appContext.Binary, method.MethodPointer);
+            }
+            catch
+            {
+                continue;
+            }
+
+            foreach (var target in FindWriteBarrierCalls(body).Distinct())
+                votes[target] = votes.TryGetValue(target, out var count) ? count + 1 : 1;
+        }
+
+        var best = 0ul;
+        var bestVotes = 0;
+        foreach (var vote in votes)
+        {
+            if (vote.Value <= bestVotes)
+                continue;
+
+            best = vote.Key;
+            bestVotes = vote.Value;
+        }
+
+        if (best == 0)
+        {
+            Logger.VerboseNewline("Not found. Write barriers disabled?");
+            return 0;
+        }
+
+        Logger.VerboseNewline($"Found at 0x{best:X} (found in {bestVotes} of {WriteBarrierAnchors.Length} checked methods)");
+        return best;
+    }
+
+    private static IEnumerable<ulong> FindWriteBarrierCalls(List<Arm64Instruction> body)
+    {
+        const int window = 6;
+
+        for (var i = 0; i < body.Count; i++)
+        {
+            var call = body[i];
+            if (call.Mnemonic is not ("bl" or "b")
+                || (call.Mnemonic == "b" && !call.Details.Operands.Any()))
+                continue;
+
+            var start = Math.Max(0, i - window);
+            for (var j = start; j < i; j++)
+            {
+                var store = body[j];
+                if (store.Mnemonic is not ("str" or "stur")
+                    || store.Details is not { } details
+                    || !details.Operands.Skip(1).Any()
+                    || details.Operands[0].ToString() is not { } source
+                    || !source.StartsWith("x", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                yield return (ulong)call.Details.Operands[0].Immediate;
+                break;
+            }
+        }
     }
 
     protected override ulong FindFunctionThisIsAThunkOf(ulong thunkPtr, bool prioritiseCall = false)
