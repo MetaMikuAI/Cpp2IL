@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using Cpp2IL.Core.Model.Contexts;
 
 namespace Cpp2IL.Core.Api;
@@ -13,6 +14,12 @@ public abstract class Cpp2IlOutputFormat
     /// The name of the output format displayed to the user (e.g. in logs or the GUI)
     /// </summary>
     public abstract string OutputFormatName { get; }
+
+    /// <summary>
+    /// IDs of the processing layers this output format needs in order to produce complete output.
+    /// Any of these the user hasn't asked for are run before the ones they have.
+    /// </summary>
+    public virtual IEnumerable<string> RequiredProcessingLayerIds => [];
 
     /// <summary>
     /// Called when this output format is selected by the user, before any binary is loaded.

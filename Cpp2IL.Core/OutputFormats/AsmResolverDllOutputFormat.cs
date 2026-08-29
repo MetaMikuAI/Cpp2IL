@@ -22,6 +22,10 @@ namespace Cpp2IL.Core.OutputFormats;
 
 public abstract class AsmResolverDllOutputFormat : Cpp2IlOutputFormat
 {
+    //Custom attributes are only present in the output if they've been analyzed first. Without them ILSpy can't
+    //recognise compiler-generated members, so auto-properties, lambdas and state machines all stay expanded.
+    public override IEnumerable<string> RequiredProcessingLayerIds => ["attributeanalyzer"];
+
     private AssemblyDefinition? MostRecentCorLib { get; set; }
     protected int TotalMethodCount;
     protected int SuccessfulMethodCount;

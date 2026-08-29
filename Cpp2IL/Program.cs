@@ -688,6 +688,8 @@ internal static class Program
         foreach (var (key, value) in runtimeArgs.ProcessingLayerConfigurationOptions)
             Cpp2IlApi.CurrentAppContext.PutExtraData(key, value);
 
+        AddProcessingLayersRequiredByOutputFormats(runtimeArgs);
+
         //Pre-process processing layers, allowing them to stop others from running
         Logger.InfoNewline("Pre-processing processing layers...");
         var layers = runtimeArgs.ProcessingLayersToRun.Clone();
@@ -728,6 +730,23 @@ internal static class Program
 
         Logger.InfoNewline($"Done. Total execution time: {(DateTime.Now - executionStart).TotalMilliseconds}ms");
         return 0;
+    }
+
+    private static void AddProcessingLayersRequiredByOutputFormats(Cpp2IlRuntimeArgs runtimeArgs)
+    {
+        var missing = (runtimeArgs.OutputFormats ?? [])
+            .SelectMany(f => f.RequiredProcessingLayerIds)
+            .Distinct()
+            .Where(id => runtimeArgs.ProcessingLayersToRun.TrueForAll(l => l.Id != id))
+            .Select(ProcessingLayerRegistry.GetById)
+            .ToList();
+
+        if (missing.Count == 0)
+            return;
+
+        //Requested layers may build on these, so put them first
+        runtimeArgs.ProcessingLayersToRun.InsertRange(0, missing);
+        Logger.VerboseNewline($"Added processing layers required by the selected output formats: {string.Join(", ", missing.Select(l => l.Name))}");
     }
 
     private static void RunProcessingLayers(Cpp2IlRuntimeArgs runtimeArgs, Action<Cpp2IlProcessingLayer> run)
