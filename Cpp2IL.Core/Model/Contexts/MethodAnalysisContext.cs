@@ -455,6 +455,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Every call that was going to resolve now has. Any argument registers it ended up
         // not using are just keeping their definitions alive, so drop them.
         CallArgumentTrimmer.Run(this);
+        ThrowHelperRecovery.TypeThrowOperands(this);
         DeadCodeEliminator.Run(this);
 
         LocalVariables.RemoveUnused(this);

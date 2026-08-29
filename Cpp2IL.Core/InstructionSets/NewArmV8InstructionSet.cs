@@ -148,9 +148,16 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         var dataReferences = new List<ulong>();
         var callTargets = new List<ulong>();
         var pages = new Dictionary<Arm64Register, ulong>();
+        var previous = default(Arm64Instruction);
+        var havePrevious = false;
 
         foreach (var insn in body)
         {
+            // 无返回 helper 常紧邻下一个函数布局，最终 BL 后没有 RET；若随后出现新的栈帧序言，
+            // 即在序言前停止扫描。
+            if (havePrevious && previous.Mnemonic == Arm64Mnemonic.BL && IsFunctionPrologue(insn))
+                break;
+
             switch (insn.Mnemonic)
             {
                 case Arm64Mnemonic.ADRP:
@@ -173,9 +180,28 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             if (insn.Mnemonic is Arm64Mnemonic.RET or Arm64Mnemonic.RETAA or Arm64Mnemonic.RETAB or Arm64Mnemonic.BR or Arm64Mnemonic.INVALID
                 || (insn.Mnemonic == Arm64Mnemonic.B && insn.MnemonicConditionCode is Arm64ConditionCode.NONE or Arm64ConditionCode.AL))
                 break;
+
+            previous = insn;
+            havePrevious = true;
         }
 
         return (dataReferences, callTargets);
+    }
+
+    private static bool IsFunctionPrologue(Arm64Instruction instruction)
+    {
+        if (instruction.Mnemonic == Arm64Mnemonic.SUB
+            && IsReg31(instruction.Op0Reg)
+            && IsReg31(instruction.Op1Reg)
+            && instruction.Op2Kind == Arm64OperandKind.Immediate
+            && instruction.Op2Imm > 0)
+            return true;
+
+        return instruction.Mnemonic is Arm64Mnemonic.STR or Arm64Mnemonic.STP
+               && IsReg31(instruction.MemBase)
+               && instruction.MemIndexMode == Arm64MemoryIndexMode.PreIndex
+               && instruction.MemOffset < 0
+               && (instruction.Op0Reg == Arm64Register.X30 || instruction.Op1Reg == Arm64Register.X30);
     }
 
     public override List<Instruction> GetIsilFromMethod(MethodAnalysisContext context)

@@ -300,6 +300,9 @@ public static class MetadataResolver
                 {
                     var raised = callInstruction.Operands[raisedIndex];
 
+                    if (raised is LocalVariable local)
+                        local.Type = method.AppContext.SystemTypes.SystemExceptionType;
+
                     callInstruction.OpCode = OpCode.Throw;
                     callInstruction.SetOperands(raised);
                 }

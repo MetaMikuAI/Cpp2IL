@@ -94,6 +94,20 @@ public class NewArm64KeyFunctionAddresses : BaseKeyFunctionAddresses
         return call.Mnemonic == Arm64Mnemonic.BL ? call.BranchTarget : 0;
     }
 
+    protected override ulong FindMetadataInitInline(ulong metadataInit)
+    {
+        var directThunk = base.FindMetadataInitInline(metadataInit);
+        if (directThunk != 0)
+            return directThunk;
+
+        // 较新的 ARM64 构建可能把普通版和 inline 版作为兄弟函数发出：普通版调用共享实现并添加
+        // barrier，inline 版则直接尾调用共享实现。
+        var implementation = FindFirstCallTargetInMethod(metadataInit);
+        return implementation == 0
+            ? 0
+            : FindAllThunkFunctions(implementation, 0, metadataInit).FirstOrDefault();
+    }
+
     protected override ulong GetObjectIsInstFromSystemType()
     {
         Logger.Verbose("\tTrying to use System.Type::IsInstanceOfType to find il2cpp::vm::Object::IsInst...");

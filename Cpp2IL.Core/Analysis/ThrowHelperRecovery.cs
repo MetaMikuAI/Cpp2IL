@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using Cpp2IL.Core.Extensions;
+using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 
 namespace Cpp2IL.Core.Analysis;
@@ -28,6 +30,16 @@ public static class ThrowHelperRecovery
         return type == null ? null : appContext.ResolveContextForType(type);
     }
 
+    public static void TypeThrowOperands(MethodAnalysisContext method)
+    {
+        var exceptionType = method.AppContext.SystemTypes.SystemExceptionType;
+
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+            if (instruction is { OpCode: OpCode.Throw, Operands: [LocalVariable local] }
+                && local.Type?.IsAssignableTo(exceptionType) != true)
+                local.Type = exceptionType;
+    }
+
     // Whether the provided method raises whatever exception it is handed
     // e.g. il2cpp_codegen_raise_exception, il2cpp_codegen_rethrow_exception, vm::Exception::Raise
     public static bool IsExceptionRaiser(ApplicationAnalysisContext appContext, ulong address)
@@ -43,11 +55,18 @@ public static class ThrowHelperRecovery
         if (raise == 0)
             return false;
 
-        // grab the c++ exception raise method from the end of il2cpp::vm::Exception::Raise
-        var nativeThrow = appContext.InstructionSet.InspectPotentialThrowHelper(appContext, raise).CallTargets.LastOrDefault();
+        // 大多数 codegen 包装器直接调用 vm::Exception::Raise，优先使用这个稳定的托管边界，
+        // 再检查其原生无返回实现。
+        var result = ReachesCall(appContext, address, raise, 0, []);
 
-        // and then check if we're calling it
-        var result = nativeThrow != 0 && ReachesCall(appContext, address, nativeThrow, 0, []);
+        // grab the c++ exception raise method from the end of il2cpp::vm::Exception::Raise
+        if (!result)
+        {
+            var nativeThrow = appContext.InstructionSet.InspectPotentialThrowHelper(appContext, raise).CallTargets.LastOrDefault();
+
+            // and then check if we're calling it
+            result = nativeThrow != 0 && ReachesCall(appContext, address, nativeThrow, 0, []);
+        }
 
         appContext.ExceptionRaisersByAddress[address] = result;
         return result;
@@ -85,6 +104,11 @@ public static class ThrowHelperRecovery
         {
             foreach (var target in callTargets)
             {
+                // vm::Exception::Raise 接收异常对象，本体不会标识调用方 helper 的固定异常类型；
+                // 包装器仍需继续检查，因为类型名称位于包装器自身。
+                if (target == appContext.GetOrCreateKeyFunctionAddresses().il2cpp_vm_exception_raise)
+                    continue;
+
                 name = ResolveName(appContext, target, depth + 1);
 
                 if (name != null)

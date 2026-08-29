@@ -163,6 +163,9 @@ public abstract class BaseKeyFunctionAddresses
     // the address the first call instruction in the method at methodVa targets, or 0 if there is none or this isn't supported
     protected virtual ulong FindFirstCallTargetInMethod(ulong methodVa) => 0;
 
+    protected virtual ulong FindMetadataInitInline(ulong metadataInit)
+        => FindAllThunkFunctions(metadataInit).FirstOrDefault();
+
     protected virtual void AttemptInstructionAnalysisToFillGaps()
     {
     }
@@ -261,7 +264,7 @@ public abstract class BaseKeyFunctionAddresses
         if (il2cpp_codegen_initialize_runtime_metadata != 0)
         {
             Logger.Verbose("\tLooking for il2cpp_codegen_initialize_runtime_metadata_inline as a thunk of the metadata init...");
-            il2cpp_codegen_initialize_runtime_metadata_inline = FindAllThunkFunctions(il2cpp_codegen_initialize_runtime_metadata).FirstOrDefault();
+            il2cpp_codegen_initialize_runtime_metadata_inline = FindMetadataInitInline(il2cpp_codegen_initialize_runtime_metadata);
             Logger.VerboseNewline($"Found at 0x{il2cpp_codegen_initialize_runtime_metadata_inline:X}");
         }
 
