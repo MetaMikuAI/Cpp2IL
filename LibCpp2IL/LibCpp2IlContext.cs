@@ -111,6 +111,16 @@ public sealed class LibCpp2IlContext
         var encoded = Binary.ReadPointerAtVirtualAddress(address);
         var metadataUsage = MetadataUsage.DecodeMetadataUsage(encoded, address, this);
 
+        if (metadataUsage?.IsValid == true)
+            return metadataUsage;
+
+        // 部分 ELF/Android 构建会在元数据槽中放置经过重定位的指针。
+        // 该指针指向包含实际 v27+ 编码元数据用法值的只读表项；保留原始槽地址作为 Offset，
+        // 以便调用方仍能将用法关联到全局加载位置。
+        if (!Binary.TryMapVirtualAddressToRaw(encoded, out var indirectRaw) || indirectRaw >= Binary.RawLength)
+            return null;
+
+        metadataUsage = MetadataUsage.DecodeMetadataUsage(Binary.ReadPointerAtVirtualAddress(encoded), address, this);
         if (metadataUsage?.IsValid != true)
             return null;
 

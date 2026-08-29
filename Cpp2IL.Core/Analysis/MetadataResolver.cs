@@ -67,14 +67,31 @@ public static class MetadataResolver
     private static void ResolveMetadataUsages(MethodAnalysisContext method)
     {
         var libContext = method.AppContext.LibCpp2IlContext;
+        var resolvedMetadataPointers = new Dictionary<LocalVariable, IOperand>();
 
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
             if (instruction.OpCode != OpCode.Move)
                 continue;
 
-            if (instruction.Operands[0] is not LocalVariable)
+            if (instruction.Operands[0] is not LocalVariable destination)
                 continue;
+
+            // v27+ 元数据全局通常通过两次加载表示：第一次取得元数据槽地址，第二次解引用该地址。
+            // 将已解析的用法沿间接层传递，使 MethodInfo/FieldInfo 操作数参与正常类型传播。
+            if (instruction.Operands[1] is MemoryOperand
+                {
+                    Base: LocalVariable pointer,
+                    Index: null,
+                    Addend: 0,
+                    Scale: 0
+                }
+                && resolvedMetadataPointers.TryGetValue(pointer, out var resolvedPointer))
+            {
+                instruction.SetOperand(1, resolvedPointer);
+                resolvedMetadataPointers[destination] = resolvedPointer;
+                continue;
+            }
 
             var address = instruction.Operands[1] switch
             {
@@ -90,7 +107,9 @@ public static class MetadataResolver
             var stringLiteral = libContext.GetLiteralByAddress(address);
             if (stringLiteral != null)
             {
-                instruction.SetOperand(1, new StringLiteral(stringLiteral));
+                var resolved = new StringLiteral(stringLiteral);
+                instruction.SetOperand(1, resolved);
+                resolvedMetadataPointers[destination] = resolved;
                 continue;
             }
 
@@ -100,7 +119,9 @@ public static class MetadataResolver
                 var typeGlobal = libContext.GetTypeGlobalByAddress(address);
                 if (typeGlobal != null)
                 {
-                    instruction.SetOperand(1, declaringType.AppContext.ResolveIl2CppType(typeGlobal));
+                    var resolved = declaringType.AppContext.ResolveIl2CppType(typeGlobal);
+                    instruction.SetOperand(1, resolved);
+                    resolvedMetadataPointers[destination] = resolved;
                     continue;
                 }
             }
@@ -112,14 +133,20 @@ public static class MetadataResolver
             if (methodUsage?.Type is MetadataUsageType.MethodDef or MetadataUsageType.MethodRef
                 && method.AppContext.ResolveContextForMethod(methodUsage) is { DeclaringType: { } methodDeclaringType } methodContext)
             {
-                instruction.SetOperand(1, new RuntimeMethodInfoAnalysisContext(methodContext, methodDeclaringType.DeclaringAssembly));
+                var resolved = new RuntimeMethodInfoAnalysisContext(methodContext, methodDeclaringType.DeclaringAssembly);
+                instruction.SetOperand(1, resolved);
+                resolvedMetadataPointers[destination] = resolved;
                 continue;
             }
 
             // Field metadata usage (FieldInfo*), e.g. the RuntimeFieldHandle passed to InitializeArray.
             if (libContext.GetRawFieldGlobalByAddress(address) is { Type: MetadataUsageType.FieldInfo } fieldUsage
                 && method.AppContext.ResolveContextForField(fieldUsage.AsField()) is { DeclaringType.DeclaringAssembly: { } fieldAssembly } fieldContext)
-                instruction.SetOperand(1, new RuntimeFieldInfoAnalysisContext(fieldContext, fieldAssembly));
+            {
+                var resolved = new RuntimeFieldInfoAnalysisContext(fieldContext, fieldAssembly);
+                instruction.SetOperand(1, resolved);
+                resolvedMetadataPointers[destination] = resolved;
+            }
         }
     }
 
