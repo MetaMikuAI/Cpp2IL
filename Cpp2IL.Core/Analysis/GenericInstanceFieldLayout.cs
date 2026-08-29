@@ -49,9 +49,19 @@ public static class GenericInstanceFieldLayout
             && genericParameter.Index < genericArguments.Count)
             fieldType = genericArguments[genericParameter.Index];
 
-        // TODO support user-defined value types
         if (fieldType is GenericParameterTypeAnalysisContext or PointerTypeAnalysisContext || !fieldType.IsValueType)
             return (pointerSize, pointerSize);
+
+        // A generic struct's layout comes from its definition, with the instance's OWN arguments
+        // standing in for its parameters - e.g. KeyValuePair<string, T> lays TKey out as a string
+        // pointer regardless of what the enclosing type's arguments are. Generic instance contexts
+        // carry no field list of their own, so without this the whole layout bails on any nested
+        // generic struct (KeyValuePair, enumerators, tuples, ...).
+        if (fieldType is GenericInstanceTypeAnalysisContext { GenericType: { } genericDefinition } instance)
+        {
+            fieldType = genericDefinition;
+            genericArguments = instance.GenericArguments;
+        }
 
         if (fieldType.IsEnumType && fieldType.Fields.FirstOrDefault(f => !f.IsStatic) is { } underlying)
             return GetSizeAndAlignment(underlying.FieldType, pointerSize, genericArguments);
