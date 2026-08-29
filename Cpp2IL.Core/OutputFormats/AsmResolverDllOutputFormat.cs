@@ -14,6 +14,7 @@ using AssetRipper.CIL;
 using Cpp2IL.Core.Api;
 using Cpp2IL.Core.Logging;
 using Cpp2IL.Core.Model.Contexts;
+using Cpp2IL.Core.ProcessingLayers;
 using Cpp2IL.Core.Utils;
 using Cpp2IL.Core.Utils.AsmResolver;
 using LibCpp2IL.Metadata;
@@ -118,6 +119,13 @@ public abstract class AsmResolverDllOutputFormat : Cpp2IlOutputFormat
 
         MiscUtils.ExecuteParallel(context.Assemblies, AsmResolverAssemblyPopulator.CopyDataFromIl2CppToManaged);
         MiscUtils.ExecuteParallel(context.Assemblies, AsmResolverAssemblyPopulator.AddExplicitInterfaceImplementations);
+
+        Logger.VerboseNewline($"{(DateTime.Now - start).TotalMilliseconds:F1}ms", "DllOutput");
+
+        //Analyze custom attributes - without this there are none in the model to populate below
+        start = DateTime.Now;
+        Logger.Verbose("Analyzing custom attributes...", "DllOutput");
+        new AttributeAnalysisProcessingLayer().Process(context);
 
         Logger.VerboseNewline($"{(DateTime.Now - start).TotalMilliseconds:F1}ms", "DllOutput");
 
