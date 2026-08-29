@@ -434,10 +434,9 @@ public static class MetadataResolver
 
     private static MethodAnalysisContext? FindConcreteGenericConstructor(TypeAnalysisContext receiverType, List<MethodAnalysisContext> candidates)
     {
-        var candidateParameterCounts = candidates
+        var candidateParameterCounts = new HashSet<int>(candidates
             .Where(c => !c.IsStatic && c.Name == ".ctor")
-            .Select(c => c.Parameters.Count)
-            .ToHashSet();
+            .Select(c => c.Parameters.Count));
 
         if (candidateParameterCounts.Count == 0)
             return null;
@@ -670,7 +669,8 @@ public static class MetadataResolver
     private const long VTableOffset32 = 0xC0;
     
     // Resolves virtual dispatch through <c>[klass + vtableOffset + slot * sizeof(VirtualInvokeData)]</c>
-    // as long as the klass local's represented type is known.
+    // as long as the klass local's represented type is known. Handles both a normal call and a tail
+    // call, which the lifter leaves as an IndirectJump.
     public static bool ResolveVirtualCalls(MethodAnalysisContext method)
     {
         var pointerSize = method.AppContext.Binary.PointerSizeBytes;
@@ -687,40 +687,73 @@ public static class MetadataResolver
                 loads[destination] = load;
         }
 
-        foreach (var instruction in method.ControlFlowGraph.Instructions)
+        foreach (var block in method.ControlFlowGraph.Blocks.ToList())
         {
-            if (instruction.OpCode != OpCode.IndirectCall)
-                continue;
-
-            if (SlotLoad(instruction.Operands[0]) is not { } target
-                || target.Base is not LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: { } receiverType } } klassLocal)
-                continue;
-
-            var offset = target.Addend - vtableOffset;
-            if (offset < 0 || offset % invokeDataSize != 0)
-                continue;
-
-            var slot = (int)(offset / invokeDataSize);
-            if (ResolveVTableSlot(method.AppContext, receiverType, slot) is not { } resolved)
-                continue;
-
-            var assembly = resolved.DeclaringType?.DeclaringAssembly ?? method.DeclaringType?.DeclaringAssembly;
-
-            instruction.OpCode = OpCode.Call; // same operand layout as IndirectCall, and we've resolved it now
-            instruction.SetOperand(0, resolved);
-            resolved.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, resolved);
-
-            // the MethodInfo field is also the same method, name it, for cleanliness and so it can
-            // serve as a hidden final parameter if needed
-            for (var i = 1; i < instruction.Operands.Count && assembly != null; i++)
+            foreach (var instruction in block.Instructions.ToList())
             {
-                if (SlotLoad(instruction.Operands[i]) is { } methodInfoLoad
-                    && ReferenceEquals(methodInfoLoad.Base, klassLocal)
-                    && methodInfoLoad.Addend == target.Addend + pointerSize)
-                    instruction.SetOperand(i, new RuntimeMethodInfoAnalysisContext(resolved, assembly));
-            }
+                if (instruction.OpCode is not (OpCode.IndirectCall or OpCode.IndirectJump))
+                    continue;
 
-            changed = true;
+                if (SlotLoad(instruction.Operands[0]) is not { } target
+                    || target.Base is not LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: { } receiverType } } klassLocal)
+                    continue;
+
+                var offset = target.Addend - vtableOffset;
+                if (offset < 0 || offset % invokeDataSize != 0)
+                    continue;
+
+                var slot = (int)(offset / invokeDataSize);
+                if (ResolveVTableSlot(method.AppContext, receiverType, slot) is not { } resolved)
+                    continue;
+
+                var assembly = resolved.DeclaringType?.DeclaringAssembly ?? method.DeclaringType?.DeclaringAssembly;
+                var isTailCall = instruction.OpCode == OpCode.IndirectJump;
+
+                if (isTailCall)
+                {
+                    // an IndirectJump's return register operand is a stale use rather than a return
+                    // slot, so rebuild the operand list around the resolved signature
+                    var callingConventions = resolved.AppContext.InstructionSet.CallingConventionResolver;
+                    var operands = new List<IOperand> { resolved };
+
+                    if (!resolved.IsVoid)
+                        operands.Add(new LocalVariable("virtualTailCallResult", callingConventions?.ReturnRegister(resolved) ?? new Register(null, "rax")));
+
+                    operands.AddRange(instruction.Operands.Skip(2));
+                    instruction.SetOperands(operands);
+                    instruction.OpCode = resolved.IsVoid ? OpCode.CallVoid : OpCode.Call;
+                }
+                else
+                {
+                    instruction.OpCode = OpCode.Call; // same operand layout as IndirectCall, and we've resolved it now
+                    instruction.SetOperand(0, resolved);
+                }
+
+                resolved.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, resolved);
+
+                // the MethodInfo field is also the same method, name it, for cleanliness and so it can
+                // serve as a hidden final parameter if needed
+                for (var i = 1; i < instruction.Operands.Count && assembly != null; i++)
+                {
+                    if (SlotLoad(instruction.Operands[i]) is { } methodInfoLoad
+                        && ReferenceEquals(methodInfoLoad.Base, klassLocal)
+                        && methodInfoLoad.Addend == target.Addend + pointerSize)
+                        instruction.SetOperand(i, new RuntimeMethodInfoAnalysisContext(resolved, assembly));
+                }
+
+                if (isTailCall)
+                {
+                    // the jump was the block's terminator, so the call now needs an explicit return
+                    var returnOperands = !method.IsVoid && !resolved.IsVoid
+                        ? new List<IOperand> { instruction.Operands[1] }
+                        : [];
+
+                    block.AddInstruction(new Instruction(-1, OpCode.Return, returnOperands));
+                    block.CalculateBlockType();
+                }
+
+                changed = true;
+            }
         }
 
         return changed;
