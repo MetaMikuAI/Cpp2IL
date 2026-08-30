@@ -435,6 +435,7 @@ public static class LocalVariables
                     break;
                 case OpCode.And or OpCode.Or or OpCode.Xor or OpCode.Not or OpCode.Negate
                     or OpCode.ShiftLeft or OpCode.ShiftRight:
+                    changed |= PropagateBooleanResult(instruction, method);
                     changed |= PropagateIntegerResult(instruction, method);
                     break;
             }
@@ -484,6 +485,29 @@ public static class LocalVariables
 
         return false;
     }
+
+    // Flag expressions are represented with the same bitwise opcodes as integer arithmetic. Preserve
+    // their boolean type so branch conditions do not degrade to object locals in generated IL.
+    private static bool PropagateBooleanResult(Instruction instruction, MethodAnalysisContext method)
+    {
+        if (instruction.Operands[0] is not LocalVariable { Type: null } destination)
+            return false;
+
+        if (instruction.OpCode == OpCode.Not)
+            return IsBoolean(instruction.Operands[1], method)
+                && SetTypeIfUnknown(destination, method.AppContext.SystemTypes.SystemBooleanType);
+
+        if (instruction.OpCode is (OpCode.And or OpCode.Or or OpCode.Xor)
+            && IsBoolean(instruction.Operands[1], method)
+            && IsBoolean(instruction.Operands[2], method))
+            return SetTypeIfUnknown(destination, method.AppContext.SystemTypes.SystemBooleanType);
+
+        return false;
+    }
+
+    private static bool IsBoolean(IOperand operand, MethodAnalysisContext method)
+        => operand is LocalVariable { Type: { } type }
+           && type == method.AppContext.SystemTypes.SystemBooleanType;
 
     private static TypeAnalysisContext? IntegerResultType(IOperand operand, MethodAnalysisContext method)
     {

@@ -103,4 +103,23 @@ public class SsaSimplifierTests
         var call = live.Single(i => i.OpCode == OpCode.CallVoid);
         Assert.That(ReferenceEquals(call.Operands[1], p), Is.True, "the parameter flows through to the use");
     }
+
+    [Test]
+    public void KeepsDefinitionWhoseAddressIsRead()
+    {
+        var parameter = Local("parameter");
+        var spill = Local("spill");
+
+        // spill := parameter; f(&spill). The address cannot be replaced with the parameter, but the
+        // defining copy must remain or the generated local is passed uninitialized.
+        var live = Run(new List<Instruction>
+        {
+            new(0, OpCode.Move, spill, parameter),
+            new(1, OpCode.CallVoid, Str("f"), new AddressOf(spill)),
+            new(2, OpCode.Return),
+        }, parameter);
+
+        Assert.That(live.Any(i => i.OpCode == OpCode.Move && ReferenceEquals(i.Operands[0], spill)), Is.True,
+            "taking a local's address is a real read of its initialized value");
+    }
 }

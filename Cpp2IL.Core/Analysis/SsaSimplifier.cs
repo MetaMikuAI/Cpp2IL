@@ -119,6 +119,14 @@ public static class SsaSimplifier
                         case LocalVariable local when !ReferenceEquals(local, destination):
                             reads.Add(local);
                             break;
+                        case AddressOf { Target: LocalVariable addressed }:
+                            reads.Add(addressed);
+                            break;
+                        case AddressOf { Target: ArrayAccess addressedElement }:
+                            reads.Add(addressedElement.Array);
+                            if (addressedElement.Index is LocalVariable index)
+                                reads.Add(index);
+                            break;
                         case MemoryOperand memory:
                             if (memory.Base is LocalVariable baseLocal)
                                 reads.Add(baseLocal);
