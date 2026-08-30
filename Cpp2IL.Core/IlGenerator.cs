@@ -553,7 +553,12 @@ public static class IlGenerator
                 if (instruction.Operands[0] is FieldReference field) // stfld takes instance before value so LoadOperand StoreToOperand doesn't work
                 {
                     if (!field.Field.IsStatic)
+                    {
                         LoadLocal(field.Local, method, locals);
+
+                        if (field.ContainingField is { } containing)
+                            instructions.Add(CilOpCodes.Ldflda, containing.ToFieldDescriptor());
+                    }
 
                     LoadOperand(instruction.Operands[1], method, locals, writeLine, field.Field.FieldType);
                     instructions.Add(field.Field.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld, field.Field.ToFieldDescriptor());
@@ -957,7 +962,13 @@ public static class IlGenerator
                 }
 
                 LoadLocal(field.Local, method, locals);
-                instructions.Add(CilOpCodes.Ldfld, field.Field.ToFieldDescriptor());
+                if (field.ContainingField is { } containing)
+                {
+                    instructions.Add(CilOpCodes.Ldflda, containing.ToFieldDescriptor());
+                    instructions.Add(CilOpCodes.Ldfld, field.Field.ToFieldDescriptor());
+                }
+                else
+                    instructions.Add(CilOpCodes.Ldfld, field.Field.ToFieldDescriptor());
                 break;
             case MemoryOperand memory:
                 if (memory.Index == null && memory.Addend == 0 && memory.Scale == 0
@@ -1178,8 +1189,17 @@ public static class IlGenerator
 
                 instructions.Add(CilOpCodes.Stloc, scratch);
                 LoadLocal(field.Local, method, locals);
-                instructions.Add(CilOpCodes.Ldloc, scratch);
-                instructions.Add(CilOpCodes.Stfld, fieldDescriptor);
+                if (field.ContainingField is { } containing)
+                {
+                    instructions.Add(CilOpCodes.Ldflda, containing.ToFieldDescriptor());
+                    instructions.Add(CilOpCodes.Ldloc, scratch);
+                    instructions.Add(CilOpCodes.Stfld, fieldDescriptor);
+                }
+                else
+                {
+                    instructions.Add(CilOpCodes.Ldloc, scratch);
+                    instructions.Add(CilOpCodes.Stfld, fieldDescriptor);
+                }
                 break;
 
             case ArrayAccess arrayAccess:

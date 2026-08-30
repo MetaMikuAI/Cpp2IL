@@ -222,14 +222,53 @@ public static class MetadataResolver
                             && f.BackingData?.FieldOffset == fieldOffset);
                 }
 
-                if (field == null) // TODO: Support nested fields (Field1.Field2.Field3)
-                    continue;
+                if (field == null)
+                {
+                    // A pair load/store can address a member inside an embedded value type, e.g.
+                    // Vector2.y at outerFieldOffset + 4. Resolve the innermost field so IL generation
+                    // can use ldflda/stfld instead of leaving an untyped raw memory write behind.
+                    for (var candidateOwner = genericOwner?.GenericType ?? owner;
+                         candidateOwner != null && field == null;
+                         candidateOwner = candidateOwner.BaseType)
+                    {
+                        var containing = candidateOwner.Fields.FirstOrDefault(f => !f.IsStatic
+                            && f.FieldType.IsValueType
+                            && f.Offset >= 0
+                            && f.FieldType.Fields.Any(n => !n.IsStatic
+                                && n.Offset == fieldOffset - f.Offset));
+
+                        if (containing?.FieldType.Fields.FirstOrDefault(f => !f.IsStatic
+                                && f.Offset == fieldOffset - containing.Offset) is { } nested)
+                        {
+                            field = nested;
+                            instruction.SetOperand(i, new FieldReference(field, fieldLocal, (int)fieldOffset, containing));
+                        }
+                    }
+
+                    if (field == null)
+                        continue;
+                }
+
+                // A scalar store at the start of an embedded value type is a store to its first
+                // member, not an assignment of the whole aggregate (e.g. Vector2.x). The native
+                // compiler commonly emits this shape when initializing one component separately.
+                if (instruction.OpCode == OpCode.Move
+                    && instruction.Operands[0] is MemoryOperand
+                    && field.FieldType.IsValueType
+                    && OperandType(instruction.Operands[1], method, definitions) is { } storedType
+                    && field.FieldType.FullName != storedType.FullName
+                    && field.FieldType.Fields.FirstOrDefault(n => !n.IsStatic && n.Offset == 0
+                        && n.FieldType.FullName == storedType.FullName) is { } firstMember)
+                {
+                    instruction.SetOperand(i, new FieldReference(firstMember, fieldLocal, (int)fieldOffset, field));
+                }
 
                 // make sure we have a full GIT for field access. open type is bad.
-                if (genericOwner != null)
+                if (genericOwner != null && instruction.Operands[i] is not FieldReference { IsNested: true })
                     field = new ConcreteGenericFieldAnalysisContext(field, genericOwner);
 
-                instruction.SetOperand(i, new FieldReference(field, fieldLocal, (int)fieldOffset));
+                if (instruction.Operands[i] is not FieldReference { IsNested: true })
+                    instruction.SetOperand(i, new FieldReference(field, fieldLocal, (int)fieldOffset));
                 changed = true;
             }
         }
