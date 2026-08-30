@@ -211,6 +211,11 @@ public static class InterfaceDispatchRecovery
         {
             if (resolved.IsVoid)
                 dispatch.RemoveOperandAt(1);
+            else if (callingConventions is { }
+                     && dispatch.ImplicitDefinition is { } returnDefinition
+                     && returnDefinition.Number == callingConventions.ReturnRegister(resolved).Number
+                     && method.Locals.FirstOrDefault(local => local.Register == returnDefinition) is { } floatResult)
+                dispatch.SetOperand(1, floatResult);
 
             dispatch.SetOperand(0, resolved);
         }

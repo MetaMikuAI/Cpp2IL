@@ -179,6 +179,9 @@ public static class LocalVariables
     {
         var registers = new List<Register>();
 
+        if (instruction.ImplicitDefinition is { } implicitDefinition)
+            registers.Add(implicitDefinition);
+
         foreach (var operand in instruction.Operands)
         {
             if (operand is AddressOf { Target: Register addressed })

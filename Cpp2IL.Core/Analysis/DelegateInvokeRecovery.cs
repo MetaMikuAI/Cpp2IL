@@ -33,7 +33,7 @@ public static class DelegateInvokeRecovery
             if (delegateType.Methods.FirstOrDefault(m => m.Name == "Invoke") is not { } invoke)
                 continue;
 
-            RewriteAsInvoke(instruction, delegateLocal, invoke);
+            RewriteAsInvoke(instruction, delegateLocal, invoke, method);
         }
     }
 
@@ -54,7 +54,8 @@ public static class DelegateInvokeRecovery
         return definition is { OpCode: OpCode.Move, Operands: [_, MemoryOperand loaded] } ? loaded : null;
     }
 
-    private static void RewriteAsInvoke(Instruction call, LocalVariable delegateLocal, MethodAnalysisContext invoke)
+    private static void RewriteAsInvoke(Instruction call, LocalVariable delegateLocal, MethodAnalysisContext invoke,
+        MethodAnalysisContext caller)
     {
         if (invoke.AppContext.InstructionSet.CallingConventionResolver is not { } callingConventions
             || !callingConventions.HasRawArgumentLayout(call, invoke.AppContext))
@@ -62,6 +63,14 @@ public static class DelegateInvokeRecovery
 
         if (invoke.IsVoid)
             call.RemoveOperandAt(1);
+        else if (call.ImplicitDefinition is { } returnDefinition
+                 && returnDefinition.Number == callingConventions.ReturnRegister(invoke).Number
+                 && caller.Locals.FirstOrDefault(local => local.Register == returnDefinition) is { } result)
+        {
+            // The provisional indirect-call result is X0, while floating-point Invoke methods
+            // return through V0. The V0 SSA local is already present from the implicit clobber.
+            call.SetOperand(1, result);
+        }
 
         call.OpCode = invoke.IsVoid ? OpCode.CallVoid : OpCode.Call;
         call.SetOperand(0, invoke);

@@ -237,6 +237,23 @@ public static class MetadataResolver
         return changed;
     }
 
+    private static TypeAnalysisContext? OperandType(IOperand operand, MethodAnalysisContext method,
+        Dictionary<LocalVariable, Instruction> definitions) => OperandType(operand, method, definitions, []);
+
+    private static TypeAnalysisContext? OperandType(IOperand operand, MethodAnalysisContext method,
+        Dictionary<LocalVariable, Instruction> definitions, HashSet<LocalVariable> visited) => operand switch
+    {
+        LocalVariable { Type: { } type } => type,
+        LocalVariable local when visited.Add(local)
+            && definitions.TryGetValue(local, out var definition)
+            && definition.Operands.Count > 1
+            => OperandType(definition.Operands[1], method, definitions, visited),
+        FieldReference field => field.Field.FieldType,
+        FloatLiteral => method.AppContext.SystemTypes.SystemSingleType,
+        DoubleLiteral => method.AppContext.SystemTypes.SystemDoubleType,
+        _ => null
+    };
+
     private static void UnwrapAddressUpdate(ref LocalVariable local, ref long offset,
         Dictionary<LocalVariable, Instruction> definitions)
     {
@@ -708,12 +725,12 @@ public static class MetadataResolver
 
                 var assembly = resolved.DeclaringType?.DeclaringAssembly ?? method.DeclaringType?.DeclaringAssembly;
                 var isTailCall = instruction.OpCode == OpCode.IndirectJump;
+                var callingConventions = resolved.AppContext.InstructionSet.CallingConventionResolver;
 
                 if (isTailCall)
                 {
                     // an IndirectJump's return register operand is a stale use rather than a return
                     // slot, so rebuild the operand list around the resolved signature
-                    var callingConventions = resolved.AppContext.InstructionSet.CallingConventionResolver;
                     var operands = new List<IOperand> { resolved };
 
                     if (!resolved.IsVoid)
@@ -725,8 +742,16 @@ public static class MetadataResolver
                 }
                 else
                 {
-                    instruction.OpCode = OpCode.Call; // same operand layout as IndirectCall, and we've resolved it now
+                    instruction.OpCode = resolved.IsVoid ? OpCode.CallVoid : OpCode.Call;
                     instruction.SetOperand(0, resolved);
+
+                    if (resolved.IsVoid)
+                        instruction.RemoveOperandAt(1);
+                    else if (callingConventions is { }
+                             && instruction.ImplicitDefinition is { } returnDefinition
+                             && returnDefinition.Number == callingConventions.ReturnRegister(resolved).Number
+                             && method.Locals.FirstOrDefault(local => local.Register == returnDefinition) is { } floatResult)
+                        instruction.SetOperand(1, floatResult);
                 }
 
                 resolved.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, resolved);
