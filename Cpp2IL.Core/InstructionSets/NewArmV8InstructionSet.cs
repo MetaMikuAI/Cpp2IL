@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using Disarm;
@@ -16,7 +17,13 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
     [ThreadStatic]
     private static Dictionary<string, ulong>? adrpOffsets;
 
+    [ThreadStatic]
+    private static Dictionary<string, ulong>? integerConstants;
+
     private static readonly Arm64CallingConventionResolver CallingConventions = new();
+
+    // GetIsilFromMethod runs in parallel, so cache resolved intrinsics concurrently.
+    private readonly ConcurrentDictionary<(string Name, bool IsDouble), MethodAnalysisContext?> _mathMethods = new();
 
     public override BaseCallingConventionResolver CallingConventionResolver => CallingConventions;
 
@@ -39,6 +46,17 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
     // integer register 31 is SP or ZR depending on context, callers must decide which
     private static bool IsReg31(Arm64Register reg) => reg is Arm64Register.X31 or Arm64Register.W31;
+
+    private MethodAnalysisContext? ResolveMathMethod(ApplicationAnalysisContext app, string name, bool isDouble)
+        => _mathMethods.GetOrAdd((name, isDouble), key =>
+        {
+            var mathType = app.SystemTypes.SystemDoubleType.DeclaringAssembly.GetTypeByFullName("System.Math");
+            var wantType = key.IsDouble ? app.SystemTypes.SystemDoubleType : app.SystemTypes.SystemSingleType;
+
+            return mathType?.Methods.FirstOrDefault(m =>
+                m.IsStatic && m.Name == key.Name && m.Parameters.Count == 2
+                && m.Parameters.All(p => p.ParameterType == wantType));
+        });
 
     public override BinarySlice GetRawBytesForMethod(MethodAnalysisContext context, bool isAttributeGenerator)
     {
@@ -213,6 +231,11 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         else
             adrpOffsets.Clear();
 
+        if (integerConstants == null)
+            integerConstants = new();
+        else
+            integerConstants.Clear();
+
         var instructions = new List<Instruction>();
         var addresses = new List<ulong>();
 
@@ -254,6 +277,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         }
 
         adrpOffsets.Clear();
+        integerConstants.Clear();
         return instructions;
     }
 
@@ -314,6 +338,21 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 Add(address, OpCode.Return);
             else
                 Add(address, OpCode.Return, CallingConventions.ReturnRegister(context));
+        }
+
+        void AddMathIntrinsic(string name)
+        {
+            var isDouble = instruction.Op0Reg is >= Arm64Register.D0 and <= Arm64Register.D31;
+            var method = ResolveMathMethod(context.AppContext, name, isDouble);
+
+            if (method == null)
+            {
+                Add(address, OpCode.NotImplemented, new StringLiteral($"System.Math.{name} not resolved"));
+                return;
+            }
+
+            Add(address, OpCode.Call, method, ConvertOperand(instruction, 0),
+                ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
         }
 
         // for pre/post indexed accesses, apply the base register update on the correct side of the access
@@ -815,6 +854,12 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.FSUB:
                 Add(address, OpCode.Subtract, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
                 break;
+            case Arm64Mnemonic.FMIN:
+                AddMathIntrinsic("Min");
+                break;
+            case Arm64Mnemonic.FMAX:
+                AddMathIntrinsic("Max");
+                break;
             case Arm64Mnemonic.BL:
                 AddCallAt(instruction.BranchTarget);
                 break;
@@ -822,6 +867,10 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 {
                     var call = Add(address, OpCode.IndirectCall, ConvertOperand(instruction, 0), new Register(null, "X0") /* return value */);
                     call.AddOperands(CallingConventions.ResolveForUnmanaged(context.AppContext, address));
+                    // An indirect call may return a float in V0. Keep that register's clobber in
+                    // SSA as well; virtual-call recovery can replace the provisional X0 result
+                    // once the managed signature is known.
+                    call.ImplicitDefinition = new Register(null, "V0");
                     break;
                 }
             case Arm64Mnemonic.BR:
@@ -960,10 +1009,37 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             adrpOffsets!.Remove(NormalizeRegister(instruction.Op0Reg));
         if (instruction.MemIndexMode != Arm64MemoryIndexMode.Offset && instruction.MemBase != Arm64Register.INVALID)
             adrpOffsets!.Remove(NormalizeRegister(instruction.MemBase));
+
+        // Keep integer constants long enough to recover the common compiler sequence
+        // MOV Wn, <IEEE-754 bits>; FMOV Sn, Wn. Any other write invalidates the value.
+        if (instruction.Op0Kind == Arm64OperandKind.Register)
+        {
+            var destination = NormalizeRegister(instruction.Op0Reg);
+            if (instruction.Mnemonic is Arm64Mnemonic.MOV or Arm64Mnemonic.MOVZ
+                && instruction.Op1Kind == Arm64OperandKind.Immediate)
+                integerConstants![destination] = unchecked((ulong)instruction.Op1Imm);
+            else if (instruction.Mnemonic == Arm64Mnemonic.MOVN
+                && instruction.Op1Kind == Arm64OperandKind.Immediate)
+                integerConstants![destination] = ~unchecked((ulong)instruction.Op1Imm);
+            else if (instruction.Mnemonic != Arm64Mnemonic.ADRP)
+                integerConstants!.Remove(destination);
+        }
     }
 
     private IOperand ConvertOperand(Arm64Instruction instruction, int operand)
     {
+        if (instruction.Mnemonic == Arm64Mnemonic.FMOV && operand == 1
+            && instruction.Op0Kind == Arm64OperandKind.Register
+            && instruction.Op1Kind == Arm64OperandKind.Register
+            && integerConstants!.TryGetValue(NormalizeRegister(instruction.Op1Reg), out var fpBits))
+        {
+            if (instruction.Op0Reg is >= Arm64Register.D0 and <= Arm64Register.D31)
+                return new DoubleLiteral(BitConverter.Int64BitsToDouble(unchecked((long)fpBits)));
+
+            if (instruction.Op0Reg is >= Arm64Register.S0 and <= Arm64Register.S31)
+                return new FloatLiteral(BitConverter.ToSingle(BitConverter.GetBytes((uint)fpBits), 0));
+        }
+
         var kind = operand switch
         {
             0 => instruction.Op0Kind,

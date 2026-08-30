@@ -19,7 +19,33 @@ public static class FloatLiteralRecovery
                 TryConvert(instruction, 1, field.Field.FieldType);
             else if (instruction.IsCall && instruction.Operands is [MethodAnalysisContext target, ..])
                 ConvertArguments(instruction, target);
+            else if (IsArithmeticOrComparison(instruction.OpCode) && FloatOperandType(instruction) is { } floatType)
+                for (var i = 1; i < instruction.Operands.Count; i++)
+                    TryConvert(instruction, i, floatType);
         }
+    }
+
+    private static bool IsArithmeticOrComparison(OpCode opCode) => opCode is
+        OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.Modulo
+        or OpCode.CheckEqual or OpCode.CheckNotEqual or OpCode.CheckLess or OpCode.CheckLessOrEqual
+        or OpCode.CheckGreater or OpCode.CheckGreaterOrEqual;
+
+    private static TypeAnalysisContext? FloatOperandType(Instruction instruction)
+    {
+        foreach (var operand in instruction.Operands)
+        {
+            var type = operand switch
+            {
+                LocalVariable { Type: { } localType } => localType,
+                FieldReference field => field.Field.FieldType,
+                _ => null
+            };
+
+            if (type?.FullName is "System.Single" or "System.Double")
+                return type;
+        }
+
+        return null;
     }
 
     private static void ConvertArguments(Instruction call, MethodAnalysisContext target)
