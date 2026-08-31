@@ -11,6 +11,7 @@ using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
 using Cpp2IL.Core.Utils.AsmResolver;
+using LibCpp2IL.BinaryStructures;
 
 namespace Cpp2IL.Core;
 
@@ -550,6 +551,18 @@ public static class IlGenerator
                 break;
 
             case OpCode.Move:
+                // Native aggregate zeroing can collapse to a scalar Move after adjacent ARM64
+                // stack slots are reconnected into one value-type local. A scalar ldc.i4.0 cannot
+                // be stored into that local in managed IL; initialize the aggregate explicitly.
+                if (instruction.Operands is [LocalVariable { Type: { IsValueType: true } valueType } zeroed, var zero]
+                    && valueType.Type is Il2CppTypeEnum.IL2CPP_TYPE_VALUETYPE or Il2CppTypeEnum.IL2CPP_TYPE_GENERICINST
+                    && IsZeroConstant(zero))
+                {
+                    instructions.Add(CilOpCodes.Ldloca, locals[zeroed]);
+                    instructions.Add(CilOpCodes.Initobj, valueType.ToTypeSignature().ToTypeDefOrRef());
+                    break;
+                }
+
                 if (instruction.Operands[0] is FieldReference field) // stfld takes instance before value so LoadOperand StoreToOperand doesn't work
                 {
                     if (!field.Field.IsStatic)
