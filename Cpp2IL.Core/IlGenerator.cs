@@ -6,6 +6,7 @@ using AsmResolver.DotNet;
 using AsmResolver.DotNet.Code.Cil;
 using AsmResolver.DotNet.Signatures;
 using AsmResolver.PE.DotNet.Cil;
+using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
@@ -245,6 +246,7 @@ public static class IlGenerator
         NormalizeDelegateConstruction(definition);
         NormalizeLinqGenericInstantiations(definition);
         NormalizeLambdaNullChecks(definition);
+        ForeachRecovery.Run(definition);
     }
 
     private static readonly HashSet<string> LinqMethodNames =
