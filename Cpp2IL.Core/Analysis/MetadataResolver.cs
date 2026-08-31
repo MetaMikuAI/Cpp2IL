@@ -1,4 +1,6 @@
+using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Reflection;
 using Cpp2IL.Core.Extensions;
@@ -172,6 +174,20 @@ public static class MetadataResolver
             {
                 var operand = instruction.Operands[i];
 
+                // StackAnalyzer names each frame slot independently. A large value type returned
+                // through ARM64 X8 spans several such slots, so a later load of (base + field
+                // offset) arrives as a plain local instead of a MemoryOperand. Reconnect that slot
+                // to its enclosing value type before normal propagation handles the loaded type.
+                if (instruction.OpCode == OpCode.Move
+                    && i == 1
+                    && operand is LocalVariable stackFieldLocal
+                    && ResolveStackFieldLoad(method, stackFieldLocal) is { } stackField)
+                {
+                    instruction.SetOperand(i, stackField);
+                    operand = stackField;
+                    changed = true;
+                }
+
                 if (operand is not MemoryOperand memory)
                     continue;
 
@@ -196,30 +212,35 @@ public static class MetadataResolver
                 var staticOwner = (fieldLocal.Type as StaticFieldStorageTypeAnalysisContext)?.OwnerType;
                 var owner = staticOwner ?? fieldLocal.Type;
                 var genericOwner = owner as GenericInstanceTypeAnalysisContext;
+                GenericInstanceTypeAnalysisContext? fieldGenericOwner = genericOwner;
 
-                FieldAnalysisContext? field;
-                if (genericOwner != null && staticOwner == null)
+                // Search the complete inheritance chain. Generic base classes have zero metadata
+                // offsets, so compute their instantiated layout and retain the concrete owner for
+                // field type substitution (e.g. ResourcePool<AreaObjectCharacter>.resources).
+                FieldAnalysisContext? field = null;
+                for (var candidateOwner = owner; candidateOwner != null && field == null; candidateOwner = candidateOwner.BaseType)
                 {
-                    // metadata has all-0 offsets for generic definitions, so recompute layout
-                    // TODO support user-defined value types
-                    if (genericOwner.GenericArguments.Any(a => a.IsValueType))
+                    if (staticOwner == null && candidateOwner is GenericInstanceTypeAnalysisContext candidateGeneric)
+                    {
+                        if (candidateGeneric.GenericArguments.Any(a => a.IsValueType))
+                            continue;
+
+                        field = GenericInstanceFieldLayout.FindFieldAtOffset(candidateGeneric.GenericType, fieldOffset);
+                        if (field != null)
+                            fieldGenericOwner = candidateGeneric;
+
                         continue;
+                    }
 
-                    field = GenericInstanceFieldLayout.FindFieldAtOffset(genericOwner.GenericType, fieldOffset);
-                }
-                else if (staticOwner == null && owner.GenericParameters.Count > 0)
-                {
-                    field = GenericInstanceFieldLayout.FindFieldAtOffset(owner, fieldOffset);
-                }
-                else
-                {
-                    // an inherited field exists on the base type but sits at the same offset in the
-                    // derived layout, so the whole chain is searched
-                    field = null;
-                    for (var candidateOwner = genericOwner?.GenericType ?? owner; candidateOwner != null && field == null; candidateOwner = candidateOwner.BaseType)
-                        field = candidateOwner.Fields.FirstOrDefault(f => f.IsStatic == (staticOwner != null)
-                            && (f.Attributes & FieldAttributes.Literal) == 0 // consts have no storage but their metadata offset is 0, which would match
-                            && f.BackingData?.FieldOffset == fieldOffset);
+                    if (staticOwner == null && candidateOwner.GenericParameters.Count > 0)
+                    {
+                        field = GenericInstanceFieldLayout.FindFieldAtOffset(candidateOwner, fieldOffset);
+                        continue;
+                    }
+
+                    field = candidateOwner.Fields.FirstOrDefault(f => f.IsStatic == (staticOwner != null)
+                        && (f.Attributes & FieldAttributes.Literal) == 0 // consts have no storage but their metadata offset is 0, which would match
+                        && f.BackingData?.FieldOffset == fieldOffset);
                 }
 
                 if (field == null)
@@ -264,8 +285,8 @@ public static class MetadataResolver
                 }
 
                 // make sure we have a full GIT for field access. open type is bad.
-                if (genericOwner != null && instruction.Operands[i] is not FieldReference { IsNested: true })
-                    field = new ConcreteGenericFieldAnalysisContext(field, genericOwner);
+                if (fieldGenericOwner != null && instruction.Operands[i] is not FieldReference { IsNested: true })
+                    field = new ConcreteGenericFieldAnalysisContext(field, fieldGenericOwner);
 
                 if (instruction.Operands[i] is not FieldReference { IsNested: true })
                     instruction.SetOperand(i, new FieldReference(field, fieldLocal, (int)fieldOffset));
@@ -274,6 +295,60 @@ public static class MetadataResolver
         }
 
         return changed;
+    }
+
+    private static FieldReference? ResolveStackFieldLoad(MethodAnalysisContext method, LocalVariable fieldLocal)
+    {
+        if (!TryGetStackOffset(fieldLocal, out var fieldOffset))
+            return null;
+
+        foreach (var baseLocal in method.Locals)
+        {
+            if (ReferenceEquals(baseLocal, fieldLocal)
+                || !TryGetStackOffset(baseLocal, out var baseOffset)
+                || baseOffset >= fieldOffset
+                || baseLocal.Type is not { IsValueType: true } baseType)
+                continue;
+
+            var relativeOffset = fieldOffset - baseOffset;
+            var definition = baseType is GenericInstanceTypeAnalysisContext generic
+                ? generic.GenericType
+                : baseType;
+            var field = GenericInstanceFieldLayout.FindFieldAtUnboxedOffset(definition, relativeOffset);
+            if (field == null)
+                continue;
+
+            if (baseType is GenericInstanceTypeAnalysisContext genericOwner)
+                field = new ConcreteGenericFieldAnalysisContext(field, genericOwner);
+
+            return new FieldReference(field, baseLocal, (int)relativeOffset);
+        }
+
+        return null;
+    }
+
+    private static bool TryGetStackOffset(LocalVariable local, out long offset)
+    {
+        var name = local.Register.Name;
+        if (name is not { Length: > 6 } || !name.StartsWith("stack_", StringComparison.Ordinal))
+        {
+            offset = 0;
+            return false;
+        }
+
+        var text = name[6..];
+        var negative = text.StartsWith("-", StringComparison.Ordinal);
+        if (negative)
+            text = text[1..];
+
+        if (!long.TryParse(text, NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out var magnitude))
+        {
+            offset = 0;
+            return false;
+        }
+
+        offset = negative ? -magnitude : magnitude;
+        return true;
     }
 
     private static TypeAnalysisContext? OperandType(IOperand operand, MethodAnalysisContext method,
@@ -672,12 +747,25 @@ public static class MetadataResolver
             if (!instruction.IsCall)
                 continue;
 
-            if (instruction.Operands[0] is not Immediate target)
-                //Already resolved
-                continue;
-
             if (GetMethodInfoArgument(instruction) is not { RepresentedMethod: { } representedMethod })
                 //No MethodInfo to work with
+                continue;
+
+            // A shared generic body can be resolved early to a single address (often the object
+            // instantiation). Once the MethodInfo* argument is typed, specialize that already
+            // resolved target to the concrete generic method used by the caller.
+            if (instruction.Operands[0] is MethodAnalysisContext currentMethod)
+            {
+                if (!CanSpecializeSharedGeneric(currentMethod, representedMethod))
+                    continue;
+
+                instruction.SetOperand(0, representedMethod);
+                representedMethod.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, representedMethod);
+                changed = true;
+                continue;
+            }
+
+            if (instruction.Operands[0] is not Immediate target)
                 continue;
 
             if (!method.AppContext.MethodsByAddress.TryGetValue(target.UnsignedValue, out var candidates))
@@ -717,6 +805,25 @@ public static class MetadataResolver
         }
 
         return changed;
+    }
+
+    private static bool CanSpecializeSharedGeneric(MethodAnalysisContext current, MethodAnalysisContext represented)
+    {
+        if (ReferenceEquals(current, represented)
+            || current.Name != represented.Name
+            || current.Parameters.Count != represented.Parameters.Count
+            || current.DeclaringType is not GenericInstanceTypeAnalysisContext currentInstance
+            || represented.DeclaringType is not GenericInstanceTypeAnalysisContext representedInstance
+            || !IsSameType(currentInstance.GenericType, representedInstance.GenericType)
+            || IsSameType(current.DeclaringType, represented.DeclaringType))
+            return false;
+
+        var currentBase = BaseMethodOf(current);
+        var representedBase = BaseMethodOf(represented);
+        return ReferenceEquals(currentBase, representedBase)
+               || (currentBase.Name == representedBase.Name
+                   && currentBase.Parameters.Count == representedBase.Parameters.Count
+                   && IsSameType(currentBase.DeclaringType, representedBase.DeclaringType));
     }
 
     // Offset of Il2CppClass::vtable, VirtualInvokeData entries of {methodPtr, MethodInfo*}.

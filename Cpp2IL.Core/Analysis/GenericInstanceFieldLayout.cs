@@ -6,6 +6,26 @@ namespace Cpp2IL.Core.Analysis;
 //Resolves field offsets on generic types, which are all 0 in the metadata.
 public static class GenericInstanceFieldLayout
 {
+    public static FieldAnalysisContext? FindFieldAtUnboxedOffset(TypeAnalysisContext definition, long targetOffset)
+    {
+        var pointerSize = definition.AppContext.Binary.PointerSizeBytes;
+        var offset = 0L;
+
+        foreach (var field in definition.Fields.Where(f => !f.IsStatic))
+        {
+            if (GetSizeAndAlignment(field.FieldType, pointerSize) is not var (size, alignment))
+                return null;
+
+            offset = (offset + alignment - 1) & ~(alignment - 1);
+            if (offset == targetOffset)
+                return field;
+
+            offset += size;
+        }
+
+        return null;
+    }
+
     public static FieldAnalysisContext? FindFieldAtOffset(TypeAnalysisContext definition, long targetOffset)
     {
         var pointerSize = definition.AppContext.Binary.PointerSizeBytes;
