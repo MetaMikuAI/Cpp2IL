@@ -174,6 +174,22 @@ public static class MetadataResolver
             {
                 var operand = instruction.Operands[i];
 
+                // A memory-to-memory Move is the folded form of a native aggregate copy
+                // (for example, an 8-byte Vector2 assignment). At zero offset this address
+                // is not a scalar field access; preserve the aggregate copy instead of reducing it to the first member.
+                if (instruction.OpCode == OpCode.Move
+                    && instruction.Operands.Count == 2
+                    && instruction.Operands[0] is MemoryOperand
+                    && instruction.Operands[1] is MemoryOperand)
+                    continue;
+
+                // Before SSA elimination, aggregate copies appear as a 64-bit X-register temporary
+                // between two byref accesses. Resolving either end as Vector2.x would lose the adjacent
+                // y component when the temporary is inlined, so preserve the original copy.
+                if (operand is MemoryOperand aggregateMemory
+                    && IsByRefValueAggregateCopy(instruction, i, aggregateMemory))
+                    continue;
+
                 // StackAnalyzer names each frame slot independently. A large value type returned
                 // through ARM64 X8 spans several such slots, so a later load of (base + field
                 // offset) arrives as a plain local instead of a MemoryOperand. Reconnect that slot
@@ -211,6 +227,10 @@ public static class MetadataResolver
                 // check if static field access
                 var staticOwner = (fieldLocal.Type as StaticFieldStorageTypeAnalysisContext)?.OwnerType;
                 var owner = staticOwner ?? fieldLocal.Type;
+                // A ref/out parameter points at the managed value, so resolve offsets against the
+                // referent's fields rather than the ByRef wrapper itself.
+                if (owner is ByRefTypeAnalysisContext byRef)
+                    owner = byRef.ElementType;
                 var genericOwner = owner as GenericInstanceTypeAnalysisContext;
                 GenericInstanceTypeAnalysisContext? fieldGenericOwner = genericOwner;
 
@@ -295,6 +315,18 @@ public static class MetadataResolver
         }
 
         return changed;
+    }
+
+    private static bool IsByRefValueAggregateCopy(Instruction instruction, int memoryOperandIndex,
+        MemoryOperand memory)
+    {
+        if (instruction.OpCode != OpCode.Move || instruction.Operands.Count != 2
+            || memory.Addend != 0 || memory.Index != null || memory.Scale != 0
+            || memory.Base is not LocalVariable { Type: ByRefTypeAnalysisContext { ElementType.IsValueType: true } })
+            return false;
+
+        var other = instruction.Operands[1 - memoryOperandIndex];
+        return other is LocalVariable { Register.Name: ['X', ..] };
     }
 
     private static FieldReference? ResolveStackFieldLoad(MethodAnalysisContext method, LocalVariable fieldLocal)
