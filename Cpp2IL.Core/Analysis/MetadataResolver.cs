@@ -469,7 +469,10 @@ public static class MetadataResolver
             }
 
             // Duplicated/Shared method bodies are resolved later in ResolveCallsViaMethodInfo/ResolveAmbiguousCalls.
-            if (targetMethods is not [{ } singleTargetMethod])
+            // A reference-type generic body is commonly represented by its object instantiation
+            // (for example List<object>.Enumerator.Dispose). Binding that placeholder here loses
+            // the concrete T when the caller's MethodInfo is unavailable on an exception edge.
+            if (targetMethods is not [{ } singleTargetMethod] || IsSharedGenericMethod(singleTargetMethod))
                 continue;
 
             callInstruction.SetOperand(0, singleTargetMethod);
@@ -492,6 +495,12 @@ public static class MetadataResolver
     public static bool ResolveAmbiguousCalls(MethodAnalysisContext method)
     {
         var changed = false;
+        var definitions = new Dictionary<LocalVariable, Instruction>();
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
+            if (instruction.Destination is LocalVariable destination)
+                definitions[destination] = instruction;
+        }
 
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
@@ -502,7 +511,22 @@ public static class MetadataResolver
             if (instruction.Operands[0] is not Immediate target)
                 continue;
 
-            if (!method.AppContext.MethodsByAddress.TryGetValue(target.UnsignedValue, out var candidates) || candidates.Count < 2)
+            if (!method.AppContext.MethodsByAddress.TryGetValue(target.UnsignedValue, out var candidates))
+                continue;
+
+            // A single candidate can still be a shared generic object body. In that case the
+            // receiver carries the concrete instantiation even when no MethodInfo* survived.
+            if (candidates is [{ } sharedGeneric]
+                && GetReceiver(instruction, definitions) is { Type: { } singleReceiverType }
+                && TrySpecializeSharedGeneric(sharedGeneric, singleReceiverType) is { } specialized)
+            {
+                instruction.SetOperand(0, specialized);
+                specialized.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, specialized);
+                changed = true;
+                continue;
+            }
+
+            if (candidates.Count < 2)
                 continue;
 
             // e.g. string.Equals and string.op_Equality, identical params, instance type, and bodies are shared
@@ -516,7 +540,7 @@ public static class MetadataResolver
                 continue;
             }
 
-            if (GetReceiver(instruction) is not { Type: { } receiverType } receiver)
+            if (GetReceiver(instruction, definitions) is not { Type: { } receiverType } receiver)
                 continue;
 
             // Prefer picking base ctor if we are a ctor
@@ -617,18 +641,48 @@ public static class MetadataResolver
     // The receiver ('this') of a call is the first integer-slot argument: operand 1 for CallVoid
     // (after the target), operand 2 for Call (after the target and the return value).
     // A value type receiver is passed byref, so it arrives as an AddressOf over the local.
-    private static LocalVariable? GetReceiver(Instruction call)
+    private static LocalVariable? GetReceiver(Instruction call, Dictionary<LocalVariable, Instruction>? definitions = null)
     {
         var index = call.OpCode == OpCode.CallVoid ? 1 : 2;
 
-        return index < call.Operands.Count
-            ? call.Operands[index] switch
+        if (index >= call.Operands.Count)
+            return null;
+
+        if (call.Operands[index] is AddressOf { Target: LocalVariable directAddressed })
+            return directAddressed;
+
+        if (call.Operands[index] is not LocalVariable local)
+            return null;
+
+        if (definitions == null)
+            return local;
+
+        // ARM64 address materialization is commonly lifted as Move local, AddressOf(local). Calls
+        // then consume the pointer local instead of retaining the AddressOf wrapper. Follow local
+        // copies until the addressed value is recovered, while leaving ordinary value receivers
+        // untouched.
+        var visited = new HashSet<LocalVariable>();
+        var current = local;
+        while (visited.Add(current)
+               && definitions.TryGetValue(current, out var definition)
+               && definition.OpCode == OpCode.Move
+               && definition.Operands.Count > 1)
+        {
+            switch (definition.Operands[1])
             {
-                LocalVariable local => local,
-                AddressOf { Target: LocalVariable addressed } => addressed,
-                _ => null
+                case AddressOf { Target: LocalVariable aliasedAddressed }:
+                    return aliasedAddressed;
+                case LocalVariable next:
+                    current = next;
+                    continue;
+                default:
+                    break;
             }
-            : null;
+
+            break;
+        }
+
+        return local;
     }
 
     // Concrete generic method contexts build their declaring type fresh rather than via the
@@ -674,7 +728,7 @@ public static class MetadataResolver
             if (!method.AppContext.MethodsByAddress.TryGetValue(callTarget.UnsignedValue, out var candidates))
                 continue;
 
-            if (GetReceiver(instruction) is not { } receiver || AllocatedType(receiver, definitions) is not { } allocatedType)
+            if (GetReceiver(instruction, definitions) is not { } receiver || AllocatedType(receiver, definitions) is not { } allocatedType)
                 continue;
 
             var constructor = candidates.FirstOrDefault(c => !c.IsStatic && c.Name == ".ctor" && ReferenceEquals(c.DeclaringType, allocatedType))
@@ -791,14 +845,18 @@ public static class MetadataResolver
                 continue;
             }
 
-            if (candidates.Count < 2)
+            if (candidates.Count == 1)
+            {
+                if (!IsSharedGenericMethod(candidates[0])
+                    || !MatchesSharedGenericMethod(candidates[0], representedMethod))
+                    continue;
+            }
+            else if (!candidates.Any(candidate => ReferenceEquals(BaseMethodOf(candidate), BaseMethodOf(representedMethod))))
+            {
                 continue;
+            }
 
             //Try to actually match on the method name so we don't just replace a call with something else.
-            var representedBase = BaseMethodOf(representedMethod);
-            if (!candidates.Any(candidate => ReferenceEquals(BaseMethodOf(candidate), representedBase)))
-                continue;
-
             instruction.SetOperand(0, representedMethod);
             representedMethod.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, representedMethod);
             changed = true;
@@ -824,6 +882,82 @@ public static class MetadataResolver
                || (currentBase.Name == representedBase.Name
                    && currentBase.Parameters.Count == representedBase.Parameters.Count
                    && IsSameType(currentBase.DeclaringType, representedBase.DeclaringType));
+    }
+
+    private static bool IsSharedGenericMethod(MethodAnalysisContext method)
+    {
+        if (method.DeclaringType is not GenericInstanceTypeAnalysisContext instance
+            || instance.GenericArguments.Count == 0)
+            return false;
+
+        // IL2CPP uses System.Object as the canonical body for reference-type generic sharing.
+        return instance.GenericArguments.Any(argument => argument == method.AppContext.SystemTypes.SystemObjectType);
+    }
+
+    private static bool MatchesSharedGenericMethod(MethodAnalysisContext shared, MethodAnalysisContext represented)
+    {
+        if (!IsSharedGenericMethod(shared)
+            || shared.Name != represented.Name
+            || shared.IsStatic != represented.IsStatic
+            || shared.Parameters.Count != represented.Parameters.Count)
+            return false;
+
+        if (ReferenceEquals(BaseMethodOf(shared), BaseMethodOf(represented)))
+            return true;
+
+        return shared.DeclaringType is GenericInstanceTypeAnalysisContext sharedInstance
+            && represented.DeclaringType is GenericInstanceTypeAnalysisContext representedInstance
+            && ReferenceEquals(sharedInstance.GenericType, representedInstance.GenericType)
+            && sharedInstance.GenericArguments.Count == representedInstance.GenericArguments.Count;
+    }
+
+    private static MethodAnalysisContext? TrySpecializeSharedGeneric(MethodAnalysisContext shared, TypeAnalysisContext receiverType)
+    {
+        if (!IsSharedGenericMethod(shared)
+            || shared.DeclaringType is not GenericInstanceTypeAnalysisContext sharedInstance)
+            return null;
+
+        for (var type = receiverType; type != null; type = type.BaseType)
+        {
+            if (type is not GenericInstanceTypeAnalysisContext receiverInstance
+                || !ReferenceEquals(receiverInstance.GenericType, sharedInstance.GenericType)
+                || receiverInstance.GenericArguments.Count != sharedInstance.GenericArguments.Count)
+                continue;
+
+            // The canonical object body is already the right target for an object receiver.
+            var sameArguments = true;
+            for (var i = 0; i < receiverInstance.GenericArguments.Count; i++)
+            {
+                if (IsSameType(receiverInstance.GenericArguments[i], sharedInstance.GenericArguments[i]))
+                    continue;
+
+                sameArguments = false;
+                break;
+            }
+
+            if (sameArguments)
+                return shared;
+
+            var matches = receiverInstance.GenericType.Methods
+                .Where(candidate => candidate.Name == shared.Name
+                    && candidate.IsStatic == shared.IsStatic
+                    && candidate.Parameters.Count == shared.Parameters.Count)
+                .ToList();
+
+            if (matches is not [{ } definition]
+                || definition.DeclaringType?.GenericParameters.Count != receiverInstance.GenericArguments.Count
+                || definition.GenericParameters.Count != shared.GenericParameters.Count)
+                return null;
+
+            // Shared generic methods with their own method parameters need a second instantiation
+            // source which is not available on this edge; leave those unresolved.
+            if (definition.GenericParameters.Count != 0)
+                return null;
+
+            return new ConcreteGenericMethodAnalysisContext(definition, receiverInstance.GenericArguments, []);
+        }
+
+        return null;
     }
 
     // Offset of Il2CppClass::vtable, VirtualInvokeData entries of {methodPtr, MethodInfo*}.
