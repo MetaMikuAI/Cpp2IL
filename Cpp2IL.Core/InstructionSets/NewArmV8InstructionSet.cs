@@ -23,7 +23,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
     private static readonly Arm64CallingConventionResolver CallingConventions = new();
 
     // GetIsilFromMethod runs in parallel, so cache resolved intrinsics concurrently.
-    private readonly ConcurrentDictionary<(string Name, bool IsDouble), MethodAnalysisContext?> _mathMethods = new();
+    private readonly ConcurrentDictionary<(string Name, bool IsDouble, int ParameterCount), MethodAnalysisContext?> _mathMethods = new();
 
     public override BaseCallingConventionResolver CallingConventionResolver => CallingConventions;
 
@@ -47,15 +47,31 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
     // integer register 31 is SP or ZR depending on context, callers must decide which
     private static bool IsReg31(Arm64Register reg) => reg is Arm64Register.X31 or Arm64Register.W31;
 
-    private MethodAnalysisContext? ResolveMathMethod(ApplicationAnalysisContext app, string name, bool isDouble)
-        => _mathMethods.GetOrAdd((name, isDouble), key =>
+    private MethodAnalysisContext? ResolveMathMethod(ApplicationAnalysisContext app, string name, bool isDouble,
+        int parameterCount)
+        => _mathMethods.GetOrAdd((name, isDouble, parameterCount), key =>
         {
-            var mathType = app.SystemTypes.SystemDoubleType.DeclaringAssembly.GetTypeByFullName("System.Math");
             var wantType = key.IsDouble ? app.SystemTypes.SystemDoubleType : app.SystemTypes.SystemSingleType;
 
-            return mathType?.Methods.FirstOrDefault(m =>
-                m.IsStatic && m.Name == key.Name && m.Parameters.Count == 2
-                && m.Parameters.All(p => p.ParameterType == wantType));
+            // Unity versions place single-precision math functions in different types: System.Math
+            // provides Min/Max, while sqrtf commonly maps to UnityEngine.Mathf. Resolve by exact
+            // parameter type to avoid implicit conversions.
+            foreach (var typeName in key.IsDouble
+                         ? new[] { "System.Math", "System.MathF" }
+                         : new[] { "System.Math", "System.MathF", "UnityEngine.Mathf" })
+            {
+                foreach (var assembly in app.Assemblies)
+                {
+                    var mathType = assembly.GetTypeByFullName(typeName);
+                    var method = mathType?.Methods.FirstOrDefault(m =>
+                        m.IsStatic && m.Name == key.Name && m.Parameters.Count == key.ParameterCount
+                        && m.Parameters.All(p => p.ParameterType == wantType));
+                    if (method != null)
+                        return method;
+                }
+            }
+
+            return null;
         });
 
     public override BinarySlice GetRawBytesForMethod(MethodAnalysisContext context, bool isAttributeGenerator)
@@ -369,10 +385,10 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 Add(address, OpCode.Return, CallingConventions.ReturnRegister(context));
         }
 
-        void AddMathIntrinsic(string name)
+        void AddMathIntrinsic(string name, int parameterCount)
         {
             var isDouble = instruction.Op0Reg is >= Arm64Register.D0 and <= Arm64Register.D31;
-            var method = ResolveMathMethod(context.AppContext, name, isDouble);
+            var method = ResolveMathMethod(context.AppContext, name, isDouble, parameterCount);
 
             if (method == null)
             {
@@ -380,8 +396,15 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 return;
             }
 
-            Add(address, OpCode.Call, method, ConvertOperand(instruction, 0),
-                ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+            var operands = new List<IOperand>(parameterCount + 2)
+            {
+                method,
+                ConvertOperand(instruction, 0)
+            };
+            for (var i = 1; i <= parameterCount; i++)
+                operands.Add(ConvertOperand(instruction, i));
+
+            Add(address, OpCode.Call, operands);
         }
 
         // for pre/post indexed accesses, apply the base register update on the correct side of the access
@@ -884,10 +907,13 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 Add(address, OpCode.Subtract, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
                 break;
             case Arm64Mnemonic.FMIN:
-                AddMathIntrinsic("Min");
+                AddMathIntrinsic("Min", 2);
                 break;
             case Arm64Mnemonic.FMAX:
-                AddMathIntrinsic("Max");
+                AddMathIntrinsic("Max", 2);
+                break;
+            case Arm64Mnemonic.FSQRT:
+                AddMathIntrinsic("Sqrt", 1);
                 break;
             case Arm64Mnemonic.BL:
                 AddCallAt(instruction.BranchTarget);
