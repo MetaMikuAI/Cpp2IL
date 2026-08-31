@@ -254,9 +254,22 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
         var instructions = new List<Instruction>();
         var addresses = new List<ulong>();
+        var twoSLaneRegisters = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var instruction in insns)
+        {
+            if (instruction.Op0Kind == Arm64OperandKind.Register
+                && instruction.Op0Arrangement.ToString() == "TwoS")
+                twoSLaneRegisters.Add(NormalizeRegister(instruction.Op0Reg));
+            if (instruction.Op1Kind == Arm64OperandKind.Register
+                && instruction.Op1Arrangement.ToString() == "TwoS")
+                twoSLaneRegisters.Add(NormalizeRegister(instruction.Op1Reg));
+            if (instruction.Op2Kind == Arm64OperandKind.Register
+                && instruction.Op2Arrangement.ToString() == "TwoS")
+                twoSLaneRegisters.Add(NormalizeRegister(instruction.Op2Reg));
+        }
 
         foreach (var instruction in insns)
-            ConvertInstructionStatement(instruction, instructions, addresses, context);
+            ConvertInstructionStatement(instruction, instructions, addresses, context, twoSLaneRegisters);
 
         // Add return if the function doesn't end with one already
         if (instructions.Count > 0 && instructions[^1].OpCode != OpCode.Return)
@@ -297,7 +310,8 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         return instructions;
     }
 
-    private void ConvertInstructionStatement(Arm64Instruction instruction, List<Instruction> instructions, List<ulong> addresses, MethodAnalysisContext context)
+    private void ConvertInstructionStatement(Arm64Instruction instruction, List<Instruction> instructions,
+        List<ulong> addresses, MethodAnalysisContext context, HashSet<string> twoSLaneRegisters)
     {
         var address = instruction.Address;
 
@@ -307,6 +321,87 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             var newInstruction = new Instruction(instructions.Count, opCode, operands);
             instructions.Add(newInstruction);
             return newInstruction;
+        }
+
+        Register VectorLane(Arm64Register register, int lane) =>
+            new(null, $"{NormalizeRegister(register)}.S{lane}");
+
+        bool IsTwoS(Arm64ArrangementSpecifier arrangement) => arrangement.ToString() == "TwoS";
+
+        IOperand ScalarOperand(int operand)
+        {
+            var register = operand switch
+            {
+                0 => instruction.Op0Reg,
+                1 => instruction.Op1Reg,
+                2 => instruction.Op2Reg,
+                3 => instruction.Op3Reg,
+                _ => throw new ArgumentOutOfRangeException(nameof(operand))
+            };
+            var kind = operand switch
+            {
+                0 => instruction.Op0Kind,
+                1 => instruction.Op1Kind,
+                2 => instruction.Op2Kind,
+                3 => instruction.Op3Kind,
+                _ => throw new ArgumentOutOfRangeException(nameof(operand))
+            };
+
+            // Scalar S<n> and the first lane of V<n>.2S share the same 32-bit register;
+            // preserve this alias when scalar instructions feed subsequent vector instructions.
+            return kind == Arm64OperandKind.Register
+                   && register is >= Arm64Register.S0 and <= Arm64Register.S31
+                   && twoSLaneRegisters.Contains(NormalizeRegister(register))
+                ? VectorLane(register, 0)
+                : ConvertOperand(instruction, operand);
+        }
+
+        IOperand VectorOperand(int operand, int lane)
+        {
+            var kind = operand switch
+            {
+                0 => instruction.Op0Kind,
+                1 => instruction.Op1Kind,
+                2 => instruction.Op2Kind,
+                3 => instruction.Op3Kind,
+                _ => throw new ArgumentOutOfRangeException(nameof(operand))
+            };
+
+            var arrangement = operand switch
+            {
+                0 => instruction.Op0Arrangement,
+                1 => instruction.Op1Arrangement,
+                2 => instruction.Op2Arrangement,
+                3 => instruction.Op3Arrangement,
+                _ => throw new ArgumentOutOfRangeException(nameof(operand))
+            };
+
+            if (kind == Arm64OperandKind.Register && IsTwoS(arrangement))
+            {
+                var register = operand switch
+                {
+                    0 => instruction.Op0Reg,
+                    1 => instruction.Op1Reg,
+                    2 => instruction.Op2Reg,
+                    3 => instruction.Op3Reg,
+                    _ => throw new ArgumentOutOfRangeException(nameof(operand))
+                };
+                return VectorLane(register, lane);
+            }
+
+            return ConvertOperand(instruction, operand);
+        }
+
+        bool EmitTwoSArithmetic(OpCode opCode)
+        {
+            if (!IsTwoS(instruction.Op0Arrangement))
+                return false;
+
+            for (var lane = 0; lane < 2; lane++)
+                Add(address, opCode, VectorLane(instruction.Op0Reg, lane),
+                    VectorOperand(1, lane), VectorOperand(2, lane));
+
+            return true;
         }
 
         void AddCallAt(ulong target)
@@ -399,10 +494,10 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             var operands = new List<IOperand>(parameterCount + 2)
             {
                 method,
-                ConvertOperand(instruction, 0)
+                ScalarOperand(0)
             };
             for (var i = 1; i <= parameterCount; i++)
-                operands.Add(ConvertOperand(instruction, i));
+                operands.Add(ScalarOperand(i));
 
             Add(address, OpCode.Call, operands);
         }
@@ -577,7 +672,20 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     break;
                 }
 
-                Add(address, OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                Add(address, OpCode.Move, ScalarOperand(0), ScalarOperand(1));
+                break;
+            case Arm64Mnemonic.DUP:
+                if (IsTwoS(instruction.Op0Arrangement)
+                    && instruction.Op1Kind == Arm64OperandKind.VectorRegisterElement
+                    && instruction.Op1VectorElement.Width == Arm64VectorElementWidth.S)
+                {
+                    var source = ConvertOperand(instruction, 1);
+                    Add(address, OpCode.Move, VectorLane(instruction.Op0Reg, 0), source);
+                    Add(address, OpCode.Move, VectorLane(instruction.Op0Reg, 1), source);
+                }
+                else
+                    Add(address, OpCode.NotImplemented,
+                        new StringLiteral($"Instruction {instruction.Mnemonic} not yet implemented."));
                 break;
             case Arm64Mnemonic.MOVI:
             case Arm64Mnemonic.MVNI when instruction.Op1Kind == Arm64OperandKind.Immediate:
@@ -633,8 +741,18 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
                     if (instruction.Op0Kind == Arm64OperandKind.Register && IsReg31(instruction.Op0Reg))
                         Add(address, OpCode.Nop); // load to xzr = prefetch, discard
+                    else if (instruction.Op0Reg is >= Arm64Register.D0 and <= Arm64Register.D31
+                        && twoSLaneRegisters.Contains(NormalizeRegister(instruction.Op0Reg)))
+                    {
+                        // LDR Dn supplies the two single-precision lanes used by the following .2S operation.
+                        Add(address, OpCode.Move, VectorLane(instruction.Op0Reg, 0), source);
+                        Add(address, OpCode.Move, VectorLane(instruction.Op0Reg, 1),
+                            instruction.Op1Kind == Arm64OperandKind.ImmediatePcRelative
+                                ? new MemoryOperand(addend: (long)address + instruction.Op1Imm + 4)
+                                : MemOperand(4));
+                    }
                     else
-                        Add(address, OpCode.Move, ConvertOperand(instruction, 0), source);
+                        Add(address, OpCode.Move, ScalarOperand(0), source);
 
                     EmitWriteback(beforeAccess: false);
                     break;
@@ -646,7 +764,14 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.STURB:
             case Arm64Mnemonic.STURH:
                 EmitWriteback(beforeAccess: true);
-                Add(address, OpCode.Move, MemOperand(), ConvertOperand(instruction, 0));
+                if (instruction.Op0Reg is >= Arm64Register.D0 and <= Arm64Register.D31
+                    && twoSLaneRegisters.Contains(NormalizeRegister(instruction.Op0Reg)))
+                {
+                    Add(address, OpCode.Move, MemOperand(), VectorLane(instruction.Op0Reg, 0));
+                    Add(address, OpCode.Move, MemOperand(4), VectorLane(instruction.Op0Reg, 1));
+                }
+                else
+                    Add(address, OpCode.Move, MemOperand(), ScalarOperand(0));
                 EmitWriteback(beforeAccess: false);
                 break;
             case Arm64Mnemonic.LDP:
@@ -721,7 +846,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.CMP:
             case Arm64Mnemonic.FCMP:
             case Arm64Mnemonic.FCMPE:
-                EmitCompareFlags(ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                EmitCompareFlags(ScalarOperand(0), ScalarOperand(1));
                 break;
             case Arm64Mnemonic.CMN:
                 // cmp against the negated operand
@@ -846,10 +971,13 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     break;
                 }
             case Arm64Mnemonic.MUL:
-            case Arm64Mnemonic.FMUL:
             case Arm64Mnemonic.SMULL:
             case Arm64Mnemonic.UMULL:
                 Add(address, OpCode.Multiply, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                break;
+            case Arm64Mnemonic.FMUL:
+                if (!EmitTwoSArithmetic(OpCode.Multiply))
+                    Add(address, OpCode.Multiply, ScalarOperand(0), ScalarOperand(1), ScalarOperand(2));
                 break;
             case Arm64Mnemonic.MNEG:
             case Arm64Mnemonic.SMNEGL:
@@ -897,11 +1025,15 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 }
             case Arm64Mnemonic.SDIV:
             case Arm64Mnemonic.UDIV:
-            case Arm64Mnemonic.FDIV:
                 Add(address, OpCode.Divide, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
                 break;
+            case Arm64Mnemonic.FDIV:
+                if (!EmitTwoSArithmetic(OpCode.Divide))
+                    Add(address, OpCode.Divide, ScalarOperand(0), ScalarOperand(1), ScalarOperand(2));
+                break;
             case Arm64Mnemonic.FADD:
-                Add(address, OpCode.Add, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                if (!EmitTwoSArithmetic(OpCode.Add))
+                    Add(address, OpCode.Add, ScalarOperand(0), ScalarOperand(1), ScalarOperand(2));
                 break;
             case Arm64Mnemonic.FSUB:
                 Add(address, OpCode.Subtract, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
