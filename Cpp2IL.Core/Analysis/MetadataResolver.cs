@@ -437,7 +437,12 @@ public static class MetadataResolver
                 // type, which either throw it themselves or build it and hand it back for the caller to raise.
                 if (ThrowHelperRecovery.GetThrownException(method.AppContext, target) is { } thrown)
                 {
-                    if (callInstruction.Destination is LocalVariable produced && method.ControlFlowGraph!.Instructions.Any(i => i.Sources.Any(s => ReferenceEquals(s, produced))))
+                    if (ThrowHelperRecovery.IsExceptionRaiser(method.AppContext, target))
+                    {
+                        callInstruction.OpCode = OpCode.Throw;
+                        callInstruction.SetOperands(thrown);
+                    }
+                    else if (callInstruction.Destination is LocalVariable produced && method.ControlFlowGraph!.Instructions.Any(i => i.Sources.Any(s => ReferenceEquals(s, produced))))
                     {
                         callInstruction.OpCode = OpCode.Newobj;
                         callInstruction.SetOperands(produced, thrown);
