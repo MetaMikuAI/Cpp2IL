@@ -1241,6 +1241,19 @@ public static class IlGenerator
                 if (memory.Index == null && memory.Addend == 0 && memory.Scale == 0
                     && memory.Base is LocalVariable local2)
                 {
+                    if (local2.Type is ByRefTypeAnalysisContext { ElementType: { IsValueType: true } referent })
+                    {
+                        // A Move through a byref value type is an indirect aggregate store:
+                        // save the value, load the destination address, then emit stobj.
+                        var aggregateScratch = new CilLocalVariable(referent.ToTypeSignature());
+                        method.CilMethodBody!.LocalVariables.Add(aggregateScratch);
+                        instructions.Add(CilOpCodes.Stloc, aggregateScratch);
+                        LoadLocal(local2, method, locals);
+                        instructions.Add(CilOpCodes.Ldloc, aggregateScratch);
+                        instructions.Add(CilOpCodes.Stobj, referent.ToTypeSignature().ToTypeDefOrRef());
+                        break;
+                    }
+
                     // Can pointer assignments just be ignored because it's C#? (Move [local], 123)
                     instructions.Add(CilOpCodes.Stloc, locals[local2]);
                     break;
