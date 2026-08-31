@@ -302,6 +302,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 {
                     ctx = possibleMethods[0];
                 }
+
                 else
                 {
                     // multiple methods folded onto one address, pick the one with the most arguments so nothing gets truncated
@@ -318,9 +319,12 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     }
                 }
 
+                var returnDestination = ctx.IsVoid
+                    ? null
+                    : HiddenReturnBufferDestination(ctx) ?? CallingConventions.ReturnRegister(ctx);
                 var call = ctx.IsVoid
                     ? Add(address, OpCode.CallVoid, Imm(target))
-                    : Add(address, OpCode.Call, Imm(target), CallingConventions.ReturnRegister(ctx));
+                    : Add(address, OpCode.Call, Imm(target), returnDestination!);
 
                 call.AddOperands(CallingConventions.ResolveForManaged(ctx));
             }
@@ -330,6 +334,31 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 var call = Add(address, OpCode.Call, Imm(target), new Register(null, "X0"));
                 call.AddOperands(CallingConventions.ResolveForUnmanaged(context.AppContext, target));
             }
+        }
+
+        // AAPCS64 returns aggregates larger than 16 bytes through X8, which points at a caller
+        // stack slot. Keep that slot as the logical call destination so the managed output receives
+        // the value written by the native callee (for example List<T>.Enumerator).
+        IOperand? HiddenReturnBufferDestination(MethodAnalysisContext callee)
+        {
+            if (CallingConventions.HiddenReturnBufferRegister(callee) is null)
+                return null;
+
+            for (var i = instructions.Count - 1; i >= 0; i--)
+            {
+                var candidate = instructions[i];
+                if (candidate is
+                    {
+                        OpCode: OpCode.Move,
+                        Operands: [Register { Name: "X8" }, AddressOf { Target: var target }]
+                    })
+                    return new AddressOf(target);
+
+                if (candidate.Destination is Register { Name: "X8" })
+                    break;
+            }
+
+            return null;
         }
 
         void AddReturn()

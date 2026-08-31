@@ -1173,6 +1173,13 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Stloc, locals[local]);
                 break;
 
+            case AddressOf { Target: LocalVariable addressed }:
+                // Aggregate returns on ARM64 use a caller-provided X8 buffer. The ISIL call keeps
+                // that buffer as an AddressOf destination, while the managed IL call returns the
+                // value normally and stores it into the corresponding local.
+                instructions.Add(CilOpCodes.Stloc, locals[addressed]);
+                break;
+
             case FieldReference field:
                 var fieldDescriptor = field.Field.ToFieldDescriptor();
 
