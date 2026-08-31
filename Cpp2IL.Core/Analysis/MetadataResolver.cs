@@ -824,9 +824,17 @@ public static class MetadataResolver
 
             if (!method.AppContext.MethodsByAddress.TryGetValue(target.UnsignedValue, out var candidates))
             {
-                // Some shared generic bodies aren't in the address map at all (todo investigate?).
-                // Il2cpp still passes the concrete MethodInfo as the hidden final parameter, so we can use a methodof there if we have one.
-                // However, make sure it isn't our OWN hidden MethodInfo arg, because that would turn all unknown calls into recursion
+                // A concrete generic implementation can be present in the binary metadata without
+                // having a normal method candidate (for example an adjustor/thunk-only entry).
+                // Restrict this fallback to addresses explicitly listed as concrete generic
+                // implementations; arbitrary native/runtime calls may reuse an X1 value that looks
+                // like a MethodInfo* after register allocation.
+                if (!method.AppContext.Binary.ConcreteGenericImplementationsByAddress.ContainsKey(target.UnsignedValue))
+                    continue;
+
+                // Il2CPP still passes the concrete MethodInfo as the hidden final parameter, so use
+                // a methodof there when available. Do not turn the caller's own MethodInfo into a
+                // recursive target.
                 if (ReferenceEquals(representedMethod, method))
                     continue;
 
