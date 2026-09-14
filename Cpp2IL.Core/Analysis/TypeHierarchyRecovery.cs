@@ -60,15 +60,16 @@ public static class TypeHierarchyRecovery
             // The full managed test then covers shallow objects too, without an out-of-bounds lookup.
             if (block.Predecessors is [var guard]
                 && guard.Instructions.LastOrDefault() is { OpCode: OpCode.ConditionalJump } branch
-                && block.Instructions.LastOrDefault() is { OpCode: OpCode.ConditionalJump } checkBranch
-                && ReferenceEquals(resolver.Value(checkBranch.Operands[1]), comparison.Destination)
                 && resolver.DepthCondition(branch.Operands[1], klass!, target) is { } enoughBranch
                 && Target(graph, branch) is { } taken
                 && (enoughBranch ? taken == block : taken != block)
                 && guard.Successors.FirstOrDefault(s => s != block) is { } guardFailure
-                && Failure(graph, block, comparison, checkBranch) is { } checkFailure
-                && resolver.OnlyLookup(block, comparison, checkBranch)
-                && SameFailure(guardFailure, checkFailure, resolver))
+                && (block.Instructions.LastOrDefault() is { OpCode: OpCode.ConditionalJump } checkBranch
+                    && ReferenceEquals(resolver.Value(checkBranch.Operands[1]), comparison.Destination)
+                    && Failure(graph, block, comparison, checkBranch) is { } checkFailure
+                    && resolver.OnlyLookup(block, comparison, checkBranch)
+                    && SameFailure(guardFailure, checkFailure, resolver)
+                    || SameResultOnMiss(block, guardFailure, comparison, resolver)))
             {
                 branch.SetOperand(1, new Immediate(taken == block ? 1 : 0));
             }
@@ -122,6 +123,42 @@ public static class TypeHierarchyRecovery
                 && Equals(resolver.Value(i.Operands[ai]), resolver.Value(i.Operands[bi])));
     }
 
+    // A CSET result can go straight to a return or a shared epilogue phi rather than a branch.
+    // On a shallow object the managed test is false (true for !=): every observable result must
+    // agree with the guard's old failure arm before that guard can be bypassed.
+    private static bool SameResultOnMiss(Block lookup, Block failure, Instruction comparison, Resolver resolver)
+    {
+        failure = SkipJumps(failure);
+        if (lookup.Instructions.LastOrDefault() is not { } terminator
+            || terminator.OpCode is not (OpCode.Jump or OpCode.Return)
+            || !resolver.OnlyLookup(lookup, comparison, terminator, allowCopies: true)
+            || failure.Instructions.Any(i => i.OpCode is not (OpCode.Nop or OpCode.Jump or OpCode.Return)
+                && !IsLocalCopy(i))) return false;
+
+        var miss = new Immediate(comparison.OpCode == OpCode.CheckEqual ? 0 : 1);
+        bool SameValue(IOperand a, IOperand b)
+        {
+            a = resolver.Value(a);
+            return Equals(ReferenceEquals(a, comparison.Destination) ? miss : a, resolver.Value(b));
+        }
+
+        if (terminator is { OpCode: OpCode.Return, Operands: [var returned] })
+            return failure.Instructions.LastOrDefault() is { OpCode: OpCode.Return, Operands: [var fallback] }
+                && SameValue(returned, fallback);
+
+        if (lookup.Successors is not [var merge] || failure.Successors is not [var other] || merge != other)
+            return false;
+        var li = merge.Predecessors.IndexOf(lookup) + 1;
+        var fi = merge.Predecessors.IndexOf(failure) + 1;
+        var phis = merge.Instructions.Where(i => i.OpCode == OpCode.Phi).ToArray();
+        return li > 0 && fi > 0 && phis.Length > 0
+            && phis.All(i => li < i.Operands.Count && fi < i.Operands.Count
+                && SameValue(i.Operands[li], i.Operands[fi]));
+    }
+
+    private static bool IsLocalCopy(Instruction instruction) => instruction is
+        { OpCode: OpCode.Move, Operands: [LocalVariable, Immediate or LocalVariable] };
+
     private static Block SkipJumps(Block block)
     {
         var seen = new HashSet<Block>();
@@ -135,7 +172,7 @@ public static class TypeHierarchyRecovery
         private readonly Dictionary<LocalVariable, IOperand> _values = new();
         private readonly HashSet<LocalVariable> _resolving = new();
 
-        public bool OnlyLookup(Block block, Instruction comparison, Instruction branch)
+        public bool OnlyLookup(Block block, Instruction comparison, Instruction branch, bool allowCopies = false)
         {
             var dependencies = new HashSet<Instruction>();
             void Visit(IOperand operand)
@@ -151,6 +188,7 @@ public static class TypeHierarchyRecovery
             }
             foreach (var source in comparison.Sources) Visit(source);
             return block.Instructions.All(i => i == comparison || i == branch || i.OpCode == OpCode.Nop
+                || allowCopies && IsLocalCopy(i)
                 || dependencies.Contains(i) && i.OpCode is OpCode.Move or OpCode.Add or OpCode.ShiftLeft or OpCode.ZeroExtend or OpCode.Subtract);
         }
 

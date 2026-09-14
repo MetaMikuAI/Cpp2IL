@@ -156,6 +156,100 @@ public class TypeHierarchyRecoveryTests
         Assert.That(guard.Operands[1], Is.TypeOf<LocalVariable>());
     }
 
+    private (ISILControlFlowGraph Graph, List<LocalVariable> Locals, Instruction Guard) CreateResult(
+        bool merge, bool inverted = false, bool wrongFallback = false, bool sideEffect = false,
+        bool differingPhi = false, bool subtraction = false, bool failureSideEffect = false)
+    {
+        var (original, locals, guard, check) = Create(inverted: inverted, sideEffect: sideEffect);
+        var failure = ((Block)guard.Operands[0]).Instructions[0];
+        guard.SetOperand(0, failure);
+        var instructions = original.Instructions.Where(i => i.Index <= check.Index).OrderBy(i => i.Index).ToList();
+        LocalVariable Local(string name)
+        {
+            var local = new LocalVariable(name, new Register(null, name), _app.SystemTypes.SystemBooleanType);
+            locals.Add(local);
+            return local;
+        }
+        if (subtraction)
+        {
+            var difference = Local("difference");
+            instructions.Insert(instructions.IndexOf(check), new Instruction(29, OpCode.Subtract,
+                difference, check.Operands[1], check.Operands[2]));
+            check.SetOperands(check.Operands[0], difference, new Immediate(0));
+        }
+        var copy = Local("resultCopy");
+        instructions.Add(new Instruction(31, OpCode.Move, copy, check.Destination!));
+        var miss = new Immediate((inverted ^ wrongFallback) ? 1 : 0);
+        if (!merge)
+        {
+            instructions.Add(new Instruction(32, OpCode.Return, copy));
+            failure.SetOperands(miss);
+            if (failureSideEffect)
+            {
+                failure.OpCode = OpCode.CallVoid;
+                failure.SetOperands(new Immediate(1234));
+                instructions.Add(failure);
+                instructions.Add(new Instruction(91, OpCode.Return, miss));
+            }
+            else instructions.Add(failure);
+            return (new ISILControlFlowGraph(instructions), locals, guard);
+        }
+        var fallback = Local("fallback");
+        var merged = Local("mergedResult");
+        var phi = new Instruction(100, OpCode.Phi, merged, copy, fallback);
+        instructions.Add(new Instruction(32, OpCode.Jump, phi));
+        failure.OpCode = OpCode.Move;
+        failure.SetOperands(fallback, miss);
+        instructions.Add(failure);
+        if (failureSideEffect) instructions.Add(new Instruction(91, OpCode.CallVoid, new Immediate(1234)));
+        instructions.Add(new Instruction(92, OpCode.Jump, phi));
+        instructions.Add(phi);
+        Instruction? extraPhi = null;
+        if (differingPhi)
+        {
+            extraPhi = new Instruction(101, OpCode.Phi, Local("otherResult"), new Immediate(7), new Immediate(8));
+            instructions.Add(extraPhi);
+        }
+        instructions.Add(new Instruction(102, OpCode.Return, merged));
+        var graph = new ISILControlFlowGraph(instructions);
+        var mergeBlock = graph.Blocks.Single(b => b.Instructions.Contains(phi));
+        phi.SetOperands(merged);
+        foreach (var predecessor in mergeBlock.Predecessors)
+            phi.AddOperands(new[] { predecessor.Instructions.Contains(check) ? copy : fallback });
+        return (graph, locals, guard);
+    }
+
+    [TestCase(false, false, false)]
+    [TestCase(false, true, false)]
+    [TestCase(true, false, false)]
+    [TestCase(true, true, false)]
+    [TestCase(true, false, true)]
+    public void RemovesResultGuardOnlyWhenMissValuesAgree(bool merge, bool inverted, bool subtraction)
+    {
+        var (graph, locals, guard) = CreateResult(merge, inverted, subtraction: subtraction);
+        TypeHierarchyRecovery.Run(graph, locals, _app.SystemTypes.SystemBooleanType);
+        Assert.That(guard.Operands[1], Is.EqualTo(new Immediate(0)));
+        Assert.That(graph.Instructions.Any(i => i.Operands.Any(o => o is MemoryOperand)), Is.False);
+        TypeHierarchyRecovery.Run(graph, locals, _app.SystemTypes.SystemBooleanType);
+        Assert.That(graph.Instructions.Count(i => i.OpCode == OpCode.IsInstance), Is.EqualTo(1));
+    }
+
+    [TestCase(false, true, false, false, false)]
+    [TestCase(true, true, false, false, false)]
+    [TestCase(false, false, true, false, false)]
+    [TestCase(true, false, true, false, false)]
+    [TestCase(true, false, false, true, false)]
+    [TestCase(false, false, false, false, true)]
+    [TestCase(true, false, false, false, true)]
+    public void RetainsResultGuardForObservableDifferences(bool merge, bool wrongFallback, bool sideEffect,
+        bool differingPhi, bool failureSideEffect)
+    {
+        var (graph, locals, guard) = CreateResult(merge, wrongFallback: wrongFallback, sideEffect: sideEffect,
+            differingPhi: differingPhi, failureSideEffect: failureSideEffect);
+        TypeHierarchyRecovery.Run(graph, locals, _app.SystemTypes.SystemBooleanType);
+        Assert.That(guard.Operands[1], Is.TypeOf<LocalVariable>());
+    }
+
     [Test]
     public void IsInstanceTracksReceiverAsSource()
     {
