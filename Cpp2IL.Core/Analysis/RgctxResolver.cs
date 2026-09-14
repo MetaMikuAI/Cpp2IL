@@ -92,7 +92,10 @@ public static class RgctxResolver
         if (definition.Definition is not { } typeDefinition)
             return null;
 
-        var typeArguments = (instance as GenericInstanceTypeAnalysisContext)?.GenericArguments ?? [];
+        // Open generic bodies still have a type context: their own formal parameters.
+        IReadOnlyList<TypeAnalysisContext> typeArguments = instance is GenericInstanceTypeAnalysisContext concrete
+            ? concrete.GenericArguments
+            : definition.GenericParameters;
 
         return ResolveEntry(typeDefinition.RgctXs, index, typeArguments, [], instance.AppContext);
     }
