@@ -32,6 +32,10 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
     private static Immediate Imm(long value) => new(value);
     private static Immediate Imm(ulong value) => new(unchecked((long)value));
 
+    // Low `width` bits set. Guards against `1L << 64` (C# masks the shift count to 63, which
+    // would silently produce a mask of 0 rather than "all bits").
+    internal static long LowBitMask(int width) => width >= 64 ? -1L : (1L << width) - 1;
+
     private static string NormalizeRegister(Arm64Register reg) => reg switch
     {
         >= Arm64Register.W0 and <= Arm64Register.W31 => "X" + (reg - Arm64Register.W0),
@@ -510,14 +514,39 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 Add(address, OpCode.Return, CallingConventions.ReturnRegister(context));
         }
 
-        void AddMathIntrinsic(string name, int parameterCount)
+        // Some of these map onto a BCL math method that is not a perfect semantic match - FMAXNM/FMINNM
+        // differ from FMAX/FMIN only in which operand wins when one is NaN. The managed source almost
+        // certainly called Math.Max/Min, so resolving to it decompiles far better than leaving a raw opcode.
+        void AddMathIntrinsic(string name, int parameterCount, string? alternateName = null)
         {
             var isDouble = instruction.Op0Reg is >= Arm64Register.D0 and <= Arm64Register.D31;
-            var method = ResolveMathMethod(context.AppContext, name, isDouble, parameterCount);
+            var method = ResolveMathMethod(context.AppContext, name, isDouble, parameterCount)
+                         ?? (alternateName is null
+                             ? null
+                             : ResolveMathMethod(context.AppContext, alternateName, isDouble, parameterCount));
 
             if (method == null)
             {
                 Add(address, OpCode.NotImplemented, new StringLiteral($"System.Math.{name} not resolved"));
+                return;
+            }
+
+            // The vector forms apply the operation per lane. 2S is the only arrangement ISIL models.
+            if (IsTwoS(instruction.Op0Arrangement))
+            {
+                for (var lane = 0; lane < 2; lane++)
+                {
+                    var laneOperands = new List<IOperand>(parameterCount + 2)
+                    {
+                        method,
+                        VectorLane(instruction.Op0Reg, lane)
+                    };
+                    for (var i = 1; i <= parameterCount; i++)
+                        laneOperands.Add(VectorOperand(i, lane));
+
+                    Add(address, OpCode.Call, laneOperands);
+                }
+
                 return;
             }
 
@@ -995,7 +1024,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     // dest = (src >> lsb) & ((1 << width) - 1)
                     var dest = ConvertOperand(instruction, 0);
                     Add(address, OpCode.ShiftRight, dest, ConvertOperand(instruction, 1), Imm(instruction.Op2Imm));
-                    Add(address, OpCode.And, dest, dest, Imm((1L << (int)instruction.Op3Imm) - 1));
+                    Add(address, OpCode.And, dest, dest, Imm(LowBitMask((int)instruction.Op3Imm)));
                     break;
                 }
             case Arm64Mnemonic.UBFIZ:
@@ -1004,8 +1033,54 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     // dest = (src & ((1 << width) - 1)) << shift
                     var dest = ConvertOperand(instruction, 0);
                     var temp = new Register(null, "TEMP");
-                    Add(address, OpCode.And, temp, ConvertOperand(instruction, 1), Imm((1L << (int)instruction.Op3Imm) - 1));
+                    Add(address, OpCode.And, temp, ConvertOperand(instruction, 1), Imm(LowBitMask((int)instruction.Op3Imm)));
                     Add(address, OpCode.ShiftLeft, dest, temp, Imm(instruction.Op2Imm));
+                    break;
+                }
+            case Arm64Mnemonic.BFI:
+            case Arm64Mnemonic.BFXIL:
+                {
+                    // Both merge a field of `src` into `dest`, leaving dest's other bits alone.
+                    //   BFI   dest<lsb+width-1:lsb> = src<width-1:0>
+                    //   BFXIL dest<width-1:0>       = src<lsb+width-1:lsb>
+                    var isInsert = instruction.Mnemonic == Arm64Mnemonic.BFI;
+                    var lsb = (int)instruction.Op2Imm;
+                    var width = (int)instruction.Op3Imm;
+                    var mask = LowBitMask(width);
+
+                    // Restricting the preserved mask to the register width also models the
+                    // zero-extension a 32-bit form applies to the upper half of the X register.
+                    var is64Bit = instruction.Op0Reg is >= Arm64Register.X0 and <= Arm64Register.X31;
+                    var keepMask = ~(isInsert ? mask << lsb : mask);
+                    if (!is64Bit)
+                        keepMask &= 0xFFFFFFFFL;
+
+                    var dest = ConvertOperand(instruction, 0);
+                    var temp = new Register(null, "TEMP");
+
+                    // Extract the field into TEMP first, so a dest==src encoding still reads the
+                    // original value before dest gets its hole punched.
+                    if (isInsert)
+                    {
+                        Add(address, OpCode.And, temp, ConvertOperand(instruction, 1), Imm(mask));
+                        if (lsb != 0)
+                            Add(address, OpCode.ShiftLeft, temp, temp, Imm(lsb));
+                    }
+                    else
+                    {
+                        if (lsb != 0)
+                        {
+                            Add(address, OpCode.ShiftRight, temp, ConvertOperand(instruction, 1), Imm(lsb));
+                            Add(address, OpCode.And, temp, temp, Imm(mask));
+                        }
+                        else
+                        {
+                            Add(address, OpCode.And, temp, ConvertOperand(instruction, 1), Imm(mask));
+                        }
+                    }
+
+                    Add(address, OpCode.And, dest, dest, Imm(keepMask));
+                    Add(address, OpCode.Or, dest, dest, temp);
                     break;
                 }
             case Arm64Mnemonic.MUL:
@@ -1082,9 +1157,55 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.FMAX:
                 AddMathIntrinsic("Max", 2);
                 break;
+            // The NM ("number") variants only differ from FMIN/FMAX in NaN handling
+            case Arm64Mnemonic.FMINNM:
+                AddMathIntrinsic("Min", 2);
+                break;
+            case Arm64Mnemonic.FMAXNM:
+                AddMathIntrinsic("Max", 2);
+                break;
             case Arm64Mnemonic.FSQRT:
                 AddMathIntrinsic("Sqrt", 1);
                 break;
+            case Arm64Mnemonic.FABS:
+                AddMathIntrinsic("Abs", 1);
+                break;
+            // Round toward -inf / +inf. Mathf spells these Floor/Ceil, Math spells them Floor/Ceiling.
+            case Arm64Mnemonic.FRINTM:
+                AddMathIntrinsic("Floor", 1);
+                break;
+            case Arm64Mnemonic.FRINTP:
+                AddMathIntrinsic("Ceiling", 1, alternateName: "Ceil");
+                break;
+            case Arm64Mnemonic.FABD:
+                {
+                    // dest = |src1 - src2|
+                    var isDouble = instruction.Op0Reg is >= Arm64Register.D0 and <= Arm64Register.D31;
+                    var abs = ResolveMathMethod(context.AppContext, "Abs", isDouble, 1);
+
+                    if (abs == null)
+                    {
+                        Add(address, OpCode.NotImplemented, new StringLiteral("System.Math.Abs not resolved"));
+                        break;
+                    }
+
+                    if (IsTwoS(instruction.Op0Arrangement))
+                    {
+                        for (var lane = 0; lane < 2; lane++)
+                        {
+                            var laneDest = VectorLane(instruction.Op0Reg, lane);
+                            Add(address, OpCode.Subtract, laneDest, VectorOperand(1, lane), VectorOperand(2, lane));
+                            Add(address, OpCode.Call, abs, laneDest, laneDest);
+                        }
+
+                        break;
+                    }
+
+                    var dest = ScalarOperand(0);
+                    Add(address, OpCode.Subtract, dest, ScalarOperand(1), ScalarOperand(2));
+                    Add(address, OpCode.Call, abs, dest, dest);
+                    break;
+                }
             case Arm64Mnemonic.BL:
                 AddCallAt(instruction.BranchTarget);
                 break;
