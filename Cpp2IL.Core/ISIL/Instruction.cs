@@ -113,6 +113,8 @@ public class Instruction : IOperand
             case OpCode.CheckLessOrEqual:
             case OpCode.Newobj:
             case OpCode.Box:
+            case OpCode.IsInstance:
+            case OpCode.ZeroExtend:
                 if (newDestination != null)
                     SetOperand(0, newDestination);
                 return IsConstantValue(_operands[0]) ? null : _operands[0];
@@ -151,12 +153,12 @@ public class Instruction : IOperand
         {
             OpCode.Move or OpCode.ConditionalJump
                 or OpCode.ShiftStack or OpCode.Not or OpCode.Negate
-                or OpCode.Newobj
+                or OpCode.Newobj or OpCode.ZeroExtend
                 => [_operands[1]],
 
             OpCode.Switch => [_operands[0]],
 
-            OpCode.Box => [_operands[2]],
+            OpCode.Box or OpCode.IsInstance => [_operands[2]],
 
             OpCode.Add or OpCode.Subtract or OpCode.Multiply
                 or OpCode.Divide or OpCode.Modulo or OpCode.ShiftLeft or OpCode.ShiftRight

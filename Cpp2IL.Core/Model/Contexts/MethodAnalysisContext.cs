@@ -418,6 +418,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         BooleanFlagSimplifier.Run(this);
         DeadCodeEliminator.Run(this);
 
+        TypeHierarchyRecovery.Run(this);
+
         // Copy/constant propagation belongs in SSA, where one definition dominates all uses and phis
         // make joins explicit, so forwarding a value is an unconditional global substitution.
         SsaSimplifier.Run(this);

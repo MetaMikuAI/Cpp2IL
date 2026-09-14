@@ -637,6 +637,22 @@ public static class IlGenerator
                 }
                 break;
 
+            case OpCode.ZeroExtend:
+                LoadOperand(instruction.Operands[1], method, locals, writeLine);
+                instructions.Add(CilOpCodes.Conv_U8);
+                instructions.Add(CilOpCodes.Ldc_I8, (1L << (int)((Immediate)instruction.Operands[2]).Value) - 1);
+                instructions.Add(CilOpCodes.And);
+                StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+                break;
+
+            case OpCode.IsInstance:
+                LoadOperand(instruction.Operands[2], method, locals, writeLine);
+                instructions.Add(CilOpCodes.Isinst, ((TypeAnalysisContext)instruction.Operands[1]).ToTypeSignature().ToTypeDefOrRef());
+                instructions.Add(CilOpCodes.Ldnull);
+                instructions.Add(CilOpCodes.Cgt_Un);
+                StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+                break;
+
             case OpCode.Box:
                 if (instruction.Operands is [_, TypeAnalysisContext boxedType, var boxedValue])
                 {

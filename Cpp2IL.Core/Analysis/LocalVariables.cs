@@ -237,6 +237,10 @@ public static class LocalVariables
         SeedRuntimeClassTypes(method);
         SeedNewobjResults(method);
         SeedMethodInfoTypes(method);
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+            if (instruction is { OpCode: OpCode.ZeroExtend, Destination: LocalVariable extended })
+                extended.Type = method.AppContext.SystemTypes.SystemUInt64Type;
+
         SeedComparisonResults(method);
         SeedFloatLiterals(method);
 

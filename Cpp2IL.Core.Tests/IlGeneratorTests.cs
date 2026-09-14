@@ -85,4 +85,55 @@ public class IlGeneratorTests
         Assert.That(il.Count(i => i.OpCode == CilOpCodes.Ldloc), Is.EqualTo(2),
             "expected exactly two Ldloc instructions for the two parameters of the target method");
     }
+
+    [TestCase(8)]
+    [TestCase(16)]
+    [TestCase(32)]
+    public void ZeroExtend_Emits64BitMask(int bits)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var result = new LocalVariable("extended", new Register(null, "extended"), app.SystemTypes.SystemUInt64Type);
+        var definition = GenerateSingle(new Instruction(0, OpCode.ZeroExtend, result, new Immediate(-1), new Immediate(bits)), result);
+        var il = definition.CilMethodBody!.Instructions;
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Conv_U8), Is.True);
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldc_I8 && Equals(i.Operand, (1L << bits) - 1)), Is.True);
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.And), Is.True);
+    }
+
+    [Test]
+    public void IsInstance_EmitsManagedTypeTest()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var result = new LocalVariable("matches", new Register(null, "matches"), app.SystemTypes.SystemBooleanType);
+        var definition = GenerateSingle(new Instruction(0, OpCode.IsInstance, result, app.SystemTypes.SystemStringType, new StringLiteral("test")), result);
+        var il = definition.CilMethodBody!.Instructions;
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Isinst), Is.True);
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldnull), Is.True);
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Cgt_Un), Is.True);
+    }
+
+    private static MethodDefinition GenerateSingle(Instruction instruction, LocalVariable result)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var caller = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Caller", result.Type!,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, [])
+        {
+            ControlFlowGraph = new ISILControlFlowGraph([instruction, new Instruction(1, OpCode.Return, result)]),
+            Locals = [result], ParameterLocals = [], AnalysisWarnings = []
+        };
+        var module = new ModuleDefinition("Test.dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        foreach (var context in new[] { app.SystemTypes.SystemBooleanType, app.SystemTypes.SystemUInt64Type, app.SystemTypes.SystemStringType })
+        {
+            var placeholder = new TypeDefinition(context.Namespace, context.Name, TypeAttributes.Public);
+            module.TopLevelTypes.Add(placeholder);
+            context.PutExtraData("AsmResolverType", placeholder);
+        }
+        var type = new TypeDefinition("Tests", "Recovery", TypeAttributes.Public);
+        module.TopLevelTypes.Add(type);
+        var definition = new MethodDefinition("Caller", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(instruction.OpCode == OpCode.IsInstance ? module.CorLibTypeFactory.Boolean : module.CorLibTypeFactory.UInt64));
+        type.Methods.Add(definition);
+        IlGenerator.GenerateIl(caller, definition);
+        return definition;
+    }
 }

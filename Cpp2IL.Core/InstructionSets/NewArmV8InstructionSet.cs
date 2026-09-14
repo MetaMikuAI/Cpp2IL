@@ -909,6 +909,32 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
                     var src1 = ConvertOperand(instruction, 1);
                     var src2 = ConvertOperand(instruction, 2);
+                    var unsignedExtendBits = instruction.FinalOpExtendType switch
+                    {
+                        Arm64ExtendType.UXTB => 8,
+                        Arm64ExtendType.UXTH => 16,
+                        Arm64ExtendType.UXTW => 32,
+                        _ => 0
+                    };
+                    if (instruction.Op2Kind == Arm64OperandKind.Register && unsignedExtendBits != 0)
+                    {
+                        var extended = new Register(null, "TEMP_EXTENDED");
+                        Add(address, OpCode.ZeroExtend, extended, src2, Imm(unsignedExtendBits));
+                        src2 = extended;
+                    }
+
+                    // Disarm stores a shifted register's amount as operand 3, not in operand 2.
+                    if (instruction.Op2Kind == Arm64OperandKind.Register
+                        && (instruction.FinalOpShiftType == Arm64ShiftType.LSL || unsignedExtendBits != 0)
+                        && instruction.Op3Kind == Arm64OperandKind.Immediate && instruction.Op3Imm != 0)
+                    {
+                        var shifted = new Register(null, "TEMP_SHIFTED");
+                        Add(address, OpCode.ShiftLeft, shifted, src2, Imm(instruction.Op3Imm));
+                        if (unsignedExtendBits == 0 && instruction.Op2Reg is >= Arm64Register.W0 and <= Arm64Register.W31)
+                            Add(address, OpCode.And, shifted, shifted, Imm(0xFFFFFFFFL));
+                        src2 = shifted;
+                    }
+
                     // a discarded result means this is only about the flags
                     var dest = IsReg31(instruction.Op0Reg) ? new Register(null, "TEMP") : ConvertOperand(instruction, 0);
 

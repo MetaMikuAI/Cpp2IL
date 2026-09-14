@@ -125,6 +125,12 @@ public enum OpCode
     /// </summary>
     Box,
 
+    /// <summary>Tests op 3 against the reference type in op 2, writing a boolean to op 1.</summary>
+    IsInstance,
+
+    /// <summary>Zero-extends the low op 3 bits of op 2 to UInt64 in op 1.</summary>
+    ZeroExtend,
+
     /// <summary>
     /// Throws a new instance of the exception type described by op 1.
     /// </summary>
