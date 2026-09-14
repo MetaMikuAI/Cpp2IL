@@ -112,6 +112,21 @@ public class IlGeneratorTests
         Assert.That(il.Any(i => i.OpCode == CilOpCodes.Cgt_Un), Is.True);
     }
 
+    [TestCase(false)]
+    [TestCase(true)]
+    public void TryCast_EmitsReferenceResultRatherThanBoolean(bool nullObject)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var result = new LocalVariable("cast", new Register(null, "cast"), app.SystemTypes.SystemStringType);
+        IOperand value = nullObject ? new Immediate(0) : new StringLiteral("test");
+        var definition = GenerateSingle(new Instruction(0, OpCode.TryCast, result, app.SystemTypes.SystemStringType, value), result);
+        var il = definition.CilMethodBody!.Instructions;
+        Assert.That(il.Count(i => i.OpCode == CilOpCodes.Isinst), Is.EqualTo(1));
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Cgt_Un || i.OpCode == CilOpCodes.Castclass), Is.False);
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldnull), Is.EqualTo(nullObject));
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldc_I4_0), Is.False);
+    }
+
     private static MethodDefinition GenerateSingle(Instruction instruction, LocalVariable result)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
@@ -131,7 +146,7 @@ public class IlGeneratorTests
         var type = new TypeDefinition("Tests", "Recovery", TypeAttributes.Public);
         module.TopLevelTypes.Add(type);
         var definition = new MethodDefinition("Caller", MethodAttributes.Public | MethodAttributes.Static,
-            MethodSignature.CreateStatic(instruction.OpCode == OpCode.IsInstance ? module.CorLibTypeFactory.Boolean : module.CorLibTypeFactory.UInt64));
+            MethodSignature.CreateStatic(instruction.OpCode == OpCode.IsInstance ? module.CorLibTypeFactory.Boolean : instruction.OpCode == OpCode.TryCast ? module.CorLibTypeFactory.String : module.CorLibTypeFactory.UInt64));
         type.Methods.Add(definition);
         IlGenerator.GenerateIl(caller, definition);
         return definition;

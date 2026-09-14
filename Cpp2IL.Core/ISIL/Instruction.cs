@@ -114,6 +114,7 @@ public class Instruction : IOperand
             case OpCode.Newobj:
             case OpCode.Box:
             case OpCode.IsInstance:
+            case OpCode.TryCast:
             case OpCode.ZeroExtend:
                 if (newDestination != null)
                     SetOperand(0, newDestination);
@@ -158,7 +159,7 @@ public class Instruction : IOperand
 
             OpCode.Switch => [_operands[0]],
 
-            OpCode.Box or OpCode.IsInstance => [_operands[2]],
+            OpCode.Box or OpCode.IsInstance or OpCode.TryCast => [_operands[2]],
 
             OpCode.Add or OpCode.Subtract or OpCode.Multiply
                 or OpCode.Divide or OpCode.Modulo or OpCode.ShiftLeft or OpCode.ShiftRight

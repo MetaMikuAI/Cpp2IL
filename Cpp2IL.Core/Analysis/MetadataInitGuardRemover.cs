@@ -142,6 +142,70 @@ public static class MetadataInitGuardRemover
             || TryExcise(cfg, guard, second, first, initialisedFlagTest);
     }
 
+    // SSA keeps the flag load separate from its bit test. Only accept a typed class
+    // pointer and a single initializer call on the same pointer; never arbitrary calls.
+    public static void RunSsaClassGuards(MethodAnalysisContext method)
+    {
+        if (method.AppContext.Binary.PointerSizeBytes != 8 || method.AppContext.MetadataVersion is not (29 or 31 or 31.1f))
+            return;
+        RunSsaClassGuards(method.ControlFlowGraph!, InitialisedFlagOffset64);
+    }
+
+    internal static void RunSsaClassGuards(ISILControlFlowGraph cfg, long flagOffset)
+    {
+        var definitions = cfg.Instructions.Where(i => i.Destination is LocalVariable)
+            .ToDictionary(i => (LocalVariable)i.Destination!, i => i);
+        foreach (var guard in cfg.Blocks.ToArray())
+        {
+            if (guard.Instructions.LastOrDefault() is not { OpCode: OpCode.ConditionalJump, Operands: [Block taken, var condition] }
+                || guard.Successors.Count != 2)
+                continue;
+            var initOnTrue = false;
+            var seen = new HashSet<LocalVariable>();
+            while (condition is LocalVariable local && seen.Add(local) && definitions.TryGetValue(local, out var definition))
+            {
+                if (definition is { OpCode: OpCode.Move, Operands: [_, var source] })
+                    condition = source;
+                else if (definition is { OpCode: OpCode.Not, Operands: [_, var negated] })
+                {
+                    initOnTrue = !initOnTrue;
+                    condition = negated;
+                }
+                else if (definition is { OpCode: OpCode.CheckEqual or OpCode.CheckNotEqual, Operands: [_, var compared, Immediate { Value: 0 }] })
+                {
+                    if (definition.OpCode == OpCode.CheckEqual) initOnTrue = !initOnTrue;
+                    condition = compared;
+                }
+                else break;
+            }
+            if (condition is not LocalVariable tested || !definitions.TryGetValue(tested, out var mask)
+                || mask is not { OpCode: OpCode.And, Operands: [_, var flag, Immediate { Value: 1 }] }
+                || Value(flag, definitions) is not MemoryOperand { Base: LocalVariable klass, Index: null, Scale: 0 } memory
+                || memory.Addend != flagOffset || klass.Type is not RuntimeClassTypeAnalysisContext)
+                continue;
+            var init = initOnTrue ? taken : guard.Successors.First(s => s != taken);
+            var merge = guard.Successors.First(s => s != init);
+            if (init.Successors.Count != 1 || init.Successors[0] != merge)
+                continue;
+            var calls = init.Instructions.Where(i => i.IsCall).ToArray();
+            if (calls is not [{ OpCode: OpCode.Call, Operands: [Immediate, _, var argument, ..] }]
+                || init.Instructions.Any(i => i.OpCode == OpCode.Move && i.Operands[0] is not LocalVariable)
+                || !ReferenceEquals(Value(argument, definitions), Value(klass, definitions)))
+                continue;
+            TryExcise(cfg, guard, init, merge, true);
+        }
+        DeadCodeEliminator.Run(cfg);
+    }
+
+    private static IOperand Value(IOperand value, Dictionary<LocalVariable, Instruction> definitions)
+    {
+        var seen = new HashSet<LocalVariable>();
+        while (value is LocalVariable local && seen.Add(local) && definitions.TryGetValue(local, out var definition)
+            && definition is { OpCode: OpCode.Move, Operands: [_, var source] })
+            value = source;
+        return value;
+    }
+
     private static bool IsOne(IOperand operand) => operand is Immediate { Value: 1 };
 
     private static bool TryExcise(ISILControlFlowGraph cfg, Block guard, Block initEntry, Block merge, bool initialisedFlagTest)

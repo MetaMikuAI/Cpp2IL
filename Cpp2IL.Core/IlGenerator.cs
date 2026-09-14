@@ -645,11 +645,15 @@ public static class IlGenerator
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine);
                 break;
 
+            case OpCode.TryCast:
             case OpCode.IsInstance:
-                LoadOperand(instruction.Operands[2], method, locals, writeLine);
+                LoadOperand(instruction.Operands[2], method, locals, writeLine, (TypeAnalysisContext)instruction.Operands[1]);
                 instructions.Add(CilOpCodes.Isinst, ((TypeAnalysisContext)instruction.Operands[1]).ToTypeSignature().ToTypeDefOrRef());
-                instructions.Add(CilOpCodes.Ldnull);
-                instructions.Add(CilOpCodes.Cgt_Un);
+                if (instruction.OpCode == OpCode.IsInstance)
+                {
+                    instructions.Add(CilOpCodes.Ldnull);
+                    instructions.Add(CilOpCodes.Cgt_Un);
+                }
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine);
                 break;
 

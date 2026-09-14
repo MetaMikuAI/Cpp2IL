@@ -110,32 +110,62 @@ public class NewArm64KeyFunctionAddresses : BaseKeyFunctionAddresses
 
     protected override ulong GetObjectIsInstFromSystemType()
     {
-        Logger.Verbose("\tTrying to use System.Type::IsInstanceOfType to find il2cpp::vm::Object::IsInst...");
-        var typeIsInstanceOfType = ReflectionCache.GetType("Type", "System")?.Methods?.FirstOrDefault(m => m.Name == "IsInstanceOfType");
-        if (typeIsInstanceOfType == null)
+        // Modern corlib exposes the icall on RuntimeTypeHandle, not virtual System.Type.
+        // Follow only entry-point B thunks and require the returned pointer's bool test.
+        foreach (var typeName in new[] { "RuntimeTypeHandle", "Type" })
         {
-            Logger.VerboseNewline("Type or method not found, aborting.");
-            return 0;
+            var anchor = ReflectionCache.GetType(typeName, "System")?.Methods?.FirstOrDefault(m => m.Name == "IsInstanceOfType");
+            if (anchor == null || (anchor.iflags & (ushort)System.Reflection.MethodImplAttributes.InternalCall) == 0)
+                continue; // A virtual managed implementation is not the native icall anchor.
+            var address = anchor.MethodPointer;
+            var seen = new HashSet<ulong>();
+            while (address != 0 && seen.Count < 4 && seen.Add(address))
+            {
+                var body = NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(_appContext.Binary, address, false, 64);
+                if (body.FirstOrDefault() is { Mnemonic: Arm64Mnemonic.B, MnemonicConditionCode: Arm64ConditionCode.NONE or Arm64ConditionCode.AL } thunk)
+                {
+                    address = thunk.BranchTarget;
+                    continue;
+                }
+                var target = FindObjectIsInstTarget(body);
+                if (target != 0) return target;
+                break;
+            }
         }
+        return 0;
+    }
 
-        //IsInstanceOfType is a very simple ICall, that looks like this:
-        //  Il2CppClass* klass = vm::Class::FromIl2CppType(type->type.type);
-        //  return il2cpp::vm::Object::IsInst(obj, klass) != NULL;
-        //The last call is to Object::IsInst
+    // An entry consisting of B alone preserves all arguments and the return value.
+    internal static ulong GetBranchThunkTarget(Model.Contexts.ApplicationAnalysisContext context, ulong thunkAddress)
+    {
+        var raw = context.Binary.MapVirtualAddressToRaw(thunkAddress, false);
+        var bytes = context.Binary.GetRawBinaryContent();
+        if (raw < 0 || raw > bytes.Length - 4 || context.Binary.IsBigEndian) return 0;
+        return DecodeBranchThunk(System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(bytes.Slice((int)raw, 4)), thunkAddress);
+    }
 
-        Logger.Verbose($"IsInstanceOfType found at 0x{typeIsInstanceOfType.MethodPointer:X}...");
-        var instructions = NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(_appContext.Binary, typeIsInstanceOfType.MethodPointer, false);
+    internal static ulong DecodeBranchThunk(uint word, ulong thunkAddress)
+    {
+        if ((word & 0xfc000000) != 0x14000000) return 0;
+        var displacement = (int)(word << 6) >> 4;
+        return unchecked((ulong)((long)thunkAddress + displacement));
+    }
 
-        var lastCall = instructions.LastOrDefault(i => i.Mnemonic == Arm64Mnemonic.BL);
-
-        if (lastCall.Mnemonic == Arm64Mnemonic.INVALID)
+    internal static ulong FindObjectIsInstTarget(IReadOnlyList<Arm64Instruction> body)
+    {
+        ulong target = 0;
+        for (var i = 0; i + 2 < body.Count && body[i].Mnemonic is not (Arm64Mnemonic.RET or Arm64Mnemonic.RETAA or Arm64Mnemonic.RETAB); i++)
         {
-            Logger.VerboseNewline("Method does not match expected signature. Aborting.");
-            return 0;
+            // cmp x0, #0; cset w0, ne. The pointer-returning helper is the preceding BL,
+            // not a metadata lookup or an arbitrary last call in a virtual managed body.
+            if (body[i].Mnemonic != Arm64Mnemonic.BL
+                || body[i + 1] is not { Mnemonic: Arm64Mnemonic.CMP, Op0Reg: Arm64Register.X0, Op1Kind: Arm64OperandKind.Immediate, Op1Imm: 0 }
+                || body[i + 2] is not { Mnemonic: Arm64Mnemonic.CSET, Op0Reg: Arm64Register.W0, FinalOpConditionCode: Arm64ConditionCode.NE })
+                continue;
+            if (target != 0) return 0; // ambiguous anchor
+            target = body[i].BranchTarget;
         }
-
-        Logger.VerboseNewline($"Success. IsInst found at 0x{lastCall.BranchTarget:X}");
-        return lastCall.BranchTarget;
+        return target;
     }
 
     protected override ulong GetWriteBarrier()

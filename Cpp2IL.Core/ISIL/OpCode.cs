@@ -128,6 +128,9 @@ public enum OpCode
     /// <summary>Tests op 3 against the reference type in op 2, writing a boolean to op 1.</summary>
     IsInstance,
 
+    /// <summary>Returns op 3 as the reference type in op 2, or null, into op 1.</summary>
+    TryCast,
+
     /// <summary>Zero-extends the low op 3 bits of op 2 to UInt64 in op 1.</summary>
     ZeroExtend,
 

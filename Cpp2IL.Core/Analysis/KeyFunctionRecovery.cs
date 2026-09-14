@@ -38,8 +38,12 @@ public static class KeyFunctionRecovery
 
     public static void Run(MethodAnalysisContext method)
     {
+        var definitions = method.ControlFlowGraph!.Instructions.Where(i => i.Destination is LocalVariable)
+            .GroupBy(i => (LocalVariable)i.Destination!).Where(g => g.Count() == 1).ToDictionary(g => g.Key, g => g.Single());
         foreach (var instruction in method.ControlFlowGraph!.Blocks.SelectMany(block => block.Instructions))
         {
+            if (TryRewriteIsInst(instruction, method, definitions))
+                continue;
             if (instruction.Operands is not [StringLiteral { Value: var keyFunction }, ..])
                 continue;
 
@@ -56,6 +60,35 @@ public static class KeyFunctionRecovery
             else if (keyFunction == nameof(BaseKeyFunctionAddresses.InternalCalls_Resolve))
                 RewriteInternalCallResolve(instruction, method);
         }
+    }
+
+    private static bool TryRewriteIsInst(Instruction instruction, MethodAnalysisContext method,
+        Dictionary<LocalVariable, Instruction> definitions)
+    {
+        if (instruction is not { OpCode: OpCode.Call, Operands: [var target, LocalVariable result, var value, var classOperand, ..] })
+            return false;
+        var seen = new HashSet<LocalVariable>();
+        while (classOperand is LocalVariable local && seen.Add(local) && definitions.TryGetValue(local, out var definition)
+            && definition is { OpCode: OpCode.Move or OpCode.Phi, Operands: [_, var source] })
+            classOperand = source;
+        // Require an actual metadata value, not a static type inferred for a dynamic
+        // class pointer (or one arbitrarily chosen from a mixed phi).
+        var klass = classOperand as RuntimeClassTypeAnalysisContext;
+        if (klass == null || klass.RepresentedType.IsValueType || klass.RepresentedType is GenericParameterTypeAnalysisContext)
+            return false;
+        if (target is not StringLiteral { Value: nameof(BaseKeyFunctionAddresses.il2cpp_vm_object_is_inst) })
+        {
+            if (target is not Immediate address) return false;
+            var known = method.AppContext.GetOrCreateKeyFunctionAddresses().il2cpp_vm_object_is_inst;
+            if (known == 0 || address.UnsignedValue != known
+                && (method.AppContext.InstructionSet is not InstructionSets.NewArmV8InstructionSet
+                    || NewArm64KeyFunctionAddresses.GetBranchThunkTarget(method.AppContext, address.UnsignedValue) != known))
+                return false;
+        }
+        result.Type = klass.RepresentedType;
+        instruction.OpCode = OpCode.TryCast;
+        instruction.SetOperands(result, klass.RepresentedType, value);
+        return true;
     }
 
     private static void RemoveWriteBarrier(Instruction instruction)
