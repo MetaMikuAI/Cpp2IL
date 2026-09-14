@@ -428,7 +428,7 @@ public static class LocalVariables
                     changed |= PropagatePhi(instruction);
                     break;
                 case OpCode.Add or OpCode.Subtract or OpCode.Multiply:
-                    changed |= PropagateArithmetic(instruction, method);
+                    changed |= PropagateArithmetic(instruction, method) || PropagateKnownIntegerArithmetic(instruction, method);
                     break;
                 case OpCode.Divide or OpCode.Modulo:
                     changed |= PropagateArithmetic(instruction, method) || PropagateIntegerResult(instruction, method);
@@ -473,11 +473,62 @@ public static class LocalVariables
         return SetTypeIfUnknown(destination, floatType);
     }
 
+    // Do not infer integer arithmetic from just one operand: the other may be an
+    // unresolved pointer. Require both operands to have the same promoted integer
+    // type, or a known integer and a representable literal.
+    private static bool PropagateKnownIntegerArithmetic(Instruction instruction, MethodAnalysisContext method)
+    {
+        if (instruction.Operands is not [LocalVariable { Type: null } destination, var left, var right])
+            return false;
+
+        var leftType = KnownIntegerType(left, method);
+        var rightType = KnownIntegerType(right, method);
+        if (leftType != null && rightType != null && leftType == rightType)
+            return SetTypeIfUnknown(destination, leftType);
+        if (leftType != null && LiteralFits(right, leftType))
+            return SetTypeIfUnknown(destination, leftType);
+        if (rightType != null && LiteralFits(left, rightType))
+            return SetTypeIfUnknown(destination, rightType);
+        return false;
+    }
+
+    private static TypeAnalysisContext? KnownIntegerType(IOperand operand, MethodAnalysisContext method)
+    {
+        var type = operand switch
+        {
+            LocalVariable local => local.Type,
+            FieldReference field => field.Field.FieldType,
+            _ => null,
+        };
+        return type?.FullName switch
+        {
+            "System.Byte" or "System.SByte" or "System.Int16" or "System.UInt16" or "System.Char"
+                => method.AppContext.SystemTypes.SystemInt32Type,
+            "System.Int32" or "System.UInt32" or "System.Int64" or "System.UInt64" => type,
+            _ => null,
+        };
+    }
+
+    private static bool LiteralFits(IOperand operand, TypeAnalysisContext type) => operand is Immediate immediate
+        && type.FullName switch
+        {
+            "System.Int32" => immediate.Value is >= int.MinValue and <= int.MaxValue,
+            "System.UInt32" => immediate.Value is >= 0 and <= uint.MaxValue,
+            "System.Int64" => true,
+            "System.UInt64" => immediate.Value >= 0,
+            _ => false,
+        };
+
     // An integer operand makes the result an integer. Excludes bool operands so flag logic stays boolean.
     private static bool PropagateIntegerResult(Instruction instruction, MethodAnalysisContext method)
     {
         if (instruction.Operands[0] is not LocalVariable { Type: null } destination)
             return false;
+
+        // A shift count says nothing about the shifted value's width or signedness.
+        // In particular, an Int32 count must not turn an unknown 64-bit value into Int32.
+        if (instruction.OpCode is OpCode.ShiftLeft or OpCode.ShiftRight)
+            return SetTypeIfUnknown(destination, KnownIntegerType(instruction.Operands[1], method));
 
         for (var i = 1; i < instruction.Operands.Count; i++)
             if (IntegerResultType(instruction.Operands[i], method) is { } integerType)
