@@ -734,14 +734,28 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 Add(address, OpCode.Move, ScalarOperand(0), ScalarOperand(1));
                 break;
             case Arm64Mnemonic.DUP:
+                // Broadcast one value into every lane. Only the 2S arrangement is modelled, and only
+                // from a source ISIL can name: another S lane, or a general-purpose register.
                 if (IsTwoS(instruction.Op0Arrangement)
-                    && instruction.Op1Kind == Arm64OperandKind.VectorRegisterElement
-                    && instruction.Op1VectorElement.Width == Arm64VectorElementWidth.S)
+                    && ((instruction.Op1Kind == Arm64OperandKind.VectorRegisterElement
+                         && instruction.Op1VectorElement.Width == Arm64VectorElementWidth.S)
+                        || instruction.Op1Kind == Arm64OperandKind.Register))
                 {
                     var source = ConvertOperand(instruction, 1);
                     Add(address, OpCode.Move, VectorLane(instruction.Op0Reg, 0), source);
                     Add(address, OpCode.Move, VectorLane(instruction.Op0Reg, 1), source);
                 }
+                else
+                    Add(address, OpCode.NotImplemented,
+                        new StringLiteral($"Instruction {instruction.Mnemonic} not yet implemented."));
+                break;
+            case Arm64Mnemonic.UMOV:
+            case Arm64Mnemonic.SMOV:
+                // Copy one vector lane into a general-purpose register. ConvertOperand already names
+                // the lane, so this is just a move; the sign/zero extension SMOV/UMOV differ by is
+                // not modelled, matching how the SXT*/UXT* cases above are treated as plain moves.
+                if (instruction.Op1Kind == Arm64OperandKind.VectorRegisterElement)
+                    Add(address, OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
                 else
                     Add(address, OpCode.NotImplemented,
                         new StringLiteral($"Instruction {instruction.Mnemonic} not yet implemented."));
@@ -1116,6 +1130,24 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     Add(address, isAdd ? OpCode.Add : OpCode.Subtract, ConvertOperand(instruction, 0), ConvertOperand(instruction, 3), temp);
                     break;
                 }
+            case Arm64Mnemonic.ROR:
+                {
+                    // dest = (src >> amount) | (src << (regSize - amount))
+                    // The shift amount is a register here, so the left-shift distance has to be
+                    // computed rather than folded, unlike the EXTR case below.
+                    var regSize = instruction.Op0Reg is >= Arm64Register.X0 and <= Arm64Register.X31 ? 64 : 32;
+                    var source = ConvertOperand(instruction, 1);
+                    var amount = ConvertOperand(instruction, 2);
+                    var low = new Register(null, "TEMP");
+                    var high = new Register(null, "TEMP2");
+                    var distance = new Register(null, "TEMP3");
+
+                    Add(address, OpCode.ShiftRight, low, source, amount);
+                    Add(address, OpCode.Subtract, distance, Imm(regSize), amount);
+                    Add(address, OpCode.ShiftLeft, high, source, distance);
+                    Add(address, OpCode.Or, ConvertOperand(instruction, 0), low, high);
+                    break;
+                }
             case Arm64Mnemonic.EXTR:
                 {
                     // dest = (rn:rm) >> lsb
@@ -1206,6 +1238,18 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     Add(address, OpCode.Call, abs, dest, dest);
                     break;
                 }
+            case Arm64Mnemonic.FADDP:
+                // Scalar-reducing form: add the two lanes of a 2S vector into a scalar.
+                // The wider reductions have no single-instruction ISIL equivalent.
+                if (instruction.Op0Kind == Arm64OperandKind.Register
+                    && instruction.Op1Kind == Arm64OperandKind.Register
+                    && IsTwoS(instruction.Op1Arrangement))
+                    Add(address, OpCode.Add, ScalarOperand(0),
+                        VectorLane(instruction.Op1Reg, 0), VectorLane(instruction.Op1Reg, 1));
+                else
+                    Add(address, OpCode.NotImplemented,
+                        new StringLiteral($"Instruction {instruction.Mnemonic} not yet implemented."));
+                break;
             case Arm64Mnemonic.BL:
                 AddCallAt(instruction.BranchTarget);
                 break;
