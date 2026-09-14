@@ -912,6 +912,28 @@ public static class MetadataResolver
 
     private static bool CanSpecializeSharedGeneric(MethodAnalysisContext current, MethodAnalysisContext represented)
     {
+        // Reference-type method arguments share an object body too, even when their
+        // declaring type is not generic (e.g. Enumerable.FirstOrDefault<T>).
+        if (current is ConcreteGenericMethodAnalysisContext currentGeneric
+            && represented is ConcreteGenericMethodAnalysisContext representedGeneric
+            && ReferenceEquals(currentGeneric.BaseMethodContext, representedGeneric.BaseMethodContext)
+            && IsSameType(current.DeclaringType, represented.DeclaringType)
+            && currentGeneric.MethodGenericParameters.Count > 0
+            && currentGeneric.MethodGenericParameters.Count == representedGeneric.MethodGenericParameters.Count)
+        {
+            var changed = false;
+            for (var i = 0; i < currentGeneric.MethodGenericParameters.Count; i++)
+            {
+                var before = currentGeneric.MethodGenericParameters[i];
+                var after = representedGeneric.MethodGenericParameters[i];
+                if (IsSameType(before, after)) continue;
+                if (before != current.AppContext.SystemTypes.SystemObjectType || after.IsValueType)
+                    return false; // Not a refinement of the canonical reference-type body.
+                changed = true;
+            }
+            return changed;
+        }
+
         if (ReferenceEquals(current, represented)
             || current.Name != represented.Name
             || current.Parameters.Count != represented.Parameters.Count
