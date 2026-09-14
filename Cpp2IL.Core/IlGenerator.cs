@@ -957,6 +957,21 @@ public static class IlGenerator
 
         switch (operand)
         {
+            // Native immediates carry bits, not a CIL stack type. Honor known
+            // destinations/signatures instead of choosing the width by magnitude.
+            case Immediate immediate when expectedType?.FullName is "System.Int64" or "System.UInt64":
+                instructions.Add(CilOpCodes.Ldc_I8, immediate.Value);
+                break;
+            case Immediate { Value: >= int.MinValue and <= uint.MaxValue } immediate
+                when expectedType?.FullName is "System.Int32" or "System.UInt32":
+                instructions.Add(CilOpCodes.Ldc_I4, unchecked((int)immediate.Value));
+                break;
+            case Immediate { Value: 0 } when expectedType?.FullName == "System.Single":
+                instructions.Add(CilOpCodes.Ldc_R4, 0f);
+                break;
+            case Immediate { Value: 0 } when expectedType?.FullName == "System.Double":
+                instructions.Add(CilOpCodes.Ldc_R8, 0d);
+                break;
             case Immediate { Value: >= int.MinValue and <= int.MaxValue } immediate:
                 instructions.Add(CilOpCodes.Ldc_I4, (int)immediate.Value);
                 break;
