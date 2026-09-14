@@ -830,11 +830,17 @@ public static class IlGenerator
                     case OpCode.Add: instructions.Add(CilOpCodes.Add); break;
                     case OpCode.Subtract: instructions.Add(CilOpCodes.Sub); break;
                     case OpCode.Multiply: instructions.Add(CilOpCodes.Mul); break;
-                    case OpCode.Divide: instructions.Add(CilOpCodes.Div); break;
-                    case OpCode.Modulo: instructions.Add(CilOpCodes.Rem); break;
+                    case OpCode.Divide:
+                        instructions.Add(IsUnsignedOperation(instruction) ? CilOpCodes.Div_Un : CilOpCodes.Div);
+                        break;
+                    case OpCode.Modulo:
+                        instructions.Add(IsUnsignedOperation(instruction) ? CilOpCodes.Rem_Un : CilOpCodes.Rem);
+                        break;
 
                     case OpCode.ShiftLeft: instructions.Add(CilOpCodes.Shl); break;
-                    case OpCode.ShiftRight: instructions.Add(CilOpCodes.Shr); break;
+                    case OpCode.ShiftRight:
+                        instructions.Add(IsUnsignedOperation(instruction) ? CilOpCodes.Shr_Un : CilOpCodes.Shr);
+                        break;
 
                     case OpCode.And: instructions.Add(CilOpCodes.And); break;
                     case OpCode.Or: instructions.Add(CilOpCodes.Or); break;
@@ -899,6 +905,26 @@ public static class IlGenerator
 
         return null;
     }
+
+    // ARM64 spells the signed and unsigned forms as distinct instructions (LSR vs ASR, UDIV vs
+    // SDIV), but ISIL folds each pair into one opcode, so the distinction has to be recovered from
+    // the operand types at IL generation time. Getting this wrong is silent: `Shr` on a ushort
+    // whose high bit is set sign-extends where the original `>>` did not.
+    private static bool IsUnsignedOperation(Instruction instruction)
+    {
+        // The shift distance is always a non-negative count, so only the value being shifted
+        // decides the signedness; for a divide, either operand being unsigned is enough.
+        if (IsUnsignedType(instruction.Operands[1]))
+            return true;
+
+        return instruction.OpCode is OpCode.Divide or OpCode.Modulo
+               && IsUnsignedType(instruction.Operands[2]);
+    }
+
+    private static bool IsUnsignedType(IOperand operand) =>
+        (operand as LocalVariable)?.Type?.FullName is
+            "System.Byte" or "System.UInt16" or "System.UInt32" or "System.UInt64"
+            or "System.UIntPtr" or "System.Char";
 
     private static CilOpCode? FloatArithmeticConversion(Instruction instruction)
     {
