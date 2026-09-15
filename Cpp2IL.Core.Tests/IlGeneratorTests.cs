@@ -145,6 +145,25 @@ public class IlGeneratorTests
         Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldc_I4_0), Is.False);
     }
 
+    [TestCase(true, 0L, 1L)]
+    [TestCase(true, 1L, 0L)]
+    [TestCase(false, 0L, -1L)]
+    [TestCase(false, 1L, -2L)]
+    public void Not_ConstantFoldingPreservesBooleanVersusIntegerSemantics(bool boolean, long input, long expected)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var type = boolean ? app.SystemTypes.SystemBooleanType : app.SystemTypes.SystemInt64Type;
+        var result = new LocalVariable("result", new Register(null, "result"), type);
+        var not = new Instruction(0, OpCode.Not, result, new Immediate(input));
+        var generated = GenerateSingle(not, result).CilMethodBody!.Instructions;
+        Assert.That(generated.Any(i => i.OpCode == CilOpCodes.Ceq), Is.EqualTo(boolean));
+        Assert.That(generated.Any(i => i.OpCode == CilOpCodes.Not), Is.EqualTo(!boolean));
+        var cfg = new ISILControlFlowGraph([not, new(1, OpCode.Return, result)]);
+        Assert.That(Cpp2IL.Core.Analysis.ConstantFolder.Run(cfg), Is.True);
+        Assert.That(not.OpCode, Is.EqualTo(OpCode.Move));
+        Assert.That(((Immediate)not.Operands[1]).Value, Is.EqualTo(expected));
+    }
+
     [TestCase(false, false)]
     [TestCase(false, true)]
     [TestCase(true, false)]

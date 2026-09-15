@@ -902,7 +902,7 @@ public static class IlGenerator
 
                 if (instruction.OpCode == OpCode.Negate)
                     instructions.Add(CilOpCodes.Neg);
-                else if (IsBoolean(instruction.Operands[1], context))
+                else if (IsBoolean(instruction.Operands[1], context) || IsBoolean(instruction.Operands[0], context))
                 {
                     instructions.Add(CilOpCodes.Ldc_I4_0);
                     instructions.Add(CilOpCodes.Ceq);

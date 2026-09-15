@@ -4,6 +4,7 @@ using System.Linq;
 using Cpp2IL.Core.Il2CppApiFunctions;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
+using LibCpp2IL.BinaryStructures;
 
 namespace Cpp2IL.Core.Analysis;
 
@@ -73,8 +74,15 @@ public static class KeyFunctionRecovery
             classOperand = source;
         // Require an actual metadata value, not a static type inferred for a dynamic
         // class pointer (or one arbitrarily chosen from a mixed phi).
-        var klass = classOperand as RuntimeClassTypeAnalysisContext;
-        if (klass == null || klass.RepresentedType.IsValueType || klass.RepresentedType is GenericParameterTypeAnalysisContext)
+        var castType = classOperand switch
+        {
+            RuntimeClassTypeAnalysisContext klass => klass.RepresentedType,
+            TypeAnalysisContext { Type: Il2CppTypeEnum.IL2CPP_TYPE_CLASS or Il2CppTypeEnum.IL2CPP_TYPE_OBJECT
+                or Il2CppTypeEnum.IL2CPP_TYPE_STRING or Il2CppTypeEnum.IL2CPP_TYPE_ARRAY
+                or Il2CppTypeEnum.IL2CPP_TYPE_SZARRAY or Il2CppTypeEnum.IL2CPP_TYPE_GENERICINST } type => type,
+            _ => null
+        };
+        if (castType == null || castType.IsValueType || castType is GenericParameterTypeAnalysisContext)
             return false;
         if (target is not StringLiteral { Value: nameof(BaseKeyFunctionAddresses.il2cpp_vm_object_is_inst) })
         {
@@ -85,9 +93,9 @@ public static class KeyFunctionRecovery
                     || NewArm64KeyFunctionAddresses.GetBranchThunkTarget(method.AppContext, address.UnsignedValue) != known))
                 return false;
         }
-        result.Type = klass.RepresentedType;
+        result.Type = castType;
         instruction.OpCode = OpCode.TryCast;
-        instruction.SetOperands(result, klass.RepresentedType, value);
+        instruction.SetOperands(result, castType, value);
         return true;
     }
 

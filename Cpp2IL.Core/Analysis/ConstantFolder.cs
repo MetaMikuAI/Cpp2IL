@@ -28,7 +28,7 @@ public static class ConstantFolder
 
         // Unary constant folds.
         if (instruction is { OpCode: OpCode.Not, Operands: [_, Immediate n] })
-            return ToConstant(instruction, ~n.Value);
+            return ToConstant(instruction, IsBoolean(instruction.Operands[0]) ? (n.Value == 0 ? 1 : 0) : ~n.Value);
         if (instruction is { OpCode: OpCode.Negate, Operands: [_, Immediate m] })
             return ToConstant(instruction, -m.Value);
 

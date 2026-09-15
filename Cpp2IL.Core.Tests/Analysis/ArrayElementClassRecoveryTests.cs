@@ -8,6 +8,38 @@ namespace Cpp2IL.Core.Tests.Analysis;
 
 public class ArrayElementClassRecoveryTests
 {
+    [TestCase("metadata", true)]
+    [TestCase("copy", true)]
+    [TestCase("static_type_only", false)]
+    [TestCase("mixed_phi", false)]
+    [TestCase("value_type", false)]
+    public void IsInstAcceptsExactMetadataButNotAnInferredRuntimeClass(string kind, bool expected)
+    {
+        Cpp2IlApi.ResetInternalState();
+        var app = TestGameLoader.LoadSimple2019Game();
+        var target = app.SystemTypes.SystemStringType;
+        var handle = new LocalVariable("handle", new Register(null, "handle"),
+            new RuntimeClassTypeAnalysisContext(target, target.DeclaringAssembly));
+        var result = new LocalVariable("result", new Register(null, "result"));
+        var definition = kind switch
+        {
+            "copy" => new Instruction(0, OpCode.Move, handle, target),
+            "mixed_phi" => new Instruction(0, OpCode.Phi, handle, target, app.SystemTypes.SystemObjectType),
+            _ => new Instruction(0, OpCode.Nop)
+        };
+        IOperand klass = kind == "metadata" ? target : kind == "value_type" ? app.SystemTypes.SystemInt32Type : handle;
+        var call = new Instruction(1, OpCode.Call, new StringLiteral("il2cpp_vm_object_is_inst"), result, new StringLiteral("value"), klass);
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Cast", app.SystemTypes.SystemObjectType,
+            MethodAttributes.Static | MethodAttributes.Public, [])
+        {
+            ControlFlowGraph = new ISILControlFlowGraph([definition, call, new(2, OpCode.Return, result)]),
+            Locals = [handle, result], ParameterLocals = []
+        };
+        KeyFunctionRecovery.Run(method);
+        Assert.That(call.OpCode, Is.EqualTo(expected ? OpCode.TryCast : OpCode.Call));
+        if (expected) Assert.That(call.Operands[1], Is.SameAs(target));
+    }
+
     [TestCase("newarr", true)]
     [TestCase("helper", true)]
     [TestCase("parameter", false)]
