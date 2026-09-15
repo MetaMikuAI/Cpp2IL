@@ -27,8 +27,12 @@ public abstract class AsmResolverDllOutputFormat : Cpp2IlOutputFormat
     public override IEnumerable<string> RequiredProcessingLayerIds => ["attributeanalyzer"];
 
     private AssemblyDefinition? MostRecentCorLib { get; set; }
-    protected int TotalMethodCount;
-    protected int SuccessfulMethodCount;
+
+    /// <summary>
+    /// How this run's method bodies turned out. Populated by <see cref="FillMethodBody"/> overrides
+    /// that actually recover IL; formats that only emit stubs leave it empty and print nothing.
+    /// </summary>
+    protected readonly RecoveryStatistics Statistics = new();
 
     private static readonly ConcurrentDictionary<ModuleDefinition, object> StubLocks = new();
 
@@ -76,11 +80,8 @@ public abstract class AsmResolverDllOutputFormat : Cpp2IlOutputFormat
 
         Logger.VerboseNewline($"{(DateTime.Now - start).TotalMilliseconds:F1}ms", "DllOutput");
 
-        if (TotalMethodCount != 0)
-        {
-            var percent = Math.Round((SuccessfulMethodCount / (float)TotalMethodCount) * 100);
-            Logger.InfoNewline($"{percent}% of methods successfully decompiled ({SuccessfulMethodCount} / {TotalMethodCount})", "DllOutput");
-        }
+        if (Statistics.BuildReport() is { Length: > 0 } report)
+            Logger.InfoNewline(report, "DllOutput");
     }
 
     public virtual List<AssemblyDefinition> BuildAssemblies(ApplicationAnalysisContext context)
