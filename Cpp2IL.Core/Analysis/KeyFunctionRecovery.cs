@@ -42,7 +42,7 @@ public static class KeyFunctionRecovery
             .GroupBy(i => (LocalVariable)i.Destination!).Where(g => g.Count() == 1).ToDictionary(g => g.Key, g => g.Single());
         foreach (var instruction in method.ControlFlowGraph!.Blocks.SelectMany(block => block.Instructions))
         {
-            if (TryRewriteIsInst(instruction, method, definitions))
+            if (TryRewriteIsInst(instruction, method, definitions) || TryRewriteBox(instruction, method))
                 continue;
             if (instruction.Operands is not [StringLiteral { Value: var keyFunction }, ..])
                 continue;
@@ -53,8 +53,6 @@ public static class KeyFunctionRecovery
                 RemoveWriteBarrier(instruction);
             else if (RaiseExceptionFunctions.Contains(keyFunction))
                 RewriteRaiseException(instruction);
-            else if (BoxFunctions.Contains(keyFunction))
-                RewriteBox(instruction);
             else if (keyFunction == nameof(BaseKeyFunctionAddresses.il2cpp_vm_reflection_get_type_object))
                 RewriteTypeObject(instruction);
             else if (keyFunction == nameof(BaseKeyFunctionAddresses.InternalCalls_Resolve))
@@ -111,14 +109,31 @@ public static class KeyFunctionRecovery
         instruction.SetOperands(exception);
     }
 
-    private static void RewriteBox(Instruction instruction)
+    private static bool TryRewriteBox(Instruction instruction, MethodAnalysisContext method)
     {
         // function name, result, class, address of value.
-        if (instruction.OpCode != OpCode.Call || instruction.Operands is not [_, var result, TypeAnalysisContext boxedType, var value, ..])
-            return;
+        if (instruction.OpCode != OpCode.Call || instruction.Operands is not [var target, var result, TypeAnalysisContext boxedType, var value, ..])
+            return false;
+
+        if (target is not StringLiteral name || !BoxFunctions.Contains(name.Value))
+        {
+            // Codegen may use a sibling of the exported boxing thunk. Follow only
+            // an entry-point B: calls or argument-adjusting wrappers are not equivalent.
+            if (target is not Immediate address || method.AppContext.InstructionSet is not InstructionSets.NewArmV8InstructionSet
+                || !boxedType.IsValueType
+                || value is not AddressOf { Target: LocalVariable { Type: { } valueType } } || valueType != boxedType)
+                return false;
+            var implementation = NewArm64KeyFunctionAddresses.GetBranchThunkTarget(method.AppContext, address.UnsignedValue);
+            if (implementation == 0)
+                return false;
+            var known = method.AppContext.GetOrCreateKeyFunctionAddresses();
+            if (implementation != known.il2cpp_value_box && implementation != known.il2cpp_vm_object_box)
+                return false;
+        }
 
         instruction.OpCode = OpCode.Box;
         instruction.SetOperands(result, boxedType, value);
+        return true;
     }
 
     private static void RewriteTypeObject(Instruction instruction)

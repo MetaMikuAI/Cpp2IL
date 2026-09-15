@@ -30,6 +30,7 @@ public class SsaForm
 
     public static void Build(ISILControlFlowGraph graph, DominatorInfo dominatorInfo)
     {
+        DelayAddressTakesPastStores(graph);
         var ssa = new SsaForm();
         ssa.FindClobberingAddressTakes(graph);
 
@@ -38,6 +39,36 @@ public class SsaForm
         ssa.CollectRegisters(graph);
         ssa.InsertPhiFunctions(graph, dominatorInfo);
         ssa.Rename(graph.EntryBlock, dominatorInfo);
+    }
+
+    // Native code can form &slot before assigning slot. Move the pure address
+    // computation past adjacent stores before SSA binds it to a value version.
+    // Do not cross a use/redefinition of the pointer or any non-move instruction.
+    private static void DelayAddressTakesPastStores(ISILControlFlowGraph graph)
+    {
+        foreach (var block in graph.Blocks)
+        {
+            for (var i = 0; i < block.Instructions.Count; i++)
+            {
+                var take = block.Instructions[i];
+                if (take is not { OpCode: OpCode.Move, Operands: [Register pointer, AddressOf { Target: Register slot }] })
+                    continue;
+                var lastStore = i;
+                for (var j = i + 1; j < block.Instructions.Count; j++)
+                {
+                    var next = block.Instructions[j];
+                    if (next.OpCode != OpCode.Move || EnumerateRegisters(next).Any(r => r.Number == pointer.Number))
+                        break;
+                    if (next.Destination is Register destination && destination.Number == slot.Number)
+                        lastStore = j;
+                }
+                if (lastStore == i)
+                    continue;
+                block.Instructions.RemoveAt(i);
+                block.Instructions.Insert(lastStore, take);
+                i--;
+            }
+        }
     }
 
     // The address-takes whose slot is read again afterwards, and so have to be treated as definitions.
