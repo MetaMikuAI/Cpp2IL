@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Linq;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
@@ -19,6 +20,9 @@ public static class RgctxResolver
         var methodRgctxOffset = is32Bit ? 0x1C : 0x38; // MethodInfo::rgctx_data
         var pointerSize = is32Bit ? 4 : 8;
 
+        var definitions = method.ControlFlowGraph!.Instructions.Where(i => i.Destination is LocalVariable)
+            .GroupBy(i => (LocalVariable)i.Destination!).Where(g => g.Count() == 1)
+            .ToDictionary(g => g.Key, g => g.Single());
         var changed = false;
 
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
@@ -31,6 +35,26 @@ public static class RgctxResolver
 
             if (instruction.Operands[1] is not MemoryOperand { Index: null, Scale: 0, Base: LocalVariable source } memory)
                 continue;
+
+            // Native code can keep &MethodInfo::klass in a register and dereference it later.
+            // Follow SSA copies/constant additions without guessing the type of an interior pointer.
+            var seen = new HashSet<LocalVariable>();
+            var validAddress = true;
+            while (definitions.TryGetValue(source, out var definition))
+            {
+                if (!seen.Add(source)) { validAddress = false; break; }
+                if (definition is { OpCode: OpCode.Move, Operands: [_, LocalVariable copied] })
+                    source = copied;
+                else if (definition is { OpCode: OpCode.Add, Operands: [_, LocalVariable origin, Immediate offset] })
+                {
+                    try { memory.Addend = checked(memory.Addend + offset.Value); }
+                    catch (System.OverflowException) { validAddress = false; break; }
+                    source = origin;
+                }
+                else break;
+            }
+
+            if (!validAddress) continue;
 
             var resolved = source.Type switch
             {

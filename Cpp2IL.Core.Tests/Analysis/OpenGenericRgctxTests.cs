@@ -72,6 +72,37 @@ public class OpenGenericRgctxTests
         Assert.That(affectedMethods, Is.GreaterThan(0));
     }
 
+    [TestCase("split", true)]
+    [TestCase("copy", true)]
+    [TestCase("wrong_offset", false)]
+    [TestCase("variable_offset", false)]
+    [TestCase("mixed_phi", false)]
+    [TestCase("overflow", false)]
+    public void ResolvesSplitMethodInfoClassAddressOnlyWithProvenOffsets(string kind, bool expected)
+    {
+        var owner = _app.AllTypes.Single(t => t.FullName == "System.Collections.Generic.List`1");
+        var caller = new InjectedMethodAnalysisContext(owner, "Caller", _app.SystemTypes.SystemVoidType,
+            MethodAttributes.Public | MethodAttributes.Static, []);
+        var info = new LocalVariable("info", new Register(null, "info"), new RuntimeMethodInfoAnalysisContext(caller, owner.DeclaringAssembly));
+        var pointer = new LocalVariable("pointer", new Register(null, "pointer"));
+        var copied = new LocalVariable("copied", new Register(null, "copied"));
+        var result = new LocalVariable("klass", new Register(null, "klass"));
+        var unknown = new LocalVariable("offset", new Register(null, "offset"));
+        var offset = kind == "wrong_offset" ? 24L : kind == "overflow" ? long.MaxValue : 16L;
+        var address = kind == "mixed_phi"
+            ? new Instruction(0, OpCode.Phi, pointer, info, unknown)
+            : new Instruction(0, OpCode.Add, pointer, info, kind == "variable_offset" ? unknown : new Immediate(offset));
+        var copy = new Instruction(1, OpCode.Move, copied, pointer);
+        var load = new Instruction(2, OpCode.Move, result, new MemoryOperand(kind == "copy" ? copied : pointer, addend: 16));
+        caller.ControlFlowGraph = new ISILControlFlowGraph([address, copy, load, new(3, OpCode.Return)]);
+        Assert.That(RgctxResolver.Run(caller), Is.EqualTo(expected));
+        if (expected)
+            Assert.That(((RuntimeClassTypeAnalysisContext)result.Type!).RepresentedType, Is.SameAs(owner));
+        else
+            Assert.That(load.Operands[1], Is.TypeOf<MemoryOperand>());
+        Assert.That(RgctxResolver.Run(caller), Is.False);
+    }
+
     [TestCase(-8)]
     [TestCase(1)]
     [TestCase(1048576)]
