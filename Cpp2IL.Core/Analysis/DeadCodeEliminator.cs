@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Linq;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
@@ -18,7 +19,28 @@ namespace Cpp2IL.Core.Analysis;
 /// </summary>
 public static class DeadCodeEliminator
 {
-    public static void Run(MethodAnalysisContext method) => Run(method.ControlFlowGraph!);
+    public static void Run(MethodAnalysisContext method)
+    {
+        var cfg = method.ControlFlowGraph!;
+        Run(cfg);
+        var lookups = cfg.Blocks.SelectMany(b => b.Instructions).Where(i => i is
+            { OpCode: OpCode.Call, Operands: [Immediate, LocalVariable { Type: StaticFieldStorageTypeAnalysisContext { IsThreadStatic: true } }, ..] }).ToList();
+        if (lookups.Count == 0)
+            return;
+        var uses = CountUses(cfg);
+        var removedLookup = false;
+        foreach (var instruction in lookups)
+        {
+            if (uses.ContainsKey((LocalVariable)instruction.Operands[1])
+                || !ThreadStaticFieldRecovery.IsLookup(method.AppContext, ((Immediate)instruction.Operands[0]).UnsignedValue))
+                continue;
+            instruction.OpCode = OpCode.Nop;
+            instruction.SetOperands();
+            removedLookup = true;
+        }
+        if (removedLookup)
+            Run(cfg);
+    }
 
     public static void Run(ISILControlFlowGraph cfg)
     {

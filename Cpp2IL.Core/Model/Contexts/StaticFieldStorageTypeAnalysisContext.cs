@@ -5,15 +5,17 @@ namespace Cpp2IL.Core.Model.Contexts;
 /// <summary>
 /// Synthetic type for a value holding <c>Il2CppClass::static_fields</c>)
 /// </summary>
-public class StaticFieldStorageTypeAnalysisContext(TypeAnalysisContext ownerType, AssemblyAnalysisContext referencedFrom)
+public class StaticFieldStorageTypeAnalysisContext(TypeAnalysisContext ownerType, AssemblyAnalysisContext referencedFrom, bool isThreadStatic = false)
     : ReferencedTypeAnalysisContext(referencedFrom)
 {
     /// <summary>The type whose static fields live in this storage block.</summary>
     public TypeAnalysisContext OwnerType { get; } = ownerType;
 
+    public bool IsThreadStatic { get; } = isThreadStatic;
+
     public override Il2CppTypeEnum Type => Il2CppTypeEnum.IL2CPP_TYPE_I;
 
-    public override string DefaultName => $"Il2CppStaticFields<{OwnerType.FullName}>";
+    public override string DefaultName => $"Il2Cpp{(IsThreadStatic ? "ThreadStatic" : "Static")}Fields<{OwnerType.FullName}>";
 
     public override string DefaultNamespace => "";
 

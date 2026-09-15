@@ -238,6 +238,18 @@ public static class MetadataResolver
                 // offsets, so compute their instantiated layout and retain the concrete owner for
                 // field type substitution (e.g. ResourcePool<AreaObjectCharacter>.resources).
                 FieldAnalysisContext? field = null;
+                if (fieldLocal.Type is StaticFieldStorageTypeAnalysisContext { IsThreadStatic: true })
+                {
+                    // The high bit encodes thread-static storage, not part of its byte offset.
+                    // Generic and embedded layouts without an exact field match stay unresolved.
+                    if (genericOwner != null || fieldOffset < 0 || fieldOffset >= int.MaxValue)
+                        continue;
+                    var encodedOffset = unchecked((int)((uint)fieldOffset | 0x80000000u));
+                    field = owner.Fields.FirstOrDefault(f => f.IsStatic && f.Offset == encodedOffset
+                        && (f.Attributes & FieldAttributes.Literal) == 0);
+                    if (field == null)
+                        continue;
+                }
                 if (staticOwner is GenericInstanceTypeAnalysisContext staticGeneric)
                 {
                     // Instantiations do not populate Fields. Generic definitions can report

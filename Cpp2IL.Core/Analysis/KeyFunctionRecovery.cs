@@ -42,7 +42,8 @@ public static class KeyFunctionRecovery
             .GroupBy(i => (LocalVariable)i.Destination!).Where(g => g.Count() == 1).ToDictionary(g => g.Key, g => g.Single());
         foreach (var instruction in method.ControlFlowGraph!.Blocks.SelectMany(block => block.Instructions))
         {
-            if (TryRewriteIsInst(instruction, method, definitions) || TryRewriteBox(instruction, method))
+            if (TryRewriteIsInst(instruction, method, definitions) || TryRewriteBox(instruction, method)
+                || ThreadStaticFieldRecovery.TryTypeLookup(instruction, method, definitions))
                 continue;
             if (instruction.Operands is not [StringLiteral { Value: var keyFunction }, ..])
                 continue;
