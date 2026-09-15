@@ -946,21 +946,29 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                         Arm64ExtendType.UXTW => 32,
                         _ => 0
                     };
-                    if (instruction.Op2Kind == Arm64OperandKind.Register && unsignedExtendBits != 0)
+                    var signedExtendBits = instruction.FinalOpExtendType switch
+                    {
+                        Arm64ExtendType.SXTB => 8,
+                        Arm64ExtendType.SXTH => 16,
+                        Arm64ExtendType.SXTW => 32,
+                        _ => 0
+                    };
+                    var extendBits = unsignedExtendBits != 0 ? unsignedExtendBits : signedExtendBits;
+                    if (instruction.Op2Kind == Arm64OperandKind.Register && extendBits != 0)
                     {
                         var extended = new Register(null, "TEMP_EXTENDED");
-                        Add(address, OpCode.ZeroExtend, extended, src2, Imm(unsignedExtendBits));
+                        Add(address, signedExtendBits != 0 ? OpCode.SignExtend : OpCode.ZeroExtend, extended, src2, Imm(extendBits));
                         src2 = extended;
                     }
 
                     // Disarm stores a shifted register's amount as operand 3, not in operand 2.
                     if (instruction.Op2Kind == Arm64OperandKind.Register
-                        && (instruction.FinalOpShiftType == Arm64ShiftType.LSL || unsignedExtendBits != 0)
+                        && (instruction.FinalOpShiftType == Arm64ShiftType.LSL || extendBits != 0)
                         && instruction.Op3Kind == Arm64OperandKind.Immediate && instruction.Op3Imm != 0)
                     {
                         var shifted = new Register(null, "TEMP_SHIFTED");
                         Add(address, OpCode.ShiftLeft, shifted, src2, Imm(instruction.Op3Imm));
-                        if (unsignedExtendBits == 0 && instruction.Op2Reg is >= Arm64Register.W0 and <= Arm64Register.W31)
+                        if (extendBits == 0 && instruction.Op2Reg is >= Arm64Register.W0 and <= Arm64Register.W31)
                             Add(address, OpCode.And, shifted, shifted, Imm(0xFFFFFFFFL));
                         src2 = shifted;
                     }

@@ -134,6 +134,9 @@ public enum OpCode
     /// <summary>Zero-extends the low op 3 bits of op 2 to UInt64 in op 1.</summary>
     ZeroExtend,
 
+    /// <summary>Sign-extends the low op 3 bits of op 2 to Int64 in op 1.</summary>
+    SignExtend,
+
     /// <summary>
     /// Throws a new instance of the exception type described by op 1.
     /// </summary>

@@ -11,6 +11,22 @@ namespace Cpp2IL.Core.Tests.Isil;
 
 public class Arm64ShiftedArithmeticTests
 {
+    [TestCase(0x8B2C8D48u, 8)] // add x8, x10, w12, sxtb #3
+    [TestCase(0x8B2CAD48u, 16)]
+    [TestCase(0x8B2CCD48u, 32)]
+    [TestCase(0xCB2CCD48u, 32)] // sub
+    public void SignExtendsBeforeShiftingExtendedArithmetic(uint word, int bits)
+    {
+        var instructions = Lift(word);
+        var extend = instructions.Single(i => i.OpCode == OpCode.SignExtend);
+        var shift = instructions.Single(i => i.OpCode == OpCode.ShiftLeft);
+        Assert.That(extend.Operands[2], Is.EqualTo(new Immediate(bits)));
+        Assert.That(shift.Operands[1], Is.EqualTo(extend.Destination));
+        Assert.That(shift.Operands[2], Is.EqualTo(new Immediate(3)));
+        Assert.That(instructions.Any(i => i.OpCode == OpCode.And), Is.False,
+            "a sign-extended value must not be zero-masked after shifting");
+    }
+
     [TestCase(0x0A887D01u, OpCode.And, OpCode.ShiftRight, "System.Int32")] // and w1, w8, w8, asr #31
     [TestCase(0x8A887D01u, OpCode.And, OpCode.ShiftRight, "System.Int64")]
     [TestCase(0x0A487D01u, OpCode.And, OpCode.ShiftRight, "System.UInt32")]

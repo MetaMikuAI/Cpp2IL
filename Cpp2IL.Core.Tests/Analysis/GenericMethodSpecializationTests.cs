@@ -77,6 +77,18 @@ public class GenericMethodSpecializationTests
         return (caller, call, target);
     }
 
+    [Test]
+    public void EarlyTrimmingPreservesMetadataForSharedGenericSpecialization()
+    {
+        var (caller, call, target) = Create();
+        CallArgumentTrimmer.Run(caller, preserveGenericMetadata: true);
+        Assert.That(call.Operands.Count, Is.EqualTo(5));
+        Assert.That(MetadataResolver.ResolveCallsViaMethodInfo(caller), Is.True);
+        Assert.That(call.Operands[0], Is.SameAs(target));
+        CallArgumentTrimmer.Run(caller);
+        Assert.That(call.Operands.Count, Is.EqualTo(4));
+    }
+
     [TestCase("Find")]
     [TestCase("OtherFind")]
     [TestCase("Map")]

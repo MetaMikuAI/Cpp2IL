@@ -46,6 +46,12 @@ public static class InterfaceDispatchRecovery
                     continue;
 
                 RewriteDispatch(method, instruction, block, match, definitions);
+                // The matched native helper takes only obj, interface and slot.
+                while (match.SlowCall.Operands.Count > 5)
+                    match.SlowCall.RemoveOperandAt(match.SlowCall.Operands.Count - 1);
+                CallArgumentTrimmer.Run(method, preserveGenericMetadata: true);
+                DeadCodeEliminator.RemoveDeadCopyCycles(cfg);
+                DeadCodeEliminator.Run(method);
                 TryExciseLookup(cfg, match, definitions, homeBlock);
                 changed = true;
             }
@@ -119,39 +125,45 @@ public static class InterfaceDispatchRecovery
         return new Match(resolved, phi, merge, slowCall, klassLocal);
     }
 
-    private static LocalVariable? MatchVTableEntryChain(Dictionary<LocalVariable, Instruction> definitions, Instruction? vtableEntry, int slot)
+    internal static LocalVariable? MatchVTableEntryChain(Dictionary<LocalVariable, Instruction> definitions, Instruction? vtableEntry, int slot)
     {
+        // Both klass + (scaledSlot + header) and (klass + scaledSlot) + header
+        // are emitted by native compilers. Keep the same scale/slot/load proof.
+        var headerOutside = vtableEntry is { OpCode: OpCode.Add, Operands: [_, LocalVariable, Immediate { Value: VTableOffset }] };
+        if (headerOutside)
+            vtableEntry = ChaseCopies(definitions, (LocalVariable)vtableEntry!.Operands[1]);
         if (vtableEntry is not { OpCode: OpCode.Add, Operands: [_, LocalVariable addLeft, LocalVariable addRight] })
             return null;
 
-        var (klassCandidate, sum) = Definition(definitions, addRight) is { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Index: null, Scale: 0, Addend: 0 }] }
+        var (klassCandidate, sum) = ChaseCopies(definitions, addRight) is { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Index: null, Scale: 0, Addend: 0 }] }
             ? (addRight, addLeft)
             : (addLeft, addRight);
-
-        if (Definition(definitions, klassCandidate) is not { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Index: null, Scale: 0, Addend: 0, Base: LocalVariable }] })
+        if (ChaseCopies(definitions, klassCandidate) is not { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Index: null, Scale: 0, Addend: 0, Base: LocalVariable }] })
             return null;
 
-        if (ChaseCopies(definitions, sum) is not { OpCode: OpCode.Add, Operands: [_, LocalVariable shifted, Immediate { Value: VTableOffset }] })
-            return null;
-
-        if (ChaseCopies(definitions, shifted) is not { OpCode: OpCode.ShiftLeft, Operands: [_, LocalVariable index, Immediate { Value: InvokeDataShift }] })
+        var scaled = ChaseCopies(definitions, sum);
+        if (!headerOutside)
+        {
+            if (scaled is not { OpCode: OpCode.Add, Operands: [_, LocalVariable shifted, Immediate { Value: VTableOffset }] })
+                return null;
+            scaled = ChaseCopies(definitions, shifted);
+        }
+        if (scaled is not { OpCode: OpCode.ShiftLeft, Operands: [_, LocalVariable index, Immediate { Value: InvokeDataShift }] })
             return null;
 
         var entryOffset = ChaseCopies(definitions, index);
-
+        if (entryOffset is { OpCode: OpCode.SignExtend or OpCode.ZeroExtend, Operands: [_, LocalVariable narrow, Immediate { Value: 32 }] })
+            entryOffset = ChaseCopies(definitions, narrow);
         if (entryOffset is { OpCode: OpCode.Add, Operands: [_, LocalVariable beforeSlot, Immediate slotAddend] })
         {
             if (slotAddend.Value != slot)
                 return null;
-
             entryOffset = ChaseCopies(definitions, beforeSlot);
         }
         else if (slot != 0)
             return null;
-
         if (entryOffset is not { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Base: not null }] })
             return null;
-
         return klassCandidate;
     }
 
@@ -363,7 +375,7 @@ public static class InterfaceDispatchRecovery
                 {
                     OpCode.Nop or OpCode.Jump or OpCode.ConditionalJump or OpCode.Phi => true,
                     OpCode.Move or OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.Modulo
-                        or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.And or OpCode.Or or OpCode.Xor
+                        or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.SignExtend or OpCode.ZeroExtend or OpCode.And or OpCode.Or or OpCode.Xor
                         or OpCode.Not or OpCode.Negate
                         or (>= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual)
                         => instruction.Destination is LocalVariable,

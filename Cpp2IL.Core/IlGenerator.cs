@@ -637,6 +637,19 @@ public static class IlGenerator
                 }
                 break;
 
+            case OpCode.SignExtend:
+                LoadOperand(instruction.Operands[1], method, locals, writeLine);
+                instructions.Add(((Immediate)instruction.Operands[2]).Value switch
+                {
+                    8 => CilOpCodes.Conv_I1,
+                    16 => CilOpCodes.Conv_I2,
+                    32 => CilOpCodes.Conv_I4,
+                    _ => throw new InvalidOperationException("Unsupported sign-extension width")
+                });
+                instructions.Add(CilOpCodes.Conv_I8);
+                StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+                break;
+
             case OpCode.ZeroExtend:
                 LoadOperand(instruction.Operands[1], method, locals, writeLine);
                 instructions.Add(CilOpCodes.Conv_U8);

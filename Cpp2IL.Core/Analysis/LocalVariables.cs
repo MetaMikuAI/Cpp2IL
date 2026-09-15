@@ -239,8 +239,9 @@ public static class LocalVariables
         SeedMethodInfoTypes(method);
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
-            if (instruction is { OpCode: OpCode.ZeroExtend, Destination: LocalVariable extended })
-                extended.Type = method.AppContext.SystemTypes.SystemUInt64Type;
+            if (instruction is { OpCode: OpCode.ZeroExtend or OpCode.SignExtend, Destination: LocalVariable extended })
+                extended.Type = instruction.OpCode == OpCode.SignExtend
+                    ? method.AppContext.SystemTypes.SystemInt64Type : method.AppContext.SystemTypes.SystemUInt64Type;
             if (instruction is { OpCode: OpCode.ShiftLeft or OpCode.ShiftRight,
                 Operands: [LocalVariable shifted, _, _, TypeAnalysisContext shiftType] })
                 shifted.Type = shiftType;
@@ -450,6 +451,61 @@ public static class LocalVariables
             }
         }
 
+        return PropagateIntegerRecurrences(method) | changed;
+    }
+
+    // Break a closed integer recurrence's type cycle: sum = phi(0, sum + intValue).
+    // The typed step supplies the width; an untyped literal alone must never do so.
+    internal static bool PropagateIntegerRecurrences(MethodAnalysisContext method)
+    {
+        var instructions = method.ControlFlowGraph!.Instructions;
+        var phis = instructions.Where(i => i is { OpCode: OpCode.Phi, Destination: LocalVariable { Type: null } }).ToList();
+        if (phis.Count == 0) return false;
+        var definitions = instructions.Where(i => i.Destination is LocalVariable)
+            .GroupBy(i => (LocalVariable)i.Destination!).Where(g => g.Count() == 1)
+            .ToDictionary(g => g.Key, g => g.Single());
+        IOperand Value(IOperand value)
+        {
+            var seen = new HashSet<LocalVariable>();
+            while (value is LocalVariable local && seen.Add(local) && definitions.TryGetValue(local, out var definition)
+                && definition is { OpCode: OpCode.Move, Operands: [_, var source] })
+                value = source;
+            return value;
+        }
+        var changed = false;
+        foreach (var phi in phis)
+        {
+            var destination = (LocalVariable)phi.Destination!;
+            TypeAnalysisContext? type = null;
+            var seeds = new List<IOperand>();
+            var updates = new List<LocalVariable>();
+            var valid = true;
+            foreach (var input in phi.Operands.Skip(1))
+            {
+                var value = Value(input);
+                if (value is Immediate)
+                {
+                    seeds.Add(value);
+                    continue;
+                }
+                if (value is not LocalVariable update || !definitions.TryGetValue(update, out var definition)
+                    || definition is not { OpCode: OpCode.Add or OpCode.Subtract, Operands: [_, var left, var right] })
+                { valid = false; break; }
+                left = Value(left);
+                right = Value(right);
+                var stepType = ReferenceEquals(left, destination) ? KnownIntegerType(right, method)
+                    : ReferenceEquals(right, destination) ? KnownIntegerType(left, method) : null;
+                if (stepType == null || type != null && type != stepType || update.Type != null && update.Type != stepType)
+                { valid = false; break; }
+                type = stepType;
+                updates.Add(update);
+            }
+            if (!valid || type == null || seeds.Count == 0 || !seeds.All(seed => LiteralFits(seed, type)))
+                continue;
+            changed |= SetTypeIfUnknown(destination, type);
+            foreach (var update in updates)
+                changed |= SetTypeIfUnknown(update, type);
+        }
         return changed;
     }
 

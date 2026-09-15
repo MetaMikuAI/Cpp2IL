@@ -6,11 +6,17 @@ namespace Cpp2IL.Core.Analysis;
 // Drop any operands beyond the known arguments to a method, e.g. if it was unresolved at ISIL gen time and we guessed 4 operands but it's only actually 2.
 public static class CallArgumentTrimmer
 {
-    public static void Run(MethodAnalysisContext method)
+    public static void Run(MethodAnalysisContext method, bool preserveGenericMetadata = false)
     {
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
             if (!instruction.IsCall || instruction.Operands[0] is not MethodAnalysisContext called)
+                continue;
+
+            if (preserveGenericMetadata && (called is ConcreteGenericMethodAnalysisContext
+                || called.DeclaringType is GenericInstanceTypeAnalysisContext
+                || called.GenericParameters.Count != 0
+                || called.DeclaringType?.GenericParameters.Count > 0))
                 continue;
 
             // target, [return value], [this], parameters...

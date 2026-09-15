@@ -76,6 +76,34 @@ public static class DeadCodeEliminator
         }
     }
 
+    // Reference counting cannot delete a closed phi/copy cycle. Mark the copies
+    // reachable from non-copy uses, retaining calls, stores and address-taken values.
+    internal static void RemoveDeadCopyCycles(ISILControlFlowGraph cfg)
+    {
+        var instructions = cfg.Instructions;
+        var copies = instructions.Where(i => i.Destination is LocalVariable)
+            .GroupBy(i => (LocalVariable)i.Destination!).Where(g => g.Count() == 1)
+            .Select(g => g.Single()).Where(i => i.OpCode == OpCode.Phi
+                || i is { OpCode: OpCode.Move, Operands: [_, LocalVariable] })
+            .ToDictionary(i => (LocalVariable)i.Destination!);
+        var copyInstructions = copies.Values.ToHashSet();
+        var live = new HashSet<LocalVariable>();
+        var pending = new Stack<LocalVariable>(instructions.Where(i => !copyInstructions.Contains(i)).SelectMany(UsedLocals));
+        while (pending.TryPop(out var local))
+        {
+            if (!live.Add(local) || !copies.TryGetValue(local, out var definition))
+                continue;
+            foreach (var source in UsedLocals(definition))
+                pending.Push(source);
+        }
+        foreach (var (destination, definition) in copies)
+            if (!live.Contains(destination))
+            {
+                definition.OpCode = OpCode.Nop;
+                definition.SetOperands();
+            }
+    }
+
     private static Dictionary<LocalVariable, int> CountUses(ISILControlFlowGraph cfg)
     {
         var counts = new Dictionary<LocalVariable, int>();
@@ -149,7 +177,7 @@ public static class DeadCodeEliminator
     private static bool IsRemovable(OpCode opCode) =>
         opCode switch
         {
-            OpCode.IsInstance or OpCode.TryCast or OpCode.ZeroExtend or OpCode.Move or OpCode.Phi
+            OpCode.IsInstance or OpCode.TryCast or OpCode.ZeroExtend or OpCode.SignExtend or OpCode.Move or OpCode.Phi
                 or OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.Modulo
                 or OpCode.ShiftLeft or OpCode.ShiftRight
                 or OpCode.And or OpCode.Or or OpCode.Xor

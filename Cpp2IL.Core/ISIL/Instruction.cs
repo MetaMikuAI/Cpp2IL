@@ -116,6 +116,7 @@ public class Instruction : IOperand
             case OpCode.IsInstance:
             case OpCode.TryCast:
             case OpCode.ZeroExtend:
+            case OpCode.SignExtend:
                 if (newDestination != null)
                     SetOperand(0, newDestination);
                 return IsConstantValue(_operands[0]) ? null : _operands[0];
@@ -154,7 +155,7 @@ public class Instruction : IOperand
         {
             OpCode.Move or OpCode.ConditionalJump
                 or OpCode.ShiftStack or OpCode.Not or OpCode.Negate
-                or OpCode.Newobj or OpCode.ZeroExtend
+                or OpCode.Newobj or OpCode.ZeroExtend or OpCode.SignExtend
                 => [_operands[1]],
 
             OpCode.Switch => [_operands[0]],

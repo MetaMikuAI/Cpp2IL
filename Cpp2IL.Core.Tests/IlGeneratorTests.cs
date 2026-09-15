@@ -89,6 +89,24 @@ public class IlGeneratorTests
     [TestCase(8)]
     [TestCase(16)]
     [TestCase(32)]
+    public void SignExtend_TruncatesThenWidensSignedValue(int bits)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var result = new LocalVariable("extended", new Register(null, "extended"), app.SystemTypes.SystemInt64Type);
+        var instruction = new Instruction(0, OpCode.SignExtend, result, new Immediate(0xFFFFFFFF), new Immediate(bits));
+        var definition = GenerateSingle(instruction, result);
+        var il = definition.CilMethodBody!.Instructions;
+        var narrow = bits == 8 ? CilOpCodes.Conv_I1 : bits == 16 ? CilOpCodes.Conv_I2 : CilOpCodes.Conv_I4;
+        var position = il.ToList().FindIndex(i => i.OpCode == narrow);
+        Assert.That(position, Is.GreaterThanOrEqualTo(0));
+        Assert.That(il[position + 1].OpCode, Is.EqualTo(CilOpCodes.Conv_I8));
+        Assert.That(instruction.Destination, Is.SameAs(result));
+        Assert.That(instruction.SourcesAndConstants, Does.Contain(new Immediate(0xFFFFFFFF)));
+    }
+
+    [TestCase(8)]
+    [TestCase(16)]
+    [TestCase(32)]
     public void ZeroExtend_Emits64BitMask(int bits)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
