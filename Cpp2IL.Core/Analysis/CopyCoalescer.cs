@@ -9,12 +9,19 @@ namespace Cpp2IL.Core.Analysis;
 // Merge the copies left behind by SSA destruction.
 public static class CopyCoalescer
 {
-    public static void Run(MethodAnalysisContext method) => Run(method.ControlFlowGraph!);
+    public static void Run(MethodAnalysisContext method) => Run(method.ControlFlowGraph!,
+        new HashSet<LocalVariable>(method.ParameterLocals.Concat(method.Locals.Where(l => l.IsThis))));
 
-    public static void Run(ISILControlFlowGraph cfg)
+    public static void Run(ISILControlFlowGraph cfg) => Run(cfg, []);
+
+    private static void Run(ISILControlFlowGraph cfg, HashSet<LocalVariable> parameters)
     {
-        var copies = FindSameSlotCopies(cfg);
-        var escapedSlots = FindEscapedSlotGroups(cfg);
+        // Parameters are read with ldarg, not ldloc. Replacing their identity with
+        // a phi/local representative loses the incoming value; merging writes into
+        // them is also unsafe because local stores are not parameter stores.
+        var copies = FindSameSlotCopies(cfg).Where(c => !parameters.Contains(c.Destination) && !parameters.Contains(c.Source)).ToList();
+        var escapedSlots = FindEscapedSlotGroups(cfg).Select(g => g.Where(l => !parameters.Contains(l)).ToList())
+            .Where(g => g.Count > 1).ToList();
 
         if (copies.Count == 0 && escapedSlots.Count == 0)
             return;

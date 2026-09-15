@@ -38,6 +38,7 @@ public static class KeyFunctionRecovery
 
     public static void Run(MethodAnalysisContext method)
     {
+        ArrayElementClassRecovery.Run(method);
         var definitions = method.ControlFlowGraph!.Instructions.Where(i => i.Destination is LocalVariable)
             .GroupBy(i => (LocalVariable)i.Destination!).Where(g => g.Count() == 1).ToDictionary(g => g.Key, g => g.Single());
         foreach (var instruction in method.ControlFlowGraph!.Blocks.SelectMany(block => block.Instructions))
