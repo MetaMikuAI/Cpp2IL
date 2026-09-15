@@ -71,10 +71,10 @@ public enum OpCode
     /// <summary>Divides op 2 by op 3, and moves the remainder into op 1</summary>
     Modulo,
 
-    /// <summary>Shifts the bits of op 2 left by op 3, and moves the result into op 1</summary>
+    /// <summary>Shifts the bits of op 2 left by op 3 into op 1; optional op 4 specifies native integer width/type</summary>
     ShiftLeft,
 
-    /// <summary>Shifts the bits of op 2 right by op 3, and moves the result into op 1</summary>
+    /// <summary>Shifts the bits of op 2 right by op 3 into op 1; optional op 4 specifies native integer width/type</summary>
     ShiftRight,
 
     /// <summary>Bitwise AND on op 2 and op 3, moves the result into op 1</summary>

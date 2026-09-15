@@ -357,6 +357,32 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             return newInstruction;
         }
 
+        IOperand ShiftedLogicalOperand(int operand)
+        {
+            var source = ConvertOperand(instruction, operand);
+            var amount = operand == 1 ? instruction.Op2Imm : instruction.Op3Imm;
+            var amountKind = operand == 1 ? instruction.Op2Kind : instruction.Op3Kind;
+            if (amountKind != Arm64OperandKind.Immediate || amount == 0)
+                return source;
+            var shift = operand == 1 ? instruction.Op2ShiftType : instruction.Op3ShiftType;
+            var reg = operand == 1 ? instruction.Op1Reg : instruction.Op2Reg;
+            var wide = reg is >= Arm64Register.X0 and <= Arm64Register.X31;
+            var arithmetic = shift == Arm64ShiftType.ASR;
+            var type = wide
+                ? (arithmetic ? context.AppContext.SystemTypes.SystemInt64Type : context.AppContext.SystemTypes.SystemUInt64Type)
+                : (arithmetic ? context.AppContext.SystemTypes.SystemInt32Type : context.AppContext.SystemTypes.SystemUInt32Type);
+            var shifted = new Register(null, "TEMP_LOGICAL_SHIFT");
+            var left = shift == Arm64ShiftType.LSL;
+            Add(address, left ? OpCode.ShiftLeft : OpCode.ShiftRight, shifted, source, Imm(amount), type);
+            if (shift == Arm64ShiftType.ROR)
+            {
+                var high = new Register(null, "TEMP_LOGICAL_ROTATE");
+                Add(address, OpCode.ShiftLeft, high, source, Imm((wide ? 64 : 32) - amount), type);
+                Add(address, OpCode.Or, shifted, shifted, high);
+            }
+            return shifted;
+        }
+
         Register VectorLane(Arm64Register register, int lane) =>
             new(null, $"{NormalizeRegister(register)}.S{lane}");
 
@@ -780,7 +806,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     break;
                 }
             case Arm64Mnemonic.MVN:
-                Add(address, OpCode.Not, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                Add(address, OpCode.Not, ConvertOperand(instruction, 0), ShiftedLogicalOperand(1));
                 break;
             case Arm64Mnemonic.ADR:
                 Add(address, OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
@@ -938,15 +964,16 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     // a discarded result means this is only about the flags
                     var dest = IsReg31(instruction.Op0Reg) ? new Register(null, "TEMP") : ConvertOperand(instruction, 0);
 
+                    // SUBS may overwrite either input register. Capture comparison flags
+                    // before the destination write, while both sources still hold their old values.
+                    var aliasesInput = dest.Equals(src1) || dest.Equals(src2);
+                    if (setsFlags && isSubtract && aliasesInput)
+                        EmitCompareFlags(src1, src2);
                     Add(address, isSubtract ? OpCode.Subtract : OpCode.Add, dest, src1, src2);
-
-                    if (setsFlags)
-                    {
-                        if (isSubtract)
-                            EmitCompareFlags(src1, src2);
-                        else
-                            EmitResultFlags(dest);
-                    }
+                    if (setsFlags && isSubtract && !aliasesInput)
+                        EmitCompareFlags(src1, src2);
+                    else if (setsFlags && !isSubtract)
+                        EmitResultFlags(dest);
 
                     break;
                 }
@@ -972,7 +999,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.TST:
                 {
                     var temp = new Register(null, "TEMP");
-                    Add(address, OpCode.And, temp, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                    Add(address, OpCode.And, temp, ConvertOperand(instruction, 0), ShiftedLogicalOperand(1));
                     EmitResultFlags(temp);
                     break;
                 }
@@ -989,7 +1016,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     };
 
                     var dest = IsReg31(instruction.Op0Reg) ? new Register(null, "TEMP") : ConvertOperand(instruction, 0);
-                    Add(address, opCode, dest, ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                    Add(address, opCode, dest, ConvertOperand(instruction, 1), ShiftedLogicalOperand(2));
 
                     if (instruction.Mnemonic == Arm64Mnemonic.ANDS)
                         EmitResultFlags(dest);
@@ -1002,7 +1029,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.EON:
                 {
                     var temp = new Register(null, "TEMP");
-                    Add(address, OpCode.Not, temp, ConvertOperand(instruction, 2));
+                    Add(address, OpCode.Not, temp, ShiftedLogicalOperand(2));
                     var opCode = instruction.Mnemonic switch
                     {
                         Arm64Mnemonic.ORN => OpCode.Or,

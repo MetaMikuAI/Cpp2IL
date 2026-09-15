@@ -21,6 +21,11 @@ public static class ConstantFolder
 
     private static bool TryFold(Instruction instruction)
     {
+        // A typed native shift also converts/truncates its input. Even a zero shift
+        // cannot become a plain move without losing that conversion.
+        if (instruction is { OpCode: OpCode.ShiftLeft or OpCode.ShiftRight, Operands.Count: 4 })
+            return false;
+
         // Unary constant folds.
         if (instruction is { OpCode: OpCode.Not, Operands: [_, Immediate n] })
             return ToConstant(instruction, ~n.Value);

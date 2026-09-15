@@ -169,6 +169,27 @@ public class IlGeneratorTests
         Assert.That(il.Any(i => i.OpCode == CilOpCodes.Not), Is.EqualTo(!boolean));
     }
 
+    [TestCase(false, false)]
+    [TestCase(false, true)]
+    [TestCase(true, false)]
+    [TestCase(true, true)]
+    public void NativeShift_UsesExplicitWidthAndSignedness(bool wide, bool signed)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var type = wide ? (signed ? app.SystemTypes.SystemInt64Type : app.SystemTypes.SystemUInt64Type)
+            : (signed ? app.SystemTypes.SystemInt32Type : app.SystemTypes.SystemUInt32Type);
+        var result = new LocalVariable("shifted", new Register(null, "shifted"), type);
+        var instruction = new Instruction(0, OpCode.ShiftRight, result, new Immediate(0x80000000L), new Immediate(31), type);
+        var definition = GenerateSingle(instruction, result);
+        var il = definition.CilMethodBody!.Instructions;
+        Assert.That(il.Any(i => i.OpCode == (wide ? (signed ? CilOpCodes.Conv_I8 : CilOpCodes.Conv_U8)
+            : (signed ? CilOpCodes.Conv_I4 : CilOpCodes.Conv_U4))), Is.True);
+        Assert.That(il.Any(i => i.OpCode == (signed ? CilOpCodes.Shr : CilOpCodes.Shr_Un)), Is.True);
+        var cfg = new ISILControlFlowGraph([instruction]);
+        Assert.That(Cpp2IL.Core.Analysis.ConstantFolder.Run(cfg), Is.False);
+        Assert.That(instruction.OpCode, Is.EqualTo(OpCode.ShiftRight));
+    }
+
     private static MethodDefinition GenerateSingle(Instruction instruction, LocalVariable result)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
@@ -179,7 +200,7 @@ public class IlGeneratorTests
             Locals = [result], ParameterLocals = [], AnalysisWarnings = []
         };
         var module = new ModuleDefinition("Test.dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
-        foreach (var context in new[] { app.SystemTypes.SystemBooleanType, app.SystemTypes.SystemUInt64Type, app.SystemTypes.SystemStringType, app.SystemTypes.SystemObjectType })
+        foreach (var context in new[] { app.SystemTypes.SystemBooleanType, app.SystemTypes.SystemUInt64Type, app.SystemTypes.SystemStringType, app.SystemTypes.SystemObjectType, app.SystemTypes.SystemInt32Type, app.SystemTypes.SystemUInt32Type, app.SystemTypes.SystemInt64Type })
         {
             var placeholder = new TypeDefinition(context.Namespace, context.Name, TypeAttributes.Public);
             module.TopLevelTypes.Add(placeholder);
@@ -188,7 +209,15 @@ public class IlGeneratorTests
         var type = new TypeDefinition("Tests", "Recovery", TypeAttributes.Public);
         module.TopLevelTypes.Add(type);
         var definition = new MethodDefinition("Caller", MethodAttributes.Public | MethodAttributes.Static,
-            MethodSignature.CreateStatic(result.Type == app.SystemTypes.SystemBooleanType ? module.CorLibTypeFactory.Boolean : instruction.OpCode == OpCode.TryCast ? module.CorLibTypeFactory.String : module.CorLibTypeFactory.UInt64));
+            MethodSignature.CreateStatic(result.Type!.FullName switch
+            {
+                "System.Boolean" => module.CorLibTypeFactory.Boolean,
+                "System.String" => module.CorLibTypeFactory.String,
+                "System.Int32" => module.CorLibTypeFactory.Int32,
+                "System.UInt32" => module.CorLibTypeFactory.UInt32,
+                "System.Int64" => module.CorLibTypeFactory.Int64,
+                _ => module.CorLibTypeFactory.UInt64
+            }));
         type.Methods.Add(definition);
         IlGenerator.GenerateIl(caller, definition);
         return definition;

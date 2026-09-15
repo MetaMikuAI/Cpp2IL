@@ -238,8 +238,13 @@ public static class LocalVariables
         SeedNewobjResults(method);
         SeedMethodInfoTypes(method);
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
             if (instruction is { OpCode: OpCode.ZeroExtend, Destination: LocalVariable extended })
                 extended.Type = method.AppContext.SystemTypes.SystemUInt64Type;
+            if (instruction is { OpCode: OpCode.ShiftLeft or OpCode.ShiftRight,
+                Operands: [LocalVariable shifted, _, _, TypeAnalysisContext shiftType] })
+                shifted.Type = shiftType;
+        }
 
         SeedComparisonResults(method);
         SeedFloatLiterals(method);

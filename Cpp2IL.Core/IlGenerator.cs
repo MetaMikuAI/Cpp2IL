@@ -814,10 +814,21 @@ public static class IlGenerator
                 // Float arithmetic on a promoted integer operand needs an explicit conversion, so both
                 // operands are coerced to the (float) result type. A no-op when they already match.
                 var floatConversion = FloatArithmeticConversion(instruction);
+                var shiftType = instruction is { OpCode: OpCode.ShiftLeft or OpCode.ShiftRight,
+                    Operands: [_, _, _, TypeAnalysisContext explicitType] } ? explicitType.FullName : null;
 
                 LoadOperand(instruction.Operands[1], method, locals, writeLine);
                 if (floatConversion is { } conv1)
                     instructions.Add(conv1);
+                if (shiftType != null)
+                    instructions.Add(shiftType switch
+                    {
+                        "System.Int32" => CilOpCodes.Conv_I4,
+                        "System.UInt32" => CilOpCodes.Conv_U4,
+                        "System.Int64" => CilOpCodes.Conv_I8,
+                        "System.UInt64" => CilOpCodes.Conv_U8,
+                        _ => throw new InvalidOperationException($"Invalid native shift type: {shiftType}")
+                    });
                 LoadOperand(instruction.Operands[2], method, locals, writeLine);
                 if (floatConversion is { } conv2)
                     instructions.Add(conv2);
@@ -859,7 +870,9 @@ public static class IlGenerator
 
                     case OpCode.ShiftLeft: instructions.Add(CilOpCodes.Shl); break;
                     case OpCode.ShiftRight:
-                        instructions.Add(IsUnsignedOperation(instruction) ? CilOpCodes.Shr_Un : CilOpCodes.Shr);
+                        instructions.Add((shiftType != null
+                            ? shiftType is "System.UInt32" or "System.UInt64"
+                            : IsUnsignedOperation(instruction)) ? CilOpCodes.Shr_Un : CilOpCodes.Shr);
                         break;
 
                     case OpCode.And: instructions.Add(CilOpCodes.And); break;
