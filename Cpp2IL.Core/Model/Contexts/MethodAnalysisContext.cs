@@ -433,6 +433,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         InternalCallGuardRemover.Run(this);
         KeyFunctionRecovery.Run(this);
 
+        ArrayRecovery.RecoverSplitAccesses(this);
+
         SsaForm.Remove(this);
 
         // Phi removal leaves a copy per merged version, most of which can share one local

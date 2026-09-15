@@ -29,6 +29,138 @@ public static class ArrayRecovery
         GroupInitialisers(method.ControlFlowGraph!);
     }
 
+    // Run before phi removal: a strength-reduced byte offset can only be related
+    // to an element counter while their incoming CFG edges are still explicit.
+    public static void RecoverSplitAccesses(MethodAnalysisContext method)
+    {
+        var cfg = method.ControlFlowGraph!;
+        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+        var definitions = SingleDefinitions(cfg);
+        var peers = new Dictionary<LocalVariable, List<Instruction>>();
+        foreach (var block in cfg.Blocks)
+        {
+            var phis = block.Instructions.Where(i => i.OpCode == OpCode.Phi).ToList();
+            foreach (var phi in phis)
+                if (phi.Destination is LocalVariable local)
+                    peers[local] = phis;
+        }
+
+        foreach (var instruction in cfg.Instructions)
+        {
+            for (var i = 0; i < instruction.Operands.Count; i++)
+            {
+                if (instruction.Operands[i] is not MemoryOperand memory
+                    || ResolveArrayAddress(memory.Base, definitions, 0) is not { } address)
+                    continue;
+                var stride = ElementSize(((SzArrayTypeAnalysisContext)address.Array.Type!).ElementType, pointerSize);
+                if (stride == 0)
+                    continue;
+                var offset = Sum(address.Offset, new Affine(null, 0, memory.Addend));
+                if (memory.Index != null)
+                    offset = Sum(offset, ScaleBy(Evaluate(memory.Index, definitions, 0, false), Math.Max(memory.Scale, 1)));
+                if (offset is not { } affine || affine.Root != null && !IsNativeIndex(affine.Root))
+                    continue;
+
+                IOperand? index = null;
+                var header = ElementsOffset(pointerSize);
+                if (affine.Root == null && affine.Offset >= header && (affine.Offset - header) % stride == 0)
+                    index = new Immediate((affine.Offset - header) / stride);
+                else if (affine.Root != null && affine.Multiplier == stride && affine.Offset == header)
+                    index = affine.Root;
+                else if (affine.Root != null && peers.TryGetValue(affine.Root, out var phis))
+                    foreach (var phi in phis)
+                        if (phi.Destination is LocalVariable candidate && candidate != affine.Root
+                            && MatchesInductionIndex(affine, candidate, stride, header, definitions))
+                        {
+                            index = candidate;
+                            break;
+                        }
+                if (index == null || index is LocalVariable typedIndex && !IsNativeIndex(typedIndex))
+                    continue;
+                if (affine.Root != null)
+                    TypeIndex(affine.Root, method, definitions, new HashSet<LocalVariable>());
+                if (index is LocalVariable indexLocal)
+                    TypeIndex(indexLocal, method, definitions, new HashSet<LocalVariable>());
+                instruction.SetOperand(i, new ArrayAccess(address.Array, index));
+                if (i == 1 && instruction.OpCode == OpCode.Move && instruction.Destination is LocalVariable destination)
+                    destination.Type ??= ((SzArrayTypeAnalysisContext)address.Array.Type!).ElementType;
+            }
+        }
+    }
+
+    private static (LocalVariable Array, Affine Offset)? ResolveArrayAddress(IOperand? operand,
+        Dictionary<LocalVariable, Instruction?> definitions, int depth)
+    {
+        if (depth > 8 || operand is not LocalVariable local)
+            return null;
+        if (local.Type is SzArrayTypeAnalysisContext)
+            return (local, new Affine(null, 0, 0));
+        if (!definitions.TryGetValue(local, out var definition))
+            return null;
+        if (definition is { OpCode: OpCode.Move, Operands: [_, LocalVariable source] })
+            return ResolveArrayAddress(source, definitions, depth + 1);
+        if (definition is not { OpCode: OpCode.Add, Operands: [_, var left, var right] })
+            return null;
+        if (ResolveArrayAddress(left, definitions, depth + 1) is { } lhs
+            && Sum(lhs.Offset, Evaluate(right, definitions, depth + 1, false)) is { } leftOffset)
+            return (lhs.Array, leftOffset);
+        if (ResolveArrayAddress(right, definitions, depth + 1) is { } rhs
+            && Sum(rhs.Offset, Evaluate(left, definitions, depth + 1, false)) is { } rightOffset)
+            return (rhs.Array, rightOffset);
+        return null;
+    }
+
+    private static bool MatchesInductionIndex(Affine address, LocalVariable index, long stride, long header,
+        Dictionary<LocalVariable, Instruction?> definitions)
+    {
+        if (!definitions.TryGetValue(address.Root!, out var offsetPhi) || offsetPhi?.OpCode != OpCode.Phi
+            || !definitions.TryGetValue(index, out var indexPhi) || indexPhi?.OpCode != OpCode.Phi
+            || offsetPhi.Operands.Count != indexPhi.Operands.Count)
+            return false;
+        var hasInitialValue = false;
+        var hasRecurrence = false;
+        for (var i = 1; i < offsetPhi.Operands.Count; i++)
+        {
+            var offsetInput = Evaluate(offsetPhi.Operands[i], definitions, 0, false);
+            var indexInput = Evaluate(indexPhi.Operands[i], definitions, 0, false);
+            if (offsetInput is not { } offset || indexInput is not { } element)
+                return false;
+            if (offset.Root == null && element.Root == null)
+            {
+                if (offset.Offset * address.Multiplier + address.Offset != element.Offset * stride + header)
+                    return false;
+                hasInitialValue = true;
+            }
+            else if (offset.Root == address.Root && element.Root == index
+                && offset.Multiplier == 1 && element.Multiplier == 1
+                && offset.Offset * address.Multiplier == element.Offset * stride)
+                hasRecurrence = true;
+            else
+                return false;
+        }
+        return hasInitialValue && hasRecurrence;
+    }
+
+    private static bool IsNativeIndex(LocalVariable local) => local.Type == null
+        || local.Type.FullName is "System.Int32" or "System.UInt32" or "System.IntPtr" or "System.UIntPtr";
+
+    // Array indices and proven byte counters are native integers, not object references.
+    // Follow only copies, phis and constant increments; never infer a pointer's pointee type.
+    private static void TypeIndex(LocalVariable local, MethodAnalysisContext method,
+        Dictionary<LocalVariable, Instruction?> definitions, HashSet<LocalVariable> seen)
+    {
+        if (!seen.Add(local) || local.Type != null)
+            return;
+        local.Type = method.AppContext.SystemTypes.SystemIntPtrType;
+        if (!definitions.TryGetValue(local, out var definition) || definition == null)
+            return;
+        if (definition.OpCode is OpCode.Move or OpCode.Phi
+            || definition is { OpCode: OpCode.Add, Operands: [_, _, Immediate] })
+            foreach (var operand in definition.Sources)
+                if (operand is LocalVariable source)
+                    TypeIndex(source, method, definitions, seen);
+    }
+
     private static void RecoverAccesses(MethodAnalysisContext method)
     {
         var pointerSize = method.AppContext.Binary.PointerSizeBytes;
@@ -286,7 +418,7 @@ public static class ArrayRecovery
     // value = Multiplier * Root + Offset (a null Root means it's just a constant)
     private readonly record struct Affine(LocalVariable? Root, long Multiplier, long Offset);
 
-    private static Affine? Evaluate(IOperand operand, Dictionary<LocalVariable, Instruction?> definitions, int depth)
+    private static Affine? Evaluate(IOperand operand, Dictionary<LocalVariable, Instruction?> definitions, int depth, bool allowLea = true)
     {
         if (depth > 8)
             return null;
@@ -303,11 +435,11 @@ public static class ArrayRecovery
 
                 return definition switch
                 {
-                    { OpCode: OpCode.Move, Operands: [_, MemoryOperand lea] } => EvaluateLea(lea, definitions, depth + 1),
-                    { OpCode: OpCode.Move, Operands: [_, var source] } => Evaluate(source, definitions, depth + 1),
-                    { OpCode: OpCode.Add, Operands: [_, var left, var right] } => Sum(Evaluate(left, definitions, depth + 1), Evaluate(right, definitions, depth + 1)),
-                    { OpCode: OpCode.ShiftLeft, Operands: [_, var left, Immediate { Value: >= 0 and < 32 } shift] } => ScaleBy(Evaluate(left, definitions, depth + 1), 1L << (int)shift.Value),
-                    { OpCode: OpCode.Multiply, Operands: [_, var left, Immediate factor] } => ScaleBy(Evaluate(left, definitions, depth + 1), factor.Value),
+                    { OpCode: OpCode.Move, Operands: [_, MemoryOperand lea] } => allowLea ? EvaluateLea(lea, definitions, depth + 1) : new Affine(local, 1, 0),
+                    { OpCode: OpCode.Move, Operands: [_, var source] } => Evaluate(source, definitions, depth + 1, allowLea),
+                    { OpCode: OpCode.Add, Operands: [_, var left, var right] } => Sum(Evaluate(left, definitions, depth + 1, allowLea), Evaluate(right, definitions, depth + 1, allowLea)),
+                    { OpCode: OpCode.ShiftLeft, Operands: [_, var left, Immediate { Value: >= 0 and < 32 } shift] } => ScaleBy(Evaluate(left, definitions, depth + 1, allowLea), 1L << (int)shift.Value),
+                    { OpCode: OpCode.Multiply, Operands: [_, var left, Immediate factor] } => ScaleBy(Evaluate(left, definitions, depth + 1, allowLea), factor.Value),
                     _ => new Affine(local, 1, 0)
                 };
             }
