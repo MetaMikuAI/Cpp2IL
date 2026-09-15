@@ -1207,7 +1207,8 @@ public static class IlGenerator
     }
 
     private static bool IsBoolean(IOperand operand, MethodAnalysisContext context) =>
-        operand is LocalVariable { Type: { } type } && type == context.AppContext.SystemTypes.SystemBooleanType;
+        // Copy propagation can replace boolean locals with fields or array elements.
+        DestinationType(operand) == context.AppContext.SystemTypes.SystemBooleanType;
 
     private static bool IsZeroConstant(IOperand operand) => operand is Immediate { Value: 0 };
     

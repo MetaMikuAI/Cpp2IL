@@ -127,6 +127,48 @@ public class IlGeneratorTests
         Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldc_I4_0), Is.False);
     }
 
+    [TestCase(false, false)]
+    [TestCase(false, true)]
+    [TestCase(true, false)]
+    [TestCase(true, true)]
+    public void Not_UsesFieldTypeAfterInlining(bool boolean, bool isStatic)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var fieldType = boolean ? app.SystemTypes.SystemBooleanType : app.SystemTypes.SystemUInt64Type;
+        var receiver = new LocalVariable("receiver", new Register(null, "receiver"), app.SystemTypes.SystemObjectType);
+        var attributes = System.Reflection.FieldAttributes.Public
+            | (isStatic ? System.Reflection.FieldAttributes.Static : 0);
+        var field = new InjectedFieldAnalysisContext("Value", fieldType, attributes, app.SystemTypes.SystemObjectType);
+        var module = new ModuleDefinition("Fields.dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        var owner = new TypeDefinition("Tests", "Fields", TypeAttributes.Public);
+        module.TopLevelTypes.Add(owner);
+        var definition = new FieldDefinition("Value", (FieldAttributes)attributes,
+            new FieldSignature(boolean ? module.CorLibTypeFactory.Boolean : module.CorLibTypeFactory.UInt64));
+        owner.Fields.Add(definition);
+        field.PutExtraData("AsmResolverField", definition);
+        var result = new LocalVariable("result", new Register(null, "result"), fieldType);
+        var method = GenerateSingle(new Instruction(0, OpCode.Not, result, new FieldReference(field, receiver, 0)), result);
+        var il = method.CilMethodBody!.Instructions;
+        Assert.That(il.Any(i => i.OpCode == (isStatic ? CilOpCodes.Ldsfld : CilOpCodes.Ldfld)), Is.True);
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ceq), Is.EqualTo(boolean));
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Not), Is.EqualTo(!boolean));
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
+    public void Not_UsesArrayElementTypeAfterInlining(bool boolean)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var elementType = boolean ? app.SystemTypes.SystemBooleanType : app.SystemTypes.SystemUInt64Type;
+        var array = new LocalVariable("array", new Register(null, "array"), new SzArrayTypeAnalysisContext(elementType));
+        var result = new LocalVariable("result", new Register(null, "result"), elementType);
+        var method = GenerateSingle(new Instruction(0, OpCode.Not, result, new ArrayAccess(array, new Immediate(0))), result);
+        var il = method.CilMethodBody!.Instructions;
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldelem), Is.True);
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ceq), Is.EqualTo(boolean));
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Not), Is.EqualTo(!boolean));
+    }
+
     private static MethodDefinition GenerateSingle(Instruction instruction, LocalVariable result)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
@@ -137,7 +179,7 @@ public class IlGeneratorTests
             Locals = [result], ParameterLocals = [], AnalysisWarnings = []
         };
         var module = new ModuleDefinition("Test.dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
-        foreach (var context in new[] { app.SystemTypes.SystemBooleanType, app.SystemTypes.SystemUInt64Type, app.SystemTypes.SystemStringType })
+        foreach (var context in new[] { app.SystemTypes.SystemBooleanType, app.SystemTypes.SystemUInt64Type, app.SystemTypes.SystemStringType, app.SystemTypes.SystemObjectType })
         {
             var placeholder = new TypeDefinition(context.Namespace, context.Name, TypeAttributes.Public);
             module.TopLevelTypes.Add(placeholder);
@@ -146,7 +188,7 @@ public class IlGeneratorTests
         var type = new TypeDefinition("Tests", "Recovery", TypeAttributes.Public);
         module.TopLevelTypes.Add(type);
         var definition = new MethodDefinition("Caller", MethodAttributes.Public | MethodAttributes.Static,
-            MethodSignature.CreateStatic(instruction.OpCode == OpCode.IsInstance ? module.CorLibTypeFactory.Boolean : instruction.OpCode == OpCode.TryCast ? module.CorLibTypeFactory.String : module.CorLibTypeFactory.UInt64));
+            MethodSignature.CreateStatic(result.Type == app.SystemTypes.SystemBooleanType ? module.CorLibTypeFactory.Boolean : instruction.OpCode == OpCode.TryCast ? module.CorLibTypeFactory.String : module.CorLibTypeFactory.UInt64));
         type.Methods.Add(definition);
         IlGenerator.GenerateIl(caller, definition);
         return definition;
