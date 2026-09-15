@@ -33,7 +33,7 @@ public static class InterfaceDispatchRecovery
             }
         }
 
-        var changed = false;
+        var matches = new List<Match>();
 
         foreach (var block in cfg.Blocks.ToList())
         {
@@ -49,16 +49,19 @@ public static class InterfaceDispatchRecovery
                 // The matched native helper takes only obj, interface and slot.
                 while (match.SlowCall.Operands.Count > 5)
                     match.SlowCall.RemoveOperandAt(match.SlowCall.Operands.Count - 1);
-                CallArgumentTrimmer.Run(method, preserveGenericMetadata: true);
-                DeadCodeEliminator.RemoveDeadCopyCycles(cfg);
-                DeadCodeEliminator.Run(method);
-                TryExciseLookup(cfg, match, definitions, homeBlock);
-                changed = true;
+                matches.Add(match);
             }
         }
 
-        if (changed)
-            DeadCodeEliminator.Run(method);
+        if (matches.Count == 0) return;
+        // Later dispatches can retain earlier lookup values in guessed argument registers.
+        // Rewrite them all before testing whether any lookup region is dead.
+        CallArgumentTrimmer.Run(method, preserveGenericMetadata: true);
+        DeadCodeEliminator.RemoveDeadCopyCycles(cfg);
+        DeadCodeEliminator.Run(method);
+        foreach (var match in matches)
+            TryExciseLookup(cfg, match, definitions, homeBlock);
+        DeadCodeEliminator.Run(method);
     }
 
     private const long VTableOffset = 0x138;

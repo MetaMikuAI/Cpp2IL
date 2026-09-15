@@ -394,6 +394,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         // Resolve KeyFunctionAddress calls, then collect what removing the write barriers left dead.
         KeyFunctionRecovery.Run(this);
+        ThrowControlFlowRecovery.Run(ControlFlowGraph);
         DeadCodeEliminator.Run(this);
 
         // Delete any il2cpp_codegen_initialize_runtime_metadata/il2cpp_codegen_initialize_method
