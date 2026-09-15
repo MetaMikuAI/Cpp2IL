@@ -238,6 +238,17 @@ public static class MetadataResolver
                 // offsets, so compute their instantiated layout and retain the concrete owner for
                 // field type substitution (e.g. ResourcePool<AreaObjectCharacter>.resources).
                 FieldAnalysisContext? field = null;
+                if (staticOwner is GenericInstanceTypeAnalysisContext staticGeneric)
+                {
+                    // Instantiations do not populate Fields. Generic definitions can report
+                    // every offset as zero, so only a sole stored static field is unambiguous
+                    // without computing the instantiated static layout.
+                    var storedFields = staticGeneric.GenericType.Fields.Where(f => f.IsStatic
+                        && (f.Attributes & FieldAttributes.Literal) == 0).ToList();
+                    if (storedFields.Count != 1 || fieldOffset != 0 || storedFields[0].Offset != 0)
+                        continue;
+                    field = storedFields[0];
+                }
                 for (var candidateOwner = owner; candidateOwner != null && field == null; candidateOwner = candidateOwner.BaseType)
                 {
                     if (staticOwner == null && candidateOwner is GenericInstanceTypeAnalysisContext candidateGeneric)
