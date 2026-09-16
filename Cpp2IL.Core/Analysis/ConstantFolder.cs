@@ -1,6 +1,8 @@
+using System.Linq;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
+using LibCpp2IL.BinaryStructures;
 
 namespace Cpp2IL.Core.Analysis;
 
@@ -21,6 +23,18 @@ public static class ConstantFolder
 
     private static bool TryFold(Instruction instruction)
     {
+        // A join of the same constant (including an invariant self back-edge)
+        // is a constant too. Leave nonconstant aliases and self-only cycles alone.
+        if (instruction is { OpCode: OpCode.Phi, Operands: [LocalVariable destination, ..] })
+        {
+            // Aggregate zero is default(T), not a scalar literal. Keep its typed
+            // phi so lowering can initialize the value-type local with initobj.
+            if (destination.Type is { IsValueType: true, Type: Il2CppTypeEnum.IL2CPP_TYPE_VALUETYPE or Il2CppTypeEnum.IL2CPP_TYPE_GENERICINST })
+                return false;
+            var values = instruction.Operands.Skip(1).Where(v => !Equals(v, destination)).Distinct().ToArray();
+            return values is [Immediate] && ToMove(instruction, values[0]);
+        }
+
         // A typed native shift also converts/truncates its input. Even a zero shift
         // cannot become a plain move without losing that conversion.
         if (instruction is { OpCode: OpCode.ShiftLeft or OpCode.ShiftRight, Operands.Count: 4 })

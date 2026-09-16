@@ -428,8 +428,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // make joins explicit, so forwarding a value is an unconditional global substitution.
         SsaSimplifier.Run(this);
 
-        // Folding a constant exposes more to propagate
-        for (var i = 0; i < 8 && ConstantFolder.Run(this); i++)
+        // Removing constant edges exposes trivial phis, which in turn expose constants.
+        // Both folds are monotonic; keep phi/predecessor alignment until SSA destruction.
+        while (ConstantFolder.Run(this) | ConstantBranchFolder.PruneSsa(ControlFlowGraph!))
             SsaSimplifier.Run(this);
 
         InternalCallGuardRemover.Run(this);
