@@ -52,47 +52,87 @@ public class StackAnalyzer
         graph.RemoveEmptyBlocks();
     }
 
-    // consider mov [reg], [stack pointer]
-    // now we need to handle [reg] as if it were a stack pointer, forever.
+    // Track proven prologue frame addresses through the CFG. A restore at the end
+    // of a method must kill the alias there, not invalidate earlier accesses globally.
     private void ResolveFrameAliases(ISILControlFlowGraph graph)
     {
-        var aliases = new Dictionary<string, int>();
-
-        foreach (var instruction in graph.EntryBlock.Successors.SelectMany(b => b.Instructions))
-        {
-            if (instruction is { OpCode: OpCode.Move, Operands: [Register destination, Register { Name: "rsp" }] }
-                && _instructionState.TryGetValue(instruction, out var atCopy))
-                aliases[destination.Name] = atCopy.Size;
-        }
-
-        if (aliases.Count == 0)
-            return;
-
-        // Following a register that gets reassigned would need flow analysis, so stop trusting it entirely
-        foreach (var instruction in graph.Instructions)
-        {
-            if (instruction is { OpCode: OpCode.Move, Operands: [Register, Register { Name: "rsp" }] })
-                continue;
-
-            if (instruction.Destination is Register written)
-                aliases.Remove(written.Name);
-        }
-
-        foreach (var instruction in graph.Instructions)
-        {
-            if (!_instructionState.TryGetValue(instruction, out var state))
-                continue;
-
-            for (var i = 0; i < instruction.Operands.Count; i++)
+        var seeds = new Dictionary<Instruction, int>();
+        foreach (var block in graph.EntryBlock.Successors)
+            foreach (var instruction in block.Instructions)
             {
-                if (instruction.Operands[i] is not MemoryOperand { Index: null, Scale: 0, Base: Register frameBase } memory)
-                    continue;
-
-                if (!aliases.TryGetValue(frameBase.Name, out var frameOffset))
-                    continue;
-
-                instruction.SetOperand(i, new StackOffset((int)(frameOffset + memory.Addend - state.Size)));
+                // After a dynamic stack-pointer assignment its absolute offset is unknown.
+                if (instruction.Destination is Register { Name: "rsp" or "sp" or "X31" }) break;
+                if (!_instructionState.TryGetValue(instruction, out var state)) continue;
+                // An arbitrary stack-local address may point into an aggregate. Keep it
+                // for typed field recovery rather than flattening it into scalar slots.
+                if (instruction is { OpCode: OpCode.Move, Operands: [Register { Name: "X29" or "rbp" or "ebp" }, AddressOf { Target: StackOffset slot }] })
+                {
+                    var absoluteOffset = (long)state.Size + slot.Offset;
+                    if (absoluteOffset is >= int.MinValue and <= int.MaxValue) seeds[instruction] = (int)absoluteOffset;
+                }
+                else if (instruction is { OpCode: OpCode.Move, Operands: [Register, Register { Name: "rsp" }] })
+                    seeds[instruction] = state.Size;
             }
+        if (seeds.Count == 0) return;
+
+        var outgoing = new Dictionary<Block, Dictionary<string, int>>();
+        var pending = new Queue<Block>();
+        pending.Enqueue(graph.EntryBlock);
+        while (pending.TryDequeue(out var block))
+        {
+            var aliases = Incoming(block);
+            foreach (var instruction in block.Instructions) Transfer(instruction, aliases);
+            if (outgoing.TryGetValue(block, out var previous) && previous.Count == aliases.Count
+                && previous.All(p => aliases.TryGetValue(p.Key, out var value) && value == p.Value)) continue;
+            outgoing[block] = aliases;
+            foreach (var successor in block.Successors) pending.Enqueue(successor);
+        }
+
+        // Rewrite only after convergence: a later back-edge can invalidate a frame alias.
+        foreach (var block in graph.Blocks)
+        {
+            var aliases = Incoming(block);
+            foreach (var instruction in block.Instructions)
+            {
+                if (!_instructionState.TryGetValue(instruction, out var state)) continue;
+                for (var i = 0; i < instruction.Operands.Count; i++)
+                {
+                    if (instruction.Operands[i] is not MemoryOperand { Index: null, Scale: 0, Base: Register frame } memory
+                        || !aliases.TryGetValue(frame.Name, out var absoluteOffset)
+                        || memory.Addend is < int.MinValue or > int.MaxValue) continue;
+                    var relativeOffset = (long)absoluteOffset + memory.Addend - state.Size;
+                    if (relativeOffset is >= int.MinValue and <= int.MaxValue)
+                        instruction.SetOperand(i, new StackOffset((int)relativeOffset));
+                }
+                Transfer(instruction, aliases);
+            }
+        }
+
+        Dictionary<string, int> Incoming(Block block)
+        {
+            Dictionary<string, int>? result = null;
+            foreach (var predecessor in block.Predecessors)
+            {
+                // An unvisited predecessor is initially unknown; revisit when it arrives.
+                if (!outgoing.TryGetValue(predecessor, out var state)) continue;
+                if (result == null) result = new(state);
+                else foreach (var key in result.Keys.ToList())
+                    if (!state.TryGetValue(key, out var value) || value != result[key]) result.Remove(key);
+            }
+            return result ?? new();
+        }
+
+        void Transfer(Instruction instruction, Dictionary<string, int> aliases)
+        {
+            int? offset = seeds.TryGetValue(instruction, out var seed) ? seed : null;
+            if (instruction is { OpCode: OpCode.Move, Operands: [Register, Register source] }
+                && aliases.TryGetValue(source.Name, out var copied)) offset = copied;
+            if (instruction.Destination is Register destination)
+            {
+                aliases.Remove(destination.Name);
+                if (offset.HasValue) aliases[destination.Name] = offset.Value;
+            }
+            if (instruction.ImplicitDefinition is { } implicitDefinition) aliases.Remove(implicitDefinition.Name);
         }
     }
 
