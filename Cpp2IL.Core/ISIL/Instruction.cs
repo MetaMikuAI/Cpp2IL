@@ -10,6 +10,8 @@ namespace Cpp2IL.Core.ISIL;
 public class Instruction : IOperand
 {
     public int Index;
+    // Origin PC survives CFG/SSA transformations; zero denotes a synthetic instruction.
+    public ulong NativeAddress;
 
     public OpCode OpCode
     {

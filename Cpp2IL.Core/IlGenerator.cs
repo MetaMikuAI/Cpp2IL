@@ -137,6 +137,8 @@ public static class IlGenerator
         body.Instructions.Add(CilOpCodes.Ldstr, "-------------------------------------------------------------------------");
         body.Instructions.Add(CilOpCodes.Call, _importer!.ImportMethod(_writeLine!)); */
 
+        var usingRecovery = UsingRecovery.Prepare(context);
+
         // Generate IL
         Dictionary<Instruction, List<CilInstruction>> instructionMap = [];
         Dictionary<Block, CilInstruction> blockEntryMap = [];
@@ -243,6 +245,7 @@ public static class IlGenerator
             instructions.Add(CilOpCodes.Call, writeLine);
         }
 
+        usingRecovery?.Apply(definition, instructionMap);
         NormalizeDelegateConstruction(definition);
         NormalizeLinqGenericInstantiations(definition);
         NormalizeLambdaNullChecks(definition);
@@ -925,7 +928,7 @@ public static class IlGenerator
     private static int ConstructorReceiverIndex(Instruction constructorCall) => constructorCall.OpCode == OpCode.CallVoid ? 1 : 2;
 
     // Try find the follow up CallVoid for a constructor, after a Newobj.
-    private static Instruction? FindConstructorCall(MethodAnalysisContext context, Instruction newobj)
+    internal static Instruction? FindConstructorCall(MethodAnalysisContext context, Instruction newobj)
     {
         var newObject = newobj.Operands[0];
 

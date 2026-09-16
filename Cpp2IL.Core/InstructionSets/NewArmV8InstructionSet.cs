@@ -281,6 +281,9 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         foreach (var instruction in insns)
             ConvertInstructionStatement(instruction, instructions, addresses, context, twoSLaneRegisters);
 
+        for (var i = 0; i < addresses.Count; i++)
+            instructions[i].NativeAddress = addresses[i];
+
         // Add return if the function doesn't end with one already
         if (instructions.Count > 0 && instructions[^1].OpCode != OpCode.Return)
         {

@@ -9,6 +9,9 @@ namespace LibCpp2IL.Elf;
 public abstract class ElfStyleRelocationsBinary(Stream input) : Il2CppBinary(input)
 {
     protected readonly List<(ulong start, ulong end)> relocationBlocks = [];
+    private readonly Dictionary<ulong, string> _importSlots = [];
+    public string? GetImportNameAtSlot(ulong address) => _importSlots.GetValueOrDefault(address);
+
 
     protected void ApplyRelocations(IDictionary<ElfDynamicType, ulong> dynamicEntries, ulong loadBias, ElfMachine machine)
     {
@@ -125,6 +128,10 @@ public abstract class ElfStyleRelocationsBinary(Stream input) : Il2CppBinary(inp
 
                     symbolCache[symbolIndex] = symbolEntry;
                 }
+
+                if (symbolEntry.Shndx == 0 && symbolEntry.NameOffset != 0
+                    && dynamicEntries.TryGetValue(ElfDynamicType.DT_STRTAB, out var strings))
+                    _importSlots[relocation.Offset] = ReadStringToNull(MapVirtualAddressToRaw(loadBias + strings + symbolEntry.NameOffset));
 
                 // R_ARM_NONE / R_AARCH64_NONE need to be ignored.
                 if ((machine == ElfMachine.EM_ARM && type == ElfRelocationType.R_ARM_NONE)

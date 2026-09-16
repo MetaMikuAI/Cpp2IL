@@ -69,7 +69,13 @@ public static class InterfaceDispatchRecovery
             DeadCodeEliminator.RemoveDeadCopyCycles(cfg);
             DeadCodeEliminator.Run(method);
             foreach (var match in matches)
-                TryExciseLookup(cfg, match, definitions, homeBlock);
+            {
+                var klass = Definition(definitions, match.KlassLocal);
+                if (!TryExciseLookup(cfg, match, definitions, homeBlock)) continue;
+                if (match.Resolved.FullName == "System.IDisposable::Dispose" && match.Dispatch.NativeAddress != 0
+                    && klass is { NativeAddress: not 0, Operands: [_, MemoryOperand { Base: LocalVariable receiver }] })
+                    method.NativeDisposals.Add(new(match.Dispatch, klass.NativeAddress, receiver.Register.Name));
+            }
             DeadCodeEliminator.Run(method);
         }
     }
@@ -82,7 +88,8 @@ public static class InterfaceDispatchRecovery
         Instruction InvokeDataPhi,
         Block Merge,
         Instruction SlowCall,
-        LocalVariable KlassLocal);
+        LocalVariable KlassLocal,
+        Instruction Dispatch);
 
     private static Match? MatchDispatch(MethodAnalysisContext method, Instruction dispatch, Dictionary<LocalVariable, Instruction> definitions, Dictionary<Instruction, Block> homeBlock)
     {
@@ -135,7 +142,7 @@ public static class InterfaceDispatchRecovery
         if (!homeBlock.TryGetValue(phi, out var merge))
             return null;
 
-        return new Match(resolved, phi, merge, slowCall, klassLocal);
+        return new Match(resolved, phi, merge, slowCall, klassLocal, dispatch);
     }
 
     internal static LocalVariable? MatchVTableEntryChain(Dictionary<LocalVariable, Instruction> definitions, Instruction? vtableEntry, int slot)
@@ -277,25 +284,25 @@ public static class InterfaceDispatchRecovery
     }
 
     // Bailing here is fine, it just leaves the (already resolved) call with dead lookup around it
-    private static void TryExciseLookup(ISILControlFlowGraph cfg, Match match, Dictionary<LocalVariable, Instruction> definitions, Dictionary<Instruction, Block> homeBlock)
+    private static bool TryExciseLookup(ISILControlFlowGraph cfg, Match match, Dictionary<LocalVariable, Instruction> definitions, Dictionary<Instruction, Block> homeBlock)
     {
         var merge = match.Merge;
 
         if (!homeBlock.TryGetValue(match.SlowCall, out var slowBlock))
-            return;
+            return false;
 
         if (Definition(definitions, match.KlassLocal) is not { } klassDefinition
             || !homeBlock.TryGetValue(klassDefinition, out var head) || head == merge)
-            return;
+            return false;
 
         if (!TryCollectRegion(cfg, head, merge, out var region) || !region.Contains(slowBlock))
-            return;
+            return false;
 
         if (!RegionIsSideEffectFree(region, match.SlowCall) || AnyValueEscapes(cfg, region, merge))
-            return;
+            return false;
 
         if (!MergePhisAreDead(cfg, merge, out var removable))
-            return;
+            return false;
 
         foreach (var instruction in removable)
         {
@@ -333,6 +340,7 @@ public static class InterfaceDispatchRecovery
             block.Predecessors.Clear();
             cfg.Blocks.Remove(block);
         }
+        return true;
     }
 
     // The region has to be closed, so nothing else may enter or leave it

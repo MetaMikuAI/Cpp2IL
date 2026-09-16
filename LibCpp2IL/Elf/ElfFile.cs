@@ -179,6 +179,8 @@ public sealed class ElfFile : ElfStyleRelocationsBinary
 
     private IElfProgramHeaderEntry? GetProgramHeaderOfType(ElfProgramEntryType type) => _elfProgramHeaderEntries.FirstOrDefault(p => p.Type == type);
 
+    public ElfSectionHeaderEntry? GetSectionByName(string name) => _elfSectionHeaderEntries.FirstOrDefault(s => s.Name == name);
+
     private IEnumerable<ElfSectionHeaderEntry> GetSections(ElfSectionEntryType type) => _elfSectionHeaderEntries.Where(s => s.Type == type);
 
     private ElfSectionHeaderEntry? GetSingleSection(ElfSectionEntryType type) => GetSections(type).FirstOrDefault();

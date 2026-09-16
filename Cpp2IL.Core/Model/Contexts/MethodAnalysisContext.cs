@@ -25,6 +25,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
     /// Nullable iff this is a subclass.
     /// </summary>
     public readonly Il2CppMethodDefinition? Definition;
+    internal readonly List<NativeDisposal> NativeDisposals = [];
 
     /// <summary>
     /// The analysis context for the declaring type of this method.
@@ -476,6 +477,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
     public void ReleaseAnalysisData()
     {
         ConvertedIsil = null;
+        NativeDisposals.Clear();
         ControlFlowGraph = null;
         DominatorInfo = null;
     }
