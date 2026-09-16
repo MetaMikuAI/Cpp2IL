@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using Cpp2IL.Core.Graphs;
@@ -12,11 +13,13 @@ namespace Cpp2IL.Core.Analysis;
 // helper when the scan fails.
 public static class InterfaceDispatchRecovery
 {
-    public static void Run(MethodAnalysisContext method)
+    // Returns a retry for lookups kept alive by guessed downstream call arguments.
+    // Invoke it after the caller's normal type/virtual-call resolution pass.
+    public static Action? Run(MethodAnalysisContext method)
     {
         // offsets below are the 64-bit Il2CppClass layout
         if (method.AppContext.Binary.PointerSizeBytes != 8)
-            return;
+            return null;
 
         var cfg = method.ControlFlowGraph!;
 
@@ -53,15 +56,22 @@ public static class InterfaceDispatchRecovery
             }
         }
 
-        if (matches.Count == 0) return;
-        // Later dispatches can retain earlier lookup values in guessed argument registers.
-        // Rewrite them all before testing whether any lookup region is dead.
-        CallArgumentTrimmer.Run(method, preserveGenericMetadata: true);
-        DeadCodeEliminator.RemoveDeadCopyCycles(cfg);
-        DeadCodeEliminator.Run(method);
-        foreach (var match in matches)
-            TryExciseLookup(cfg, match, definitions, homeBlock);
-        DeadCodeEliminator.Run(method);
+        if (matches.Count == 0) return null;
+        Cleanup();
+        return Cleanup;
+
+        void Cleanup()
+        {
+            // Rewrite all dispatches before checking whether lookup values are dead.
+            // Retrying after normal type resolution lets newly resolved virtual calls
+            // release their guessed arguments without changing type-inference order.
+            CallArgumentTrimmer.Run(method, preserveGenericMetadata: true);
+            DeadCodeEliminator.RemoveDeadCopyCycles(cfg);
+            DeadCodeEliminator.Run(method);
+            foreach (var match in matches)
+                TryExciseLookup(cfg, match, definitions, homeBlock);
+            DeadCodeEliminator.Run(method);
+        }
     }
 
     private const long VTableOffset = 0x138;
@@ -465,28 +475,7 @@ public static class InterfaceDispatchRecovery
     private static bool Uses(Instruction instruction, HashSet<LocalVariable> candidates)
         => UsedLocals(instruction).Any(candidates.Contains);
 
+    // Type resolution may have replaced raw memory operands with fields/arrays.
     private static IEnumerable<LocalVariable> UsedLocals(Instruction instruction)
-    {
-        for (var i = 0; i < instruction.Operands.Count; i++)
-        {
-            if (ReferenceEquals(instruction.Operands[i], instruction.Destination))
-                continue;
-
-            switch (instruction.Operands[i])
-            {
-                case LocalVariable local:
-                    yield return local;
-                    break;
-                case AddressOf { Target: LocalVariable addressed }:
-                    yield return addressed;
-                    break;
-                case MemoryOperand memory:
-                    if (memory.Base is LocalVariable baseLocal)
-                        yield return baseLocal;
-                    if (memory.Index is LocalVariable indexLocal)
-                        yield return indexLocal;
-                    break;
-            }
-        }
-    }
+        => DeadCodeEliminator.UsedLocals(instruction);
 }

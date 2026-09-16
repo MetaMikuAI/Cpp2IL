@@ -121,7 +121,7 @@ public static class DeadCodeEliminator
     /// is excluded. Memory and field operands always contribute their address/object locals as
     /// reads, even when they are the destination of a store.
     /// </summary>
-    private static IEnumerable<LocalVariable> UsedLocals(Instruction instruction)
+    internal static IEnumerable<LocalVariable> UsedLocals(Instruction instruction)
     {
         var destination = instruction.Destination as LocalVariable;
 

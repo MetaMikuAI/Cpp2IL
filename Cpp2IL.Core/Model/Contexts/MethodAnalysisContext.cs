@@ -405,9 +405,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         InjectedCheckRemover.Run(this);
 
-        InterfaceDispatchRecovery.Run(this);
+        var retryInterfaceCleanup = InterfaceDispatchRecovery.Run(this);
 
         LocalVariables.ResolveTypesAndFields(this);
+        retryInterfaceCleanup?.Invoke();
         MetadataInitGuardRemover.RunSsaClassGuards(this);
         KeyFunctionRecovery.Run(this);
 
