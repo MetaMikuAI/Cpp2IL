@@ -348,6 +348,24 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         return true;
     }
 
+    // A relocated instruction followed by B back to the next caller instruction is
+    // a continuation island, not a tail call. Keep the original PC for literal loads.
+    internal static Arm64Instruction? DecodeReturningIsland(ReadOnlySpan<byte> bytes, ulong island, ulong continuation)
+    {
+        if (bytes.Length < 8) return null;
+        var branch = BinaryPrimitives.ReadUInt32LittleEndian(bytes.Slice(4, 4));
+        if (NewArm64KeyFunctionAddresses.DecodeBranchThunk(branch, island + 4) != continuation) return null;
+        try
+        {
+            var moved = Disassembler.Disassemble(bytes[..4], island, new Disassembler.Options(true, true, false)).ToList().Single();
+            return moved.Mnemonic is Arm64Mnemonic.LDR or Arm64Mnemonic.LDRB or Arm64Mnemonic.LDRH
+                or Arm64Mnemonic.LDRSW or Arm64Mnemonic.LDUR or Arm64Mnemonic.STR or Arm64Mnemonic.STUR
+                or Arm64Mnemonic.ADR or Arm64Mnemonic.ADRP or Arm64Mnemonic.MOV or Arm64Mnemonic.MOVZ
+                or Arm64Mnemonic.ADD or Arm64Mnemonic.SUB or Arm64Mnemonic.NOP ? moved : null;
+        }
+        catch { return null; }
+    }
+
     private void ConvertInstructionStatement(Arm64Instruction instruction, List<Instruction> instructions,
         List<ulong> addresses, MethodAnalysisContext context, HashSet<string> twoSLaneRegisters)
     {
@@ -1350,9 +1368,23 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
                     if (target < context.UnderlyingPointer || target >= context.UnderlyingPointer + (ulong)context.RawBytes.Length)
                     {
-                        // unconditional branch out of the method is a tail call
-                        AddCallAt(target);
-                        AddReturn();
+                        var binary = context.AppContext.Binary;
+                        if (address + 4 < context.UnderlyingPointer + (ulong)context.RawBytes.Length
+                            && !binary.IsBigEndian && binary.TryMapVirtualAddressToRaw(target, out var raw)
+                            && raw >= 0 && raw <= binary.RawLength - 8
+                            && DecodeReturningIsland(binary.GetRawBinaryContent().Slice((int)raw, 8), target, address + 4) is { } moved)
+                        {
+                            var first = addresses.Count;
+                            ConvertInstructionStatement(moved, instructions, addresses, context, twoSLaneRegisters);
+                            // Branches to the original B must land on the relocated instruction.
+                            for (var i = first; i < addresses.Count; i++) addresses[i] = address;
+                        }
+                        else
+                        {
+                            // A genuine outgoing branch remains a tail call.
+                            AddCallAt(target);
+                            AddReturn();
+                        }
                     }
                     else
                     {
