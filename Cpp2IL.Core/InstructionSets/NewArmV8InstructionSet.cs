@@ -382,14 +382,17 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             return newInstruction;
         }
 
-        IOperand ShiftedLogicalOperand(int operand)
+        IOperand ShiftedRegisterOperand(int operand)
         {
             var source = ConvertOperand(instruction, operand);
-            var amount = operand == 1 ? instruction.Op2Imm : instruction.Op3Imm;
-            var amountKind = operand == 1 ? instruction.Op2Kind : instruction.Op3Kind;
+            // Disarm's CMP alias removes the destination but leaves the shift in operand 3.
+            var compare = instruction.Mnemonic == Arm64Mnemonic.CMP;
+            var amount = operand == 1 && !compare ? instruction.Op2Imm : instruction.Op3Imm;
+            var amountKind = operand == 1 && !compare ? instruction.Op2Kind : instruction.Op3Kind;
             if (amountKind != Arm64OperandKind.Immediate || amount == 0)
                 return source;
-            var shift = operand == 1 ? instruction.Op2ShiftType : instruction.Op3ShiftType;
+            var shift = compare ? instruction.FinalOpShiftType : operand == 1 ? instruction.Op2ShiftType : instruction.Op3ShiftType;
+            if (shift == Arm64ShiftType.NONE) return source;
             var reg = operand == 1 ? instruction.Op1Reg : instruction.Op2Reg;
             var wide = reg is >= Arm64Register.X0 and <= Arm64Register.X31;
             var arithmetic = shift == Arm64ShiftType.ASR;
@@ -831,7 +834,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     break;
                 }
             case Arm64Mnemonic.MVN:
-                Add(address, OpCode.Not, ConvertOperand(instruction, 0), ShiftedLogicalOperand(1));
+                Add(address, OpCode.Not, ConvertOperand(instruction, 0), ShiftedRegisterOperand(1));
                 break;
             case Arm64Mnemonic.ADR:
                 Add(address, OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
@@ -1011,6 +1014,8 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     break;
                 }
             case Arm64Mnemonic.CMP:
+                EmitCompareFlags(ConvertOperand(instruction, 0), ShiftedRegisterOperand(1));
+                break;
             case Arm64Mnemonic.FCMP:
             case Arm64Mnemonic.FCMPE:
                 EmitCompareFlags(ScalarOperand(0), ScalarOperand(1));
@@ -1032,7 +1037,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.TST:
                 {
                     var temp = new Register(null, "TEMP");
-                    Add(address, OpCode.And, temp, ConvertOperand(instruction, 0), ShiftedLogicalOperand(1));
+                    Add(address, OpCode.And, temp, ConvertOperand(instruction, 0), ShiftedRegisterOperand(1));
                     EmitResultFlags(temp);
                     break;
                 }
@@ -1049,7 +1054,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     };
 
                     var dest = IsReg31(instruction.Op0Reg) ? new Register(null, "TEMP") : ConvertOperand(instruction, 0);
-                    Add(address, opCode, dest, ConvertOperand(instruction, 1), ShiftedLogicalOperand(2));
+                    Add(address, opCode, dest, ConvertOperand(instruction, 1), ShiftedRegisterOperand(2));
 
                     if (instruction.Mnemonic == Arm64Mnemonic.ANDS)
                         EmitResultFlags(dest);
@@ -1062,7 +1067,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.EON:
                 {
                     var temp = new Register(null, "TEMP");
-                    Add(address, OpCode.Not, temp, ShiftedLogicalOperand(2));
+                    Add(address, OpCode.Not, temp, ShiftedRegisterOperand(2));
                     var opCode = instruction.Mnemonic switch
                     {
                         Arm64Mnemonic.ORN => OpCode.Or,

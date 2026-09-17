@@ -85,6 +85,8 @@ public static class FlagConditionRecovery
                 if (IsZeroFlag(inner, defOf, out op0, out op1)) { relop = OpCode.CheckNotEqual; return true; }          // !ZF        => !=  (jne)
                 if (IsSignFlag(inner, defOf, out op0, out op1)) { relop = OpCode.CheckGreaterOrEqual; return true; }    // !SF        => >=  (jns)
                 if (IsSignEqualsOverflow(inner, defOf, out op0, out op1)) { relop = OpCode.CheckLess; return true; }    // !(SF==OF)  => <   (jl/jb)
+                // Conditional selects branch on the inverse of their native condition.
+                if (IsNotSignEqualsOverflow(inner, defOf, out op0, out op1)) { relop = OpCode.CheckGreaterOrEqual; return true; }
                 return false;
 
             case OpCode.CheckEqual:

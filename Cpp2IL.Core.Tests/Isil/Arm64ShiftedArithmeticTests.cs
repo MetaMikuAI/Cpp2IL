@@ -85,6 +85,28 @@ public class Arm64ShiftedArithmeticTests
         Assert.That(lastFlag, Is.LessThan(instructions.IndexOf(write)));
     }
 
+    [TestCase(0x6B880C3Fu, OpCode.ShiftRight, "System.Int32")] // cmp w1, w8, asr #3
+    [TestCase(0xEB880C3Fu, OpCode.ShiftRight, "System.Int64")]
+    [TestCase(0x6B480C3Fu, OpCode.ShiftRight, "System.UInt32")]
+    [TestCase(0xEB480C3Fu, OpCode.ShiftRight, "System.UInt64")]
+    [TestCase(0x6B080C3Fu, OpCode.ShiftLeft, "System.UInt32")]
+    [TestCase(0xEB080C3Fu, OpCode.ShiftLeft, "System.UInt64")]
+    public void CompareFlagsUseShiftedOperand(uint word, OpCode opcode, string type)
+    {
+        var instructions = Lift(word);
+        var shift = instructions.Single(i => i.OpCode == opcode);
+        Assert.That(shift.Operands[2], Is.EqualTo(new Immediate(3)));
+        Assert.That(((TypeAnalysisContext)shift.Operands[3]).FullName, Is.EqualTo(type));
+        var subtraction = instructions.Single(i => i.OpCode == OpCode.Subtract);
+        Assert.That(subtraction.Operands[2], Is.EqualTo(shift.Destination));
+        Assert.That(instructions.IndexOf(shift), Is.LessThan(instructions.IndexOf(subtraction)));
+    }
+
+    [TestCase(0x6B08003Fu)] // cmp w1, w8
+    [TestCase(0x71000C3Fu)] // cmp w1, #3
+    public void DoesNotShiftPlainCompareOperands(uint word)
+        => Assert.That(Lift(word).Any(i => i.OpCode is OpCode.ShiftLeft or OpCode.ShiftRight), Is.False);
+
     private static List<Instruction> Lift(uint word)
     {
         Cpp2IlApi.ResetInternalState();

@@ -78,8 +78,9 @@ public class FlagConditionRecoveryTests
         Assert.That(def.Operands[2], Is.EqualTo(B));
     }
 
-    [Test]
-    public void RecoversSignedLessThan()
+    [TestCase(false)]
+    [TestCase(true)]
+    public void RecoversSignedLessThan(bool inverted)
     {
         // cmp a, b ; jl  ->  full flag cluster ; cond = !(SF == OF) ; if cond
         var t1 = Flag("TEMP1");
@@ -90,8 +91,9 @@ public class FlagConditionRecoveryTests
         var sf = Flag("SF");
         var sfEqOf = Flag("TEMP_a");
         var cond = Flag("TEMP_b");
+        var inverse = Flag("TEMPCSEL");
 
-        var def = RecoverAndGetConditionDef(new List<Instruction>
+        var instructions = new List<Instruction>
         {
             new(0, OpCode.Subtract, t1, A, B),
             new(1, OpCode.Xor, t2, A, B),
@@ -101,10 +103,12 @@ public class FlagConditionRecoveryTests
             new(5, OpCode.CheckLess, sf, t1, Imm(0)),
             new(6, OpCode.CheckEqual, sfEqOf, sf, of),
             new(7, OpCode.Not, cond, sfEqOf),
-            new(8, OpCode.ConditionalJump, Imm(0), cond),
-        }, cond);
+        };
+        if (inverted) instructions.Add(new(8, OpCode.Not, inverse, cond));
+        instructions.Add(new(9, OpCode.ConditionalJump, Imm(0), inverted ? inverse : cond));
+        var def = RecoverAndGetConditionDef(instructions, inverted ? inverse : cond);
 
-        Assert.That(def.OpCode, Is.EqualTo(OpCode.CheckLess));
+        Assert.That(def.OpCode, Is.EqualTo(inverted ? OpCode.CheckGreaterOrEqual : OpCode.CheckLess));
         Assert.That(def.Operands[1], Is.EqualTo(A));
         Assert.That(def.Operands[2], Is.EqualTo(B));
     }
