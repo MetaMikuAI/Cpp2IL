@@ -6,6 +6,7 @@ using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using Disarm;
 using Cpp2IL.Core.Api;
+using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Il2CppApiFunctions;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
@@ -26,6 +27,8 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
     // GetIsilFromMethod runs in parallel, so cache resolved intrinsics concurrently.
     private readonly ConcurrentDictionary<(string Name, bool IsDouble, int ParameterCount), MethodAnalysisContext?> _mathMethods = new();
+
+    private readonly ConcurrentDictionary<(ApplicationAnalysisContext App, ulong Target), TypeAnalysisContext?> _nullCheckHelpers = new();
 
     public override BaseCallingConventionResolver CallingConventionResolver => CallingConventions;
 
@@ -368,6 +371,34 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         }
         catch { return null; }
     }
+
+    // Outlined null check: CBZ X0, throw; RET; STR LR, [SP, #-16]!; BL raiser.
+    // Match the complete returning path, not merely a call somewhere in a helper.
+    internal static ulong DecodeNullCheckRaiser(ReadOnlySpan<byte> bytes, ulong address)
+    {
+        if (bytes.Length < 16
+            || BinaryPrimitives.ReadUInt32LittleEndian(bytes) != 0xB4000040u
+            || BinaryPrimitives.ReadUInt32LittleEndian(bytes.Slice(4)) != 0xD65F03C0u
+            || BinaryPrimitives.ReadUInt32LittleEndian(bytes.Slice(8)) != 0xF81F0FFEu)
+            return 0;
+        var call = BinaryPrimitives.ReadUInt32LittleEndian(bytes.Slice(12));
+        if ((call & 0xFC000000u) != 0x94000000u) return 0;
+        return unchecked((ulong)((long)address + 12 + ((int)(call << 6) >> 4)));
+    }
+
+    private TypeAnalysisContext? GetNullCheckException(ApplicationAnalysisContext app, ulong target)
+        => _nullCheckHelpers.GetOrAdd((app, target), key =>
+        {
+            var binary = key.App.Binary;
+            if (binary.IsBigEndian || !binary.TryMapVirtualAddressToRaw(key.Target, out var raw)
+                || raw < 0 || raw > binary.RawLength - 16)
+                return null;
+            var raiser = DecodeNullCheckRaiser(binary.GetRawBinaryContent().Slice((int)raw, 16), key.Target);
+            if (raiser == 0) return null;
+            var exception = ThrowHelperRecovery.GetThrownException(key.App, raiser);
+            return exception?.FullName == "System.NullReferenceException"
+                && ThrowHelperRecovery.IsExceptionRaiser(key.App, raiser) ? exception : null;
+        });
 
     private void ConvertInstructionStatement(Arm64Instruction instruction, List<Instruction> instructions,
         List<ulong> addresses, MethodAnalysisContext context, HashSet<string> twoSLaneRegisters)
@@ -1342,7 +1373,18 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                         new StringLiteral($"Instruction {instruction.Mnemonic} not yet implemented."));
                 break;
             case Arm64Mnemonic.BL:
-                AddCallAt(instruction.BranchTarget);
+                if (!context.AppContext.MethodsByAddress.ContainsKey(instruction.BranchTarget)
+                    && GetNullCheckException(context.AppContext, instruction.BranchTarget) is { } nullException)
+                {
+                    // The helper preserves X0 on its returning path. Do not invent a call result.
+                    var nonNull = new Register(null, "TEMP_NULL_CHECK");
+                    Add(address, OpCode.CheckNotEqual, nonNull, Reg(Arm64Register.X0), Imm(0));
+                    Add(address, OpCode.ConditionalJump, Imm(address + 1), nonNull);
+                    Add(address, OpCode.Throw, nullException);
+                    Add(address + 1, OpCode.Nop);
+                }
+                else
+                    AddCallAt(instruction.BranchTarget);
                 break;
             case Arm64Mnemonic.BLR:
                 {
