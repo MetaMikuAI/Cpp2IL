@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using Cpp2IL.Core.Model.Contexts;
+using Cpp2IL.Core.Utils;
 using Disarm;
 using Disarm.InternalDisassembly;
 using LibCpp2IL.Elf;

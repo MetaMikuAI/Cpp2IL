@@ -66,7 +66,7 @@ public static class MetadataResolver
     /// naming the method it refers to (also used to type the local - see <see cref="LocalVariables"/>),
     /// or likewise a <see cref="RuntimeFieldInfoAnalysisContext"/> for a FieldInfo* usage.
     /// </summary>
-    private static void ResolveMetadataUsages(MethodAnalysisContext method)
+    internal static void ResolveMetadataUsages(MethodAnalysisContext method)
     {
         var libContext = method.AppContext.LibCpp2IlContext;
         var resolvedMetadataPointers = new Dictionary<LocalVariable, IOperand>();
@@ -79,19 +79,9 @@ public static class MetadataResolver
             if (instruction.Operands[0] is not LocalVariable destination)
                 continue;
 
-            // v27+ 元数据全局通常通过两次加载表示：第一次取得元数据槽地址，第二次解引用该地址。
-            // 将已解析的用法沿间接层传递，使 MethodInfo/FieldInfo 操作数参与正常类型传播。
-            if (instruction.Operands[1] is MemoryOperand
-                {
-                    Base: LocalVariable pointer,
-                    Index: null,
-                    Addend: 0,
-                    Scale: 0
-                }
-                && resolvedMetadataPointers.TryGetValue(pointer, out var resolvedPointer))
+            if (instruction.Operands[1] is TypeAnalysisContext or StringLiteral)
             {
-                instruction.SetOperand(1, resolvedPointer);
-                resolvedMetadataPointers[destination] = resolvedPointer;
+                resolvedMetadataPointers[destination] = instruction.Operands[1];
                 continue;
             }
 
@@ -150,6 +140,46 @@ public static class MetadataResolver
                 resolvedMetadataPointers[destination] = resolved;
             }
         }
+        ResolveIndirectMetadataUsages(method.ControlFlowGraph.Instructions, resolvedMetadataPointers);
+    }
+
+    // SSA block order is not definition order. Carry known metadata slots through
+    // copies and unanimous phis before resolving their zero-offset loads.
+    internal static void ResolveIndirectMetadataUsages(IEnumerable<Instruction> instructions, Dictionary<LocalVariable, IOperand> resolved)
+    {
+        var pending = instructions.Where(i => i.OpCode is OpCode.Move or OpCode.Phi
+            && i.Destination is LocalVariable).ToList();
+        bool changed;
+        do
+        {
+            changed = false;
+            foreach (var instruction in pending)
+            {
+                var destination = (LocalVariable)instruction.Destination!;
+                if (resolved.ContainsKey(destination)) continue;
+                IOperand? value = null;
+                if (instruction is { OpCode: OpCode.Move, Operands: [_, LocalVariable source] })
+                    resolved.TryGetValue(source, out value);
+                else if (instruction is { OpCode: OpCode.Move, Operands: [_, MemoryOperand
+                    { Base: LocalVariable pointer, Index: null, Scale: 0, Addend: 0 }] })
+                {
+                    if (resolved.TryGetValue(pointer, out value)) instruction.SetOperand(1, value);
+                }
+                else if (instruction.OpCode == OpCode.Phi && instruction.Operands.Count > 1)
+                {
+                    foreach (var operand in instruction.Operands.Skip(1))
+                    {
+                        if (operand is not LocalVariable input || !resolved.TryGetValue(input, out var incoming)
+                            || value != null && !Equals(value, incoming))
+                        { value = null; break; }
+                        value = incoming;
+                    }
+                }
+                if (value == null) continue;
+                resolved[destination] = value;
+                changed = true;
+            }
+        } while (changed);
     }
 
     /// <summary>

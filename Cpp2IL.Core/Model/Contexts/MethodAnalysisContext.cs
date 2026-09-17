@@ -406,6 +406,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         InjectedCheckRemover.Run(this);
 
+        MetadataResolver.ResolveMetadataUsages(this);
         var retryInterfaceCleanup = InterfaceDispatchRecovery.Run(this);
 
         LocalVariables.ResolveTypesAndFields(this);
