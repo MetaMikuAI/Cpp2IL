@@ -71,6 +71,21 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
     public List<string> AnalysisWarnings = [];
 
+    /// <summary>
+    /// The IL generation fallbacks this method needed. Empty means the body came out clean.
+    /// </summary>
+    /// <remarks>
+    /// Only valid between IL generation and <see cref="ReleaseAnalysisData"/>, which clears it -
+    /// read it (and <see cref="IsFullyRecovered"/>) before releasing, not after.
+    /// </remarks>
+    public List<MethodDegradation> Degradations = [];
+
+    /// <summary>
+    /// True if this method's body was generated without any fallbacks. Only meaningful before
+    /// <see cref="ReleaseAnalysisData"/> - see <see cref="Degradations"/>.
+    /// </summary>
+    public bool IsFullyRecovered => Degradations.Count == 0;
+
     public static int MaxMethodSizeBytes = 30000; // 30KB
 
     public List<ParameterAnalysisContext> Parameters = [];
@@ -475,12 +490,20 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
     public void AddWarning(string warning) => AnalysisWarnings.Add(warning);
 
+    public void AddDegradation(DegradationReason reason, string detail, ulong address = 0)
+        => Degradations.Add(new MethodDegradation(reason, detail, address));
+
     public void ReleaseAnalysisData()
     {
         ConvertedIsil = null;
         NativeDisposals.Clear();
         ControlFlowGraph = null;
         DominatorInfo = null;
+
+        // Callers aggregate these into run-wide statistics before releasing, so the per-method
+        // copies are dead weight afterwards - and at ~200k methods that adds up.
+        Degradations.Clear();
+        Degradations.TrimExcess();
     }
 
     public ConcreteGenericMethodAnalysisContext MakeGenericInstanceMethod(params IEnumerable<TypeAnalysisContext> methodGenericParameters)

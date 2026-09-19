@@ -52,23 +52,33 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
         if (shouldSkip)
         {
             FillMethodBodyWithStub(methodDefinition);
+            Statistics.Record(MethodRecoveryOutcome.StubSkippedModule, moduleName);
             return;
         }
 
         try
         {
-            Interlocked.Increment(ref TotalMethodCount);
-
             methodContext.Analyze();
 
             if (methodContext.ConvertedIsil.Count == 0)
+            {
                 FillMethodBodyWithStub(methodDefinition);
+                // Analyze() bails with empty ISIL for two very different reasons, and conflating
+                // them hides whether a stub is a failure or simply has nothing to recover.
+                Statistics.Record(methodContext.UnderlyingPointer == 0
+                    ? MethodRecoveryOutcome.StubNoNativeCode
+                    : MethodRecoveryOutcome.StubTooBig, moduleName);
+            }
             else
+            {
                 IlGenerator.GenerateIl(methodContext, methodDefinition);
+                Statistics.Record(
+                    methodContext.IsFullyRecovered ? MethodRecoveryOutcome.Readable : MethodRecoveryOutcome.Degraded,
+                    moduleName,
+                    methodContext.Degradations);
+            }
 
             //WriteControlFlowGraph(methodContext, Path.Combine(Environment.CurrentDirectory, "Cpp2IL", "bin", "Debug", "net9.0", "cpp2il_out", "cfg"));
-
-            Interlocked.Increment(ref SuccessfulMethodCount);
         }
         catch (Exception e)
         {
@@ -83,7 +93,9 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
                 Logger.WarnNewline($"Skipping {methodContext.FullName}: {e.Message}");
             else
                 Logger.ErrorNewline($"Decompiling {methodContext.FullName} failed: {detail}");
-            
+
+            Statistics.Record(MethodRecoveryOutcome.Failed, moduleName);
+
             methodDefinition.CilMethodBody = new();
             instructions = methodDefinition.CilMethodBody.Instructions;
 

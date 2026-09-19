@@ -21,6 +21,90 @@ public class NewArm64KeyFunctionAddresses : BaseKeyFunctionAddresses
 
     private List<Arm64Instruction>? _cachedDisassembledBytes;
 
+    /// <summary>
+    /// Il2CppClass::initialized_and_no_error, which Runtime::ClassInit tests on entry. Unity 6 reads
+    /// the whole 32-bit field; older builds masked a bit out of the flags byte at 0x135.
+    /// </summary>
+    private const int InitialisedFieldOffset = 0xE4;
+
+    protected override void AttemptInstructionAnalysisToFillGaps()
+    {
+        // Packers routinely strip the export table down to a handful of entries, and every key
+        // function found via FindExport goes with it. Runtime::ClassInit is worth recovering by
+        // shape because the whole chain hangs off it: without the export, the thunk that method
+        // bodies actually call is never identified either, and every one of those calls is emitted
+        // as "method not found" - 43% of all unresolved call targets on the binary this was
+        // written against.
+        if (il2cpp_runtime_class_init_actual == 0)
+            il2cpp_runtime_class_init_actual = FindClassInitByShape();
+    }
+
+    /// <summary>
+    /// Finds Runtime::ClassInit by its entry test of Il2CppClass::initialized_and_no_error.
+    /// </summary>
+    /// <remarks>
+    /// The instruction pair alone is far too common - 318 sites on the binary this was developed
+    /// against - because every inlined class-init guard uses it too. What distinguishes the
+    /// function itself is that the test sits within a few instructions of a prologue, since
+    /// ClassInit does nothing else first. That narrowed those 318 candidates to exactly one.
+    /// </remarks>
+    private ulong FindClassInitByShape()
+    {
+        const int maxInstructionsFromPrologue = 5;
+
+        var disassembly = DisassembleTextSection();
+        var found = 0ul;
+
+        for (var i = 1; i < disassembly.Count; i++)
+        {
+            if (!IsInitialisedFieldTest(disassembly[i - 1], disassembly[i]))
+                continue;
+
+            // Walk back to a prologue. Anything further away is a guard inside a larger function.
+            for (var back = 1; back <= maxInstructionsFromPrologue && i - 1 - back >= 0; back++)
+            {
+                if (!IsPrologue(disassembly[i - 1 - back]))
+                    continue;
+
+                if (found != 0)
+                    return 0; // ambiguous - better to find nothing than the wrong function
+
+                found = disassembly[i - 1 - back].Address;
+                break;
+            }
+        }
+
+        if (found != 0)
+            Logger.VerboseNewline($"\tRecovered il2cpp:vm::Runtime::ClassInit by shape at 0x{found:X} (export was stripped)");
+
+        return found;
+    }
+
+    /// <summary>LDR Wn, [X0, #0xE4] followed by CBZ on the same register.</summary>
+    internal static bool IsInitialisedFieldTest(Arm64Instruction load, Arm64Instruction branch)
+        => load is { Mnemonic: Arm64Mnemonic.LDR, Op0Kind: Arm64OperandKind.Register, MemBase: Arm64Register.X0 }
+           && load.MemOffset == InitialisedFieldOffset
+           && load.MemIndexMode == Arm64MemoryIndexMode.Offset
+           && branch is { Mnemonic: Arm64Mnemonic.CBZ }
+           && RegisterIndex(branch.Op0Reg) == RegisterIndex(load.Op0Reg);
+
+    /// <summary>Register number, ignoring whether it was named as W or X.</summary>
+    private static int RegisterIndex(Arm64Register register) => register switch
+    {
+        >= Arm64Register.X0 and <= Arm64Register.X31 => register - Arm64Register.X0,
+        >= Arm64Register.W0 and <= Arm64Register.W31 => register - Arm64Register.W0,
+        _ => -1,
+    };
+
+    /// <summary>SUB SP, SP, #imm or STP with a pre-indexed SP - i.e. a frame being set up.</summary>
+    internal static bool IsPrologue(Arm64Instruction instruction)
+        => instruction.Mnemonic == Arm64Mnemonic.SUB
+               && instruction.Op0Reg == Arm64Register.X31 && instruction.Op1Reg == Arm64Register.X31
+               && instruction.Op2Kind == Arm64OperandKind.Immediate
+           || instruction.Mnemonic == Arm64Mnemonic.STP
+               && instruction.MemBase == Arm64Register.X31
+               && instruction.MemIndexMode == Arm64MemoryIndexMode.PreIndex;
+
     private List<Arm64Instruction> DisassembleTextSection()
     {
         if (_cachedDisassembledBytes == null)

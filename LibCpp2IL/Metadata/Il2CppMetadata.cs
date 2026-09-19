@@ -890,17 +890,46 @@ public class Il2CppMetadata : ClassReadingBinaryReader
     public string GetStringLiteralFromIndex(uint index)
     {
         var stringLiteral = stringLiterals[index];
-        
-        if(MetadataVersion < 35f)
-            return Encoding.UTF8.GetString(ReadByteArrayAtRawAddress(metadataHeader.stringLiteralData.Offset + stringLiteral.dataIndex, (int)stringLiteral.length));
-        
+
+        if (MetadataVersion < 35f)
+            return ReadStringLiteral(metadataHeader.stringLiteralData.Offset + stringLiteral.dataIndex, (int)stringLiteral.length);
+
         //v35 and above - no length field. have to read until next string literal or end of string literal data
-        var nextOffset = index < stringLiterals.Length - 1 
-            ? metadataHeader.stringLiteralData.Offset + stringLiterals[index + 1].dataIndex 
+        var nextOffset = index < stringLiterals.Length - 1
+            ? metadataHeader.stringLiteralData.Offset + stringLiterals[index + 1].dataIndex
             : metadataHeader.stringLiteralData.Offset + metadataHeader.stringLiteralData.Size;
-        
+
         var startOffset = metadataHeader.stringLiteralData.Offset + stringLiteral.dataIndex;
         var length = nextOffset - startOffset;
-        return Encoding.UTF8.GetString(ReadByteArrayAtRawAddress(startOffset, length));
+        return ReadStringLiteral(startOffset, length);
+    }
+
+    /// <summary>
+    /// Reads a string literal, rejecting any (offset, length) pair that doesn't fall inside the
+    /// string literal data section.
+    /// </summary>
+    /// <remarks>
+    /// From v35 on, the length isn't stored - it's derived from the next entry's dataIndex, which
+    /// assumes the offset table is sorted ascending. Packed or otherwise corrupted metadata breaks
+    /// that assumption, and the subtraction then yields a negative or absurdly large length. Handing
+    /// that straight to the reader makes it attempt a multi-gigabyte allocation, so a single bad
+    /// entry can take down an entire run with an OutOfMemoryException. Bail out to an empty string
+    /// instead: the literal is unrecoverable either way, but the rest of the assembly still resolves.
+    /// </remarks>
+    private string ReadStringLiteral(int offset, int length)
+    {
+        if (length == 0)
+            return string.Empty;
+
+        var dataStart = metadataHeader.stringLiteralData.Offset;
+        var dataEnd = dataStart + metadataHeader.stringLiteralData.Size;
+
+        if (length < 0 || offset < dataStart || offset > dataEnd - length)
+        {
+            LibLogger.VerboseNewline($"Ignoring string literal at offset {offset} with implausible length {length} (data section is [{dataStart}, {dataEnd}))");
+            return string.Empty;
+        }
+
+        return Encoding.UTF8.GetString(ReadByteArrayAtRawAddress(offset, length));
     }
 }
