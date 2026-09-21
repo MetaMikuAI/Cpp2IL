@@ -662,26 +662,45 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         }
 
         // the memory operand for the current instruction's access, offset by extraOffset (for the second reg of a pair)
-        IOperand MemOperand(long extraOffset = 0)
+        int MemoryAccessSize() => instruction.Mnemonic switch
         {
+            Arm64Mnemonic.LDRB or Arm64Mnemonic.LDRSB or Arm64Mnemonic.LDURB or Arm64Mnemonic.LDURSB
+                or Arm64Mnemonic.STRB or Arm64Mnemonic.STURB => 1,
+            Arm64Mnemonic.LDRH or Arm64Mnemonic.LDRSH or Arm64Mnemonic.LDURH or Arm64Mnemonic.LDURSH
+                or Arm64Mnemonic.STRH or Arm64Mnemonic.STURH => 2,
+            Arm64Mnemonic.LDRSW or Arm64Mnemonic.LDURSW or Arm64Mnemonic.LDPSW => 4,
+            _ => instruction.Op0Reg switch
+            {
+                >= Arm64Register.B0 and <= Arm64Register.B31 => 1,
+                >= Arm64Register.H0 and <= Arm64Register.H31 => 2,
+                >= Arm64Register.W0 and <= Arm64Register.W31 or >= Arm64Register.S0 and <= Arm64Register.S31 => 4,
+                >= Arm64Register.X0 and <= Arm64Register.X31 or >= Arm64Register.D0 and <= Arm64Register.D31 => 8,
+                >= Arm64Register.V0 and <= Arm64Register.V31 => 16,
+                _ => 0
+            }
+        };
+
+        IOperand MemOperand(long extraOffset = 0, int? accessSize = null)
+        {
+            var size = accessSize ?? MemoryAccessSize();
             var baseReg = instruction.MemBase;
             // writeback modes apply the offset to the base register itself, the access is at [base]
             var offset = (instruction.MemIndexMode == Arm64MemoryIndexMode.Offset ? instruction.MemOffset : 0) + extraOffset;
 
             if (baseReg == Arm64Register.INVALID)
-                return new MemoryOperand(addend: offset);
+                return new MemoryOperand(addend: offset, accessSize: size);
 
             if (IsReg31(baseReg))
                 return new StackOffset((int)offset);
 
             if (instruction.MemAddendReg != Arm64Register.INVALID)
-                return new MemoryOperand(Reg(baseReg), Reg(instruction.MemAddendReg), offset, 1 << instruction.MemExtendOrShiftAmount);
+                return new MemoryOperand(Reg(baseReg), Reg(instruction.MemAddendReg), offset, 1 << instruction.MemExtendOrShiftAmount, size);
 
             // a load through a register holding an ADRP page address is really an absolute load
             if (adrpOffsets!.TryGetValue(NormalizeRegister(baseReg), out var page))
-                return new MemoryOperand(addend: (long)page + offset);
+                return new MemoryOperand(addend: (long)page + offset, accessSize: size);
 
-            return new MemoryOperand(Reg(baseReg), addend: offset);
+            return new MemoryOperand(Reg(baseReg), addend: offset, accessSize: size);
         }
 
         var flagN = new Register(null, "N");
@@ -892,10 +911,13 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 {
                     EmitWriteback(beforeAccess: true);
 
+                    var splitDouble = instruction.Op0Reg is >= Arm64Register.D0 and <= Arm64Register.D31
+                        && twoSLaneRegisters.Contains(NormalizeRegister(instruction.Op0Reg));
+                    var accessSize = splitDouble ? 4 : MemoryAccessSize();
                     // ldr with a pc-relative literal is an absolute load
                     var source = instruction.Op1Kind == Arm64OperandKind.ImmediatePcRelative
-                        ? new MemoryOperand(addend: (long)address + instruction.Op1Imm)
-                        : MemOperand();
+                        ? new MemoryOperand(addend: (long)address + instruction.Op1Imm, accessSize: accessSize)
+                        : MemOperand(accessSize: accessSize);
 
                     // A single-precision load from a constant address in a segment the runtime cannot
                     // write is a literal pool entry, so its value is known right here. Only Sn is
@@ -907,15 +929,14 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
                     if (instruction.Op0Kind == Arm64OperandKind.Register && IsReg31(instruction.Op0Reg))
                         Add(address, OpCode.Nop); // load to xzr = prefetch, discard
-                    else if (instruction.Op0Reg is >= Arm64Register.D0 and <= Arm64Register.D31
-                        && twoSLaneRegisters.Contains(NormalizeRegister(instruction.Op0Reg)))
+                    else if (splitDouble)
                     {
                         // LDR Dn supplies the two single-precision lanes used by the following .2S operation.
                         Add(address, OpCode.Move, VectorLane(instruction.Op0Reg, 0), source);
                         Add(address, OpCode.Move, VectorLane(instruction.Op0Reg, 1),
                             instruction.Op1Kind == Arm64OperandKind.ImmediatePcRelative
-                                ? new MemoryOperand(addend: (long)address + instruction.Op1Imm + 4)
-                                : MemOperand(4));
+                                ? new MemoryOperand(addend: (long)address + instruction.Op1Imm + 4, accessSize: 4)
+                                : MemOperand(4, 4));
                     }
                     else
                         Add(address, OpCode.Move, ScalarOperand(0), source);
@@ -933,8 +954,8 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 if (instruction.Op0Reg is >= Arm64Register.D0 and <= Arm64Register.D31
                     && twoSLaneRegisters.Contains(NormalizeRegister(instruction.Op0Reg)))
                 {
-                    Add(address, OpCode.Move, MemOperand(), VectorLane(instruction.Op0Reg, 0));
-                    Add(address, OpCode.Move, MemOperand(4), VectorLane(instruction.Op0Reg, 1));
+                    Add(address, OpCode.Move, MemOperand(accessSize: 4), VectorLane(instruction.Op0Reg, 0));
+                    Add(address, OpCode.Move, MemOperand(4, 4), VectorLane(instruction.Op0Reg, 1));
                 }
                 else
                     Add(address, OpCode.Move, MemOperand(), ScalarOperand(0));
@@ -944,7 +965,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.LDPSW:
             case Arm64Mnemonic.STP:
                 {
-                    var pairSize = instruction.Op0Reg switch
+                    var pairSize = instruction.Mnemonic == Arm64Mnemonic.LDPSW ? 4 : instruction.Op0Reg switch
                     {
                         >= Arm64Register.V0 and <= Arm64Register.V31 => 16,
                         >= Arm64Register.D0 and <= Arm64Register.D31 => 8,

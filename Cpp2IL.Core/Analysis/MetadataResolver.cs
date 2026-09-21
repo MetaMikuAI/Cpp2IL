@@ -10,6 +10,7 @@ using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
 using LibCpp2IL;
+using LibCpp2IL.BinaryStructures;
 
 namespace Cpp2IL.Core.Analysis;
 
@@ -196,6 +197,21 @@ public static class MetadataResolver
             if (instruction.Destination is LocalVariable destination)
                 definitions[destination] = instruction;
 
+        // A by-value struct may arrive in several native registers. Its first load
+        // must remain an aggregate when a typed consumer (possibly through copies)
+        // expects the full value, even if that individual access is narrower.
+        var aggregateCopies = new HashSet<LocalVariable>();
+        var pendingAggregates = new Queue<LocalVariable>(definitions.Keys.Where(v => IsAggregate(v.Type)));
+        while (pendingAggregates.TryDequeue(out var aggregate))
+            if (aggregateCopies.Add(aggregate) && definitions.TryGetValue(aggregate, out var copy)
+                && copy.OpCode is OpCode.Move or OpCode.Phi)
+                foreach (var source in copy.Sources.OfType<LocalVariable>())
+                    pendingAggregates.Enqueue(source);
+
+        static bool IsAggregate(TypeAnalysisContext? type) => type is ByRefTypeAnalysisContext byRef
+            ? IsAggregate(byRef.ElementType)
+            : type is { IsValueType: true, IsEnumType: false, Type: Il2CppTypeEnum.IL2CPP_TYPE_VALUETYPE or Il2CppTypeEnum.IL2CPP_TYPE_GENERICINST };
+
         var changed = false;
 
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
@@ -343,6 +359,19 @@ public static class MetadataResolver
                         continue;
                 }
 
+                // Width is evidence for a partial read only if a later member proves the
+                // aggregate extends beyond it. Equal-sized whole-struct copies stay intact.
+                if (instruction.OpCode == OpCode.Move && i == 1 && fieldGenericOwner == null
+                    && instruction.Destination is LocalVariable result && !aggregateCopies.Contains(result)
+                    && instruction.Operands[i] is MemoryOperand { AccessSize: > 0 } sized
+                    && ResolvePartialStructLoad(field, fieldLocal, (int)fieldOffset, sized.AccessSize,
+                        method.AppContext.Binary.PointerSizeBytes) is { } scalar)
+                {
+                    instruction.SetOperand(i, scalar);
+                    changed = true;
+                    continue;
+                }
+
                 // A scalar store at the start of an embedded value type is a store to its first
                 // member, not an assignment of the whole aggregate (e.g. Vector2.x). The native
                 // compiler commonly emits this shape when initializing one component separately.
@@ -368,6 +397,50 @@ public static class MetadataResolver
         }
 
         return changed;
+    }
+
+    internal static FieldReference? ResolvePartialStructLoad(FieldAnalysisContext field, LocalVariable receiver,
+        int offset, int width, int pointerSize)
+    {
+        if (width <= 0 || field.IsStatic) return null;
+        var parents = new List<FieldAnalysisContext>();
+        var seen = new HashSet<TypeAnalysisContext>();
+        while (field.FieldType is { IsValueType: true } type && seen.Add(type)
+            && type is not GenericInstanceTypeAnalysisContext && type.GenericParameters.Count == 0
+            && (type.Attributes & TypeAttributes.LayoutMask) != TypeAttributes.ExplicitLayout
+            && type.Definition is not { PackingSize: > 0 })
+        {
+            var fields = type.Fields.Where(f => !f.IsStatic).ToList();
+            if (fields.Where(f => f.Offset == 0).ToList() is not [{ } first]) return null;
+            if (!ExtendsPastAccess(type, [])) return null;
+            parents.Add(field);
+            field = first;
+            if (ScalarSize(field.FieldType) == width)
+                return new FieldReference(field, receiver, offset) { ContainingFields = parents.ToArray() };
+        }
+        return null;
+
+        bool ExtendsPastAccess(TypeAnalysisContext type, HashSet<TypeAnalysisContext> visited)
+        {
+            if (!type.IsValueType || !visited.Add(type) || type is GenericInstanceTypeAnalysisContext
+                || type.GenericParameters.Count != 0
+                || (type.Attributes & TypeAttributes.LayoutMask) == TypeAttributes.ExplicitLayout
+                || type.Definition is { PackingSize: > 0 }) return false;
+            var fields = type.Fields.Where(f => !f.IsStatic).ToList();
+            return fields.Any(f => f.Offset >= width)
+                || fields.Where(f => f.Offset == 0).ToList() is [{ } first] && ExtendsPastAccess(first.FieldType, visited);
+        }
+
+        int ScalarSize(TypeAnalysisContext type) => type is GenericParameterTypeAnalysisContext ? 0
+            : !type.IsValueType ? pointerSize : type.FullName switch
+            {
+                "System.Boolean" or "System.Byte" or "System.SByte" => 1,
+                "System.Char" or "System.Int16" or "System.UInt16" => 2,
+                "System.Int32" or "System.UInt32" or "System.Single" => 4,
+                "System.Int64" or "System.UInt64" or "System.Double" => 8,
+                "System.IntPtr" or "System.UIntPtr" => pointerSize,
+                _ => 0
+            };
     }
 
     private static bool IsByRefValueAggregateCopy(Instruction instruction, int memoryOperandIndex,

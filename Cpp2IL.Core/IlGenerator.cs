@@ -577,7 +577,7 @@ public static class IlGenerator
                     {
                         LoadLocal(field.Local, method, locals);
 
-                        if (field.ContainingField is { } containing)
+                        foreach (var containing in field.ContainingFields)
                             instructions.Add(CilOpCodes.Ldflda, containing.ToFieldDescriptor());
                     }
 
@@ -1052,6 +1052,8 @@ public static class IlGenerator
                 break;
             case AddressOf { Target: FieldReference fieldAddress }:
                 LoadLocal(fieldAddress.Local, method, locals);
+                foreach (var containing in fieldAddress.ContainingFields)
+                    instructions.Add(CilOpCodes.Ldflda, containing.ToFieldDescriptor());
                 instructions.Add(CilOpCodes.Ldflda, fieldAddress.Field.ToFieldDescriptor());
                 break;
             case AddressOf { Target: ArrayAccess elementAddress }:
@@ -1074,13 +1076,9 @@ public static class IlGenerator
                 }
 
                 LoadLocal(field.Local, method, locals);
-                if (field.ContainingField is { } containing)
-                {
+                foreach (var containing in field.ContainingFields)
                     instructions.Add(CilOpCodes.Ldflda, containing.ToFieldDescriptor());
-                    instructions.Add(CilOpCodes.Ldfld, field.Field.ToFieldDescriptor());
-                }
-                else
-                    instructions.Add(CilOpCodes.Ldfld, field.Field.ToFieldDescriptor());
+                instructions.Add(CilOpCodes.Ldfld, field.Field.ToFieldDescriptor());
                 break;
             case MemoryOperand memory:
                 if (memory.Index == null && memory.Addend == 0 && memory.Scale == 0
@@ -1309,17 +1307,10 @@ public static class IlGenerator
 
                 instructions.Add(CilOpCodes.Stloc, scratch);
                 LoadLocal(field.Local, method, locals);
-                if (field.ContainingField is { } containing)
-                {
+                foreach (var containing in field.ContainingFields)
                     instructions.Add(CilOpCodes.Ldflda, containing.ToFieldDescriptor());
-                    instructions.Add(CilOpCodes.Ldloc, scratch);
-                    instructions.Add(CilOpCodes.Stfld, fieldDescriptor);
-                }
-                else
-                {
-                    instructions.Add(CilOpCodes.Ldloc, scratch);
-                    instructions.Add(CilOpCodes.Stfld, fieldDescriptor);
-                }
+                instructions.Add(CilOpCodes.Ldloc, scratch);
+                instructions.Add(CilOpCodes.Stfld, fieldDescriptor);
                 break;
 
             case ArrayAccess arrayAccess:
