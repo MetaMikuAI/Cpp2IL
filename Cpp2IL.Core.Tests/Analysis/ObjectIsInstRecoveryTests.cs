@@ -1,3 +1,4 @@
+using System.Linq;
 using System.Reflection;
 using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Graphs;
@@ -8,6 +9,45 @@ namespace Cpp2IL.Core.Tests.Analysis;
 
 public class ObjectIsInstRecoveryTests
 {
+    [TestCase("class", true)]
+    [TestCase("baseClass", true)]
+    [TestCase("none", false)]
+    [TestCase("struct", false)]
+    [TestCase("interface", false)]
+    [TestCase("object", false)]
+    [TestCase("valueType", false)]
+    [TestCase("enum", false)]
+    public void OnlyRecoversGenericTargetsProvenToBeReferences(string constraint, bool expected)
+    {
+        Cpp2IlApi.ResetInternalState();
+        var app = TestGameLoader.LoadSimple2019Game();
+        var owner = app.SystemTypes.SystemObjectType;
+        var type = new GenericParameterTypeAnalysisContext("T", 0, LibCpp2IL.BinaryStructures.Il2CppTypeEnum.IL2CPP_TYPE_VAR,
+            constraint == "class" ? GenericParameterAttributes.ReferenceTypeConstraint
+                : constraint == "struct" ? GenericParameterAttributes.NotNullableValueTypeConstraint : GenericParameterAttributes.None, owner);
+        var baseType = constraint switch
+        {
+            "baseClass" => app.SystemTypes.SystemExceptionType,
+            "object" => owner,
+            "valueType" => app.AllTypes.Single(t => t.FullName == "System.ValueType"),
+            "enum" => app.AllTypes.Single(t => t.FullName == "System.Enum"),
+            "interface" => app.AllTypes.First(t => t.IsInterface),
+            _ => null
+        };
+        if (baseType != null) type.ConstraintTypes.Add(baseType);
+        var result = new LocalVariable("result", new Register(null, "result"));
+        var call = new Instruction(0, OpCode.Call, new StringLiteral("il2cpp_vm_object_is_inst"), result, new Immediate(0),
+            new RuntimeClassTypeAnalysisContext(type, type.DeclaringAssembly));
+        var method = new InjectedMethodAnalysisContext(owner, "Caller", owner, MethodAttributes.Public | MethodAttributes.Static, [])
+        {
+            ControlFlowGraph = new ISILControlFlowGraph([call, new(1, OpCode.Return, result)]),
+            Locals = [result], ParameterLocals = []
+        };
+        KeyFunctionRecovery.Run(method);
+        Assert.That(call.OpCode, Is.EqualTo(expected ? OpCode.TryCast : OpCode.Call));
+        if (expected) Assert.That(result.Type, Is.SameAs(type));
+    }
+
     [TestCase(false)]
     [TestCase(true)]
     public void RecoversReferenceResultThroughCopiesAndSingleInputPhi(bool nullObject)

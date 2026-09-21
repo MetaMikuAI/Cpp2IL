@@ -79,10 +79,12 @@ public static class KeyFunctionRecovery
             RuntimeClassTypeAnalysisContext klass => klass.RepresentedType,
             TypeAnalysisContext { Type: Il2CppTypeEnum.IL2CPP_TYPE_CLASS or Il2CppTypeEnum.IL2CPP_TYPE_OBJECT
                 or Il2CppTypeEnum.IL2CPP_TYPE_STRING or Il2CppTypeEnum.IL2CPP_TYPE_ARRAY
-                or Il2CppTypeEnum.IL2CPP_TYPE_SZARRAY or Il2CppTypeEnum.IL2CPP_TYPE_GENERICINST } type => type,
+                or Il2CppTypeEnum.IL2CPP_TYPE_SZARRAY or Il2CppTypeEnum.IL2CPP_TYPE_GENERICINST
+                or Il2CppTypeEnum.IL2CPP_TYPE_VAR or Il2CppTypeEnum.IL2CPP_TYPE_MVAR } type => type,
             _ => null
         };
-        if (castType == null || castType.IsValueType || castType is GenericParameterTypeAnalysisContext)
+        if (castType == null || castType.IsValueType
+            || castType is GenericParameterTypeAnalysisContext generic && !HasReferenceTypeConstraint(generic))
             return false;
         if (target is not StringLiteral { Value: nameof(BaseKeyFunctionAddresses.il2cpp_vm_object_is_inst) })
         {
@@ -97,6 +99,19 @@ public static class KeyFunctionRecovery
         instruction.OpCode = OpCode.TryCast;
         instruction.SetOperands(result, castType, value);
         return true;
+    }
+
+    private static bool HasReferenceTypeConstraint(GenericParameterTypeAnalysisContext type)
+    {
+        // TryCast stores the returned object directly as T; value-type T would need unboxing.
+        // Interfaces and Object/ValueType/Enum constraints do not rule out value types.
+        if ((type.Attributes & System.Reflection.GenericParameterAttributes.NotNullableValueTypeConstraint) != 0)
+            return false;
+        return (type.Attributes & System.Reflection.GenericParameterAttributes.ReferenceTypeConstraint) != 0
+            || type.ConstraintTypes.Any(constraint => constraint is not GenericParameterTypeAnalysisContext
+                && constraint.Type is Il2CppTypeEnum.IL2CPP_TYPE_CLASS or Il2CppTypeEnum.IL2CPP_TYPE_GENERICINST
+                && !constraint.IsInterface && !constraint.IsValueType
+                && !(constraint.Namespace == "System" && constraint.Name is "Object" or "ValueType" or "Enum"));
     }
 
     private static void RemoveWriteBarrier(Instruction instruction)

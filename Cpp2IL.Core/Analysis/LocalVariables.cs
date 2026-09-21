@@ -250,9 +250,6 @@ public static class LocalVariables
         SeedComparisonResults(method);
         SeedFloatLiterals(method);
 
-        // Everywhere there's a CallVoid after a Newobj, we can resolve the constructor call.
-        MetadataResolver.ResolveConstructorCalls(method);
-
         // Everything else is mutually enabling and so runs to a fixpoint: a typed receiver lets an
         // ambiguous call resolve, a resolved call types its return value and arguments, a typed base
         // lets a field offset resolve, a field load types its result, and any of those can be the
@@ -269,6 +266,8 @@ public static class LocalVariables
             changed = false;
             changed |= MetadataResolver.ResolveCallsViaMethodInfo(method);
             changed |= MetadataResolver.ResolveAmbiguousCalls(method);
+            // The allocation type may only become known during this fixpoint.
+            changed |= MetadataResolver.ResolveConstructorCalls(method);
             changed |= MetadataResolver.ResolveVirtualCalls(method);
             changed |= PropagateFromCallParameters(method);
             changed |= MetadataResolver.ResolveFieldOffsets(method);
