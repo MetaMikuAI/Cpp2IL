@@ -422,6 +422,13 @@ public static class LocalVariables
         return changed;
     }
 
+    // Late recoveries introduce typed values after metadata resolution has finished.
+    // Propagate only those known types; do not rerun metadata or native-layout rewrites.
+    internal static void PropagateKnownTypes(MethodAnalysisContext method)
+    {
+        while (PropagateTypesOnce(method)) { }
+    }
+
     // A single propagation sweep over every move and phi. Returns whether it filled in any type.
     private static bool PropagateTypesOnce(MethodAnalysisContext method)
     {

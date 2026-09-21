@@ -260,4 +260,39 @@ public class ArrayAddressRecoveryTests
         Assert.That(access.Operands[shape == "store" ? 0 : 1], Is.TypeOf<MemoryOperand>());
     }
 
+    [TestCase(false)]
+    [TestCase(true)]
+    public void PropagatesRecoveredLengthThroughCopiesAndArithmeticWithoutGuessingPointers(bool is32Bit)
+    {
+        _app.Binary.is32Bit = is32Bit;
+        var pointerSize = _app.Binary.PointerSizeBytes;
+        var array = Local("array", new SzArrayTypeAnalysisContext(_app.SystemTypes.SystemStringType));
+        var address = Local("address");
+        var length = Local("length");
+        var copy = Local("copy");
+        var difference = Local("difference");
+        var unknown = Local("unknown");
+        var ambiguous = Local("ambiguous");
+        var existing = Local("existing", _app.SystemTypes.SystemObjectType);
+        var method = Method(
+            new(0, OpCode.Add, address, array, new Immediate(4 * pointerSize)),
+            new(1, OpCode.Move, length, new MemoryOperand(address, addend: -pointerSize)),
+            new(2, OpCode.Move, copy, length),
+            new(3, OpCode.Subtract, difference, copy, new Immediate(1)),
+            new(4, OpCode.Add, ambiguous, difference, unknown),
+            new(5, OpCode.Add, existing, difference, new Immediate(1)),
+            new(6, OpCode.Return, difference));
+        ArrayRecovery.RecoverSplitAccesses(method);
+        Assert.That(difference.Type, Is.Null, "Array recovery alone does not propagate downstream types");
+        LocalVariables.PropagateKnownTypes(method);
+        Assert.That(copy.Type, Is.SameAs(_app.SystemTypes.SystemInt32Type));
+        Assert.That(difference.Type, Is.SameAs(_app.SystemTypes.SystemInt32Type));
+        Assert.That(address.Type, Is.Null);
+        Assert.That(ambiguous.Type, Is.Null);
+        Assert.That(unknown.Type, Is.Null);
+        Assert.That(existing.Type, Is.SameAs(_app.SystemTypes.SystemObjectType));
+        var types = method.Locals.Select(l => l.Type).ToArray();
+        LocalVariables.PropagateKnownTypes(method);
+        Assert.That(method.Locals.Select(l => l.Type), Is.EqualTo(types));
+    }
 }

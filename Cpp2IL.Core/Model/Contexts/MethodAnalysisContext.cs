@@ -449,6 +449,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         PinnedArrayRecovery.Run(this);
         ArrayRecovery.RecoverSplitAccesses(this);
+        LocalVariables.PropagateKnownTypes(this);
 
         SsaForm.Remove(this);
 
