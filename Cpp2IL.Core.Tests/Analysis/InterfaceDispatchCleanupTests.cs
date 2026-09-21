@@ -15,6 +15,7 @@ public class InterfaceDispatchCleanupTests
     [TestCase("classInit", true)]
     [TestCase("runtimeClass", true)]
     [TestCase("lateInterface", true)]
+    [TestCase("lateBox", true)]
     [TestCase("live", false)]
     [TestCase("unresolved", false)]
     [TestCase("sideEffect", false)]
@@ -102,6 +103,19 @@ public class InterfaceDispatchCleanupTests
                 init, new(41, OpCode.Jump, virtualCall),
             ]);
         }
+        if (use == "lateBox")
+        {
+            var boxClass = Local("boxClass");
+            var boxValue = Local("boxValue", app.SystemTypes.SystemInt32Type);
+            var boxPointer = Local("boxPointer");
+            instructions.AddRange([
+                new(42, OpCode.Move, boxClass, app.SystemTypes.SystemInt32Type),
+                new(43, OpCode.Move, boxValue, new Immediate(7)),
+                new(44, OpCode.Move, boxPointer, new AddressOf(boxValue)),
+            ]);
+            virtualCall.OpCode = OpCode.Call;
+            virtualCall.SetOperands(new StringLiteral("il2cpp_value_box"), virtualResult, boxClass, boxPointer, stale);
+        }
         instructions.Add(virtualCall);
         var field = new InjectedFieldAnalysisContext("Value", app.SystemTypes.SystemInt32Type, FieldAttributes.Public, objectType);
         IOperand? liveOperand = use switch
@@ -118,14 +132,14 @@ public class InterfaceDispatchCleanupTests
             instructions.Add(use == "fieldStore"
                 ? new(35, OpCode.Move, liveOperand, new Immediate(1))
                 : new(35, OpCode.CallVoid, new Immediate(0x5678), liveOperand));
-        instructions.Add(new(36, OpCode.Return));
+        instructions.Add(use == "lateBox" ? new(36, OpCode.Return, virtualResult) : new(36, OpCode.Return));
         var cfg = new ISILControlFlowGraph(instructions);
         cfg.RemoveUnreachableBlocks();
         cfg.MergeCallBlocks();
         var merge = cfg.Blocks.Single(b => b.Instructions.Contains(invokePhi));
         invokePhi.SetOperands(new IOperand[] { merged }.Concat(merge.Predecessors.Select(b => b.Instructions.Contains(fastStart) ? fast : slow)).ToList());
         stalePhi.SetOperands(new IOperand[] { stale }.Concat(merge.Predecessors.Select(b => b.Instructions.Contains(fastStart) ? offset : slot)).ToList());
-        var caller = new InjectedMethodAnalysisContext(objectType, "Caller", app.SystemTypes.SystemVoidType,
+        var caller = new InjectedMethodAnalysisContext(objectType, "Caller", use == "lateBox" ? objectType : app.SystemTypes.SystemVoidType,
             MethodAttributes.Public | MethodAttributes.Static, [])
         {
             ControlFlowGraph = cfg, Locals = locals, ParameterLocals = []
@@ -152,15 +166,25 @@ public class InterfaceDispatchCleanupTests
             MetadataInitGuardRemover.RunSsaClassGuards(cfg, 0x135);
             retryCleanup?.Invoke();
         }
+        if (use == "lateBox")
+        {
+            Assert.That(cfg.Instructions.Contains(slowCall), Is.True,
+                "The unresolved boxing helper still retains a guessed lookup argument");
+            SsaSimplifier.Run(caller);
+            KeyFunctionRecovery.Run(caller);
+            Assert.That(virtualCall.OpCode, Is.EqualTo(OpCode.Box));
+            retryCleanup?.Invoke();
+        }
 
         Assert.That(dispatch.OpCode, Is.EqualTo(OpCode.CallVoid));
         Assert.That(dispatch.Operands[0], Is.SameAs(dispose));
-        Assert.That(virtualCall.OpCode, Is.EqualTo(use == "unresolved" ? OpCode.IndirectCall : OpCode.Call));
+        Assert.That(virtualCall.OpCode, Is.EqualTo(use == "lateBox" ? OpCode.Box : use == "unresolved" ? OpCode.IndirectCall : OpCode.Call));
         Assert.That(cfg.Instructions.Contains(slowCall), Is.EqualTo(!removed));
         if (removed)
         {
             Assert.That(stalePhi.OpCode, Is.EqualTo(OpCode.Nop));
-            Assert.That(virtualCall.Operands, Is.EqualTo(new IOperand[] { virtualMethod, virtualResult, receiver }));
+            if (use != "lateBox")
+                Assert.That(virtualCall.Operands, Is.EqualTo(new IOperand[] { virtualMethod, virtualResult, receiver }));
         }
         else if (use is "live" or "unresolved")
             Assert.That(virtualCall.Operands, Does.Contain(stale));

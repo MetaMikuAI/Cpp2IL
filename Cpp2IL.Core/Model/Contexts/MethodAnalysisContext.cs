@@ -429,7 +429,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         retryInterfaceCleanup?.Invoke();
 
         // RGCTX loads can reveal the declaring interface only after type resolution.
-        if (InterfaceDispatchRecovery.Run(this) is { } retryResolvedInterfaceCleanup)
+        var retryResolvedInterfaceCleanup = InterfaceDispatchRecovery.Run(this);
+        if (retryResolvedInterfaceCleanup != null)
         {
             LocalVariables.ResolveTypesAndFields(this);
             retryResolvedInterfaceCleanup();
@@ -446,6 +447,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         InternalCallGuardRemover.Run(this);
         KeyFunctionRecovery.Run(this);
+        // Inlined helper operands can finally expose boxing and release stale lookup arguments.
+        retryInterfaceCleanup?.Invoke();
+        retryResolvedInterfaceCleanup?.Invoke();
 
         PinnedArrayRecovery.Run(this);
         ArrayRecovery.RecoverSplitAccesses(this);
