@@ -68,10 +68,11 @@ public static class InterfaceDispatchRecovery
             CallArgumentTrimmer.Run(method, preserveGenericMetadata: true);
             DeadCodeEliminator.RemoveDeadCopyCycles(cfg);
             DeadCodeEliminator.Run(method);
+            DominatorInfo? dominators = null;
             foreach (var match in matches)
             {
                 var klass = Definition(definitions, match.KlassLocal);
-                if (!TryExciseLookup(cfg, match, definitions, homeBlock)) continue;
+                if (!TryExciseLookup(cfg, match, homeBlock, ref dominators)) continue;
                 if (match.Resolved.FullName == "System.IDisposable::Dispose" && match.Dispatch.NativeAddress != 0
                     && klass is { NativeAddress: not 0, Operands: [_, MemoryOperand { Base: LocalVariable receiver }] })
                     method.NativeDisposals.Add(new(match.Dispatch, klass.NativeAddress, receiver.Register.Name));
@@ -297,15 +298,18 @@ public static class InterfaceDispatchRecovery
     }
 
     // Bailing here is fine, it just leaves the (already resolved) call with dead lookup around it
-    private static bool TryExciseLookup(ISILControlFlowGraph cfg, Match match, Dictionary<LocalVariable, Instruction> definitions, Dictionary<Instruction, Block> homeBlock)
+    private static bool TryExciseLookup(ISILControlFlowGraph cfg, Match match, Dictionary<Instruction, Block> homeBlock, ref DominatorInfo? dominators)
     {
         var merge = match.Merge;
 
-        if (!homeBlock.TryGetValue(match.SlowCall, out var slowBlock))
+        if (!homeBlock.TryGetValue(match.SlowCall, out var slowBlock) || !cfg.Blocks.Contains(slowBlock))
             return false;
 
-        if (Definition(definitions, match.KlassLocal) is not { } klassDefinition
-            || !homeBlock.TryGetValue(klassDefinition, out var head) || head == merge)
+        // The class pointer may be hoisted above unrelated branches or reused by several
+        // dispatches. The merge's immediate dominator bounds this lookup, not that load.
+        dominators ??= new DominatorInfo(cfg);
+        if (!dominators.ImmediateDominators.TryGetValue(merge, out var head)
+            || head == null || !cfg.Blocks.Contains(head))
             return false;
 
         if (!TryCollectRegion(cfg, head, merge, out var region) || !region.Contains(slowBlock))

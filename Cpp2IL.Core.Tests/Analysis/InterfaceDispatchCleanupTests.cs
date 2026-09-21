@@ -16,6 +16,9 @@ public class InterfaceDispatchCleanupTests
     [TestCase("runtimeClass", true)]
     [TestCase("lateInterface", true)]
     [TestCase("lateBox", true)]
+    [TestCase("earlyClass", true)]
+    [TestCase("earlyClassLive", false)]
+    [TestCase("earlyClassSideEffect", false)]
     [TestCase("live", false)]
     [TestCase("unresolved", false)]
     [TestCase("sideEffect", false)]
@@ -34,7 +37,7 @@ public class InterfaceDispatchCleanupTests
         var objectType = app.SystemTypes.SystemObjectType;
         var disposable = app.AllTypes.Single(t => t.FullName == "System.IDisposable");
         var dispose = disposable.Methods.Single(m => m.Name == "Dispose");
-        var virtualMethod = objectType.Methods.Single(m => m.Name == (use == "live" ? "Equals" : "ToString") && !m.IsStatic);
+        var virtualMethod = objectType.Methods.Single(m => m.Name == (use is "live" or "earlyClassLive" ? "Equals" : "ToString") && !m.IsStatic);
         var locals = new List<LocalVariable>();
         LocalVariable Local(string name, TypeAnalysisContext? type = null)
         {
@@ -81,7 +84,19 @@ public class InterfaceDispatchCleanupTests
             slowStart,
             slowCall,
         };
-        if (use == "sideEffect") instructions.Add(new(22, OpCode.CallVoid, new Immediate(0x5678)));
+        var unrelatedCall = new Instruction(5, OpCode.CallVoid, new Immediate(0x5678));
+        if (use.StartsWith("earlyClass"))
+        {
+            // The class load dominates a separate conditional side effect before lookup.
+            // Recovering the dispatch must keep that branch and call intact.
+            var lookupStart = instructions[1];
+            instructions.InsertRange(1, [
+                new(4, OpCode.ConditionalJump, lookupStart, Local("earlyCondition", app.SystemTypes.SystemBooleanType)),
+                unrelatedCall,
+                new(6, OpCode.Jump, lookupStart),
+            ]);
+        }
+        if (use is "sideEffect" or "earlyClassSideEffect") instructions.Add(new(22, OpCode.CallVoid, new Immediate(0x5678)));
         instructions.AddRange([
             new(23, OpCode.Jump, invokePhi),
             invokePhi, stalePhi,
@@ -180,13 +195,15 @@ public class InterfaceDispatchCleanupTests
         Assert.That(dispatch.Operands[0], Is.SameAs(dispose));
         Assert.That(virtualCall.OpCode, Is.EqualTo(use == "lateBox" ? OpCode.Box : use == "unresolved" ? OpCode.IndirectCall : OpCode.Call));
         Assert.That(cfg.Instructions.Contains(slowCall), Is.EqualTo(!removed));
+        if (use.StartsWith("earlyClass"))
+            Assert.That(cfg.Instructions.Contains(unrelatedCall), Is.True);
         if (removed)
         {
             Assert.That(stalePhi.OpCode, Is.EqualTo(OpCode.Nop));
             if (use != "lateBox")
                 Assert.That(virtualCall.Operands, Is.EqualTo(new IOperand[] { virtualMethod, virtualResult, receiver }));
         }
-        else if (use is "live" or "unresolved")
+        else if (use is "live" or "earlyClassLive" or "unresolved")
             Assert.That(virtualCall.Operands, Does.Contain(stale));
 
         retryCleanup?.Invoke();
