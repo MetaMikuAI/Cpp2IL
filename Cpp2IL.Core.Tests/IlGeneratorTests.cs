@@ -265,11 +265,24 @@ public class IlGeneratorTests
         Assert.That(instruction.OpCode, Is.EqualTo(OpCode.ShiftRight));
     }
 
-    [TestCase("load")]
-    [TestCase("store")]
-    [TestCase("address")]
-    [TestCase("scratch")]
-    public void NestedFieldPathsEmitEveryContainingAddressInOrder(string mode)
+    [TestCase("load", false)]
+    [TestCase("store", false)]
+    [TestCase("address", false)]
+    [TestCase("scratch", false)]
+    [TestCase("load", true)]
+    [TestCase("store", true)]
+    [TestCase("address", true)]
+    [TestCase("scratch", true)]
+    [TestCase("load", true, true, false)]
+    [TestCase("store", true, true, false)]
+    [TestCase("address", true, true, false)]
+    [TestCase("scratch", true, true, false)]
+    [TestCase("load", true, true, true)]
+    [TestCase("store", true, true, true)]
+    [TestCase("address", true, true, true)]
+    [TestCase("scratch", true, true, true)]
+    public void NestedFieldPathsEmitEveryContainingAddressInOrder(string mode, bool valueReceiver,
+        bool parameterReceiver = false, bool byRefReceiver = false)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var module = new ModuleDefinition("NestedFields.dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
@@ -279,14 +292,16 @@ public class IlGeneratorTests
         var valueBase = module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", "ValueType");
         var innerDefinition = new TypeDefinition("Tests", "Inner", TypeAttributes.Public | TypeAttributes.SequentialLayout | TypeAttributes.Sealed, valueBase);
         var outerDefinition = new TypeDefinition("Tests", "Outer", TypeAttributes.Public | TypeAttributes.SequentialLayout | TypeAttributes.Sealed, valueBase);
-        var ownerDefinition = new TypeDefinition("Tests", "Owner", TypeAttributes.Public, module.CorLibTypeFactory.Object.Type);
+        var ownerDefinition = new TypeDefinition("Tests", "Owner", TypeAttributes.Public,
+            valueReceiver ? valueBase : module.CorLibTypeFactory.Object.Type);
         module.TopLevelTypes.Add(innerDefinition);
         module.TopLevelTypes.Add(outerDefinition);
         module.TopLevelTypes.Add(ownerDefinition);
         var valueType = app.AllTypes.Single(t => t.FullName == "System.ValueType");
         var inner = new InjectedTypeAnalysisContext(valueType.DeclaringAssembly, "Tests", "Inner", valueType, System.Reflection.TypeAttributes.Public);
         var outer = new InjectedTypeAnalysisContext(valueType.DeclaringAssembly, "Tests", "Outer", valueType, System.Reflection.TypeAttributes.Public);
-        var owner = new InjectedTypeAnalysisContext(valueType.DeclaringAssembly, "Tests", "Owner", app.SystemTypes.SystemObjectType, System.Reflection.TypeAttributes.Public);
+        var owner = new InjectedTypeAnalysisContext(valueType.DeclaringAssembly, "Tests", "Owner",
+            valueReceiver ? valueType : app.SystemTypes.SystemObjectType, System.Reflection.TypeAttributes.Public);
         inner.PutExtraData("AsmResolverType", innerDefinition);
         outer.PutExtraData("AsmResolverType", outerDefinition);
         owner.PutExtraData("AsmResolverType", ownerDefinition);
@@ -306,7 +321,8 @@ public class IlGeneratorTests
         outerDefinition.Fields.Add(fields[1]);
         innerDefinition.Fields.Add(fields[2]);
         for (var i = 0; i < fields.Length; i++) contexts[i].PutExtraData("AsmResolverField", fields[i]);
-        var receiver = new LocalVariable("receiver", new Register(null, "receiver"), owner);
+        TypeAnalysisContext receiverType = byRefReceiver ? new ByRefTypeAnalysisContext(owner) : owner;
+        var receiver = new LocalVariable("receiver", new Register(null, "receiver"), receiverType);
         var result = new LocalVariable("result", new Register(null, "result"), app.SystemTypes.SystemInt32Type);
         var reference = new FieldReference(contexts[2], receiver, 0) { ContainingFields = [contexts[0], contexts[1]] };
         var target = new InjectedMethodAnalysisContext(owner, "Consume", app.SystemTypes.SystemVoidType,
@@ -323,17 +339,25 @@ public class IlGeneratorTests
             _ => new Instruction(0, OpCode.CallVoid, target, new AddressOf(reference))
         };
         var caller = new InjectedMethodAnalysisContext(owner, "Caller", app.SystemTypes.SystemVoidType,
-            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, [])
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, parameterReceiver ? [receiverType] : [])
         {
-            Locals = [receiver, result], ParameterLocals = [],
+            Locals = parameterReceiver ? [result] : [receiver, result], ParameterLocals = parameterReceiver ? [receiver] : [],
             ControlFlowGraph = new ISILControlFlowGraph([operation, new(1, OpCode.Return)])
         };
         var generated = new MethodDefinition("Caller", MethodAttributes.Public | MethodAttributes.Static,
-            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void, parameterReceiver
+                ? [byRefReceiver ? ownerDefinition.ToTypeSignature(true).MakeByReferenceType() : ownerDefinition.ToTypeSignature(true)] : []));
+        if (parameterReceiver)
+            generated.ParameterDefinitions.Add(new ParameterDefinition(1, "receiver", (ParameterAttributes)0));
         ownerDefinition.Methods.Add(generated);
         IlGenerator.GenerateIl(caller, generated);
         var addresses = generated.CilMethodBody!.Instructions.Where(i => i.OpCode == CilOpCodes.Ldflda).Select(i => i.Operand).ToList();
         Assert.That(addresses, Is.EqualTo(mode == "address" ? fields : fields.Take(2)));
+        var firstAddress = generated.CilMethodBody.Instructions.First(i => i.OpCode == CilOpCodes.Ldflda);
+        var receiverLoad = generated.CilMethodBody.Instructions[generated.CilMethodBody.Instructions.IndexOf(firstAddress) - 1];
+        Assert.That(receiverLoad.OpCode, Is.EqualTo(parameterReceiver
+            ? (byRefReceiver ? CilOpCodes.Ldarg : CilOpCodes.Ldarga)
+            : (valueReceiver ? CilOpCodes.Ldloca : CilOpCodes.Ldloc)));
     }
 
     private static MethodDefinition GenerateSingle(Instruction instruction, LocalVariable result)

@@ -575,7 +575,7 @@ public static class IlGenerator
                 {
                     if (!field.Field.IsStatic)
                     {
-                        LoadLocal(field.Local, method, locals);
+                        LoadFieldReceiver(field.Local, method, locals);
 
                         foreach (var containing in field.ContainingFields)
                             instructions.Add(CilOpCodes.Ldflda, containing.ToFieldDescriptor());
@@ -1051,7 +1051,7 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Ldloca, locals[addressed]);
                 break;
             case AddressOf { Target: FieldReference fieldAddress }:
-                LoadLocal(fieldAddress.Local, method, locals);
+                LoadFieldReceiver(fieldAddress.Local, method, locals);
                 foreach (var containing in fieldAddress.ContainingFields)
                     instructions.Add(CilOpCodes.Ldflda, containing.ToFieldDescriptor());
                 instructions.Add(CilOpCodes.Ldflda, fieldAddress.Field.ToFieldDescriptor());
@@ -1075,7 +1075,7 @@ public static class IlGenerator
                     break;
                 }
 
-                LoadLocal(field.Local, method, locals);
+                LoadFieldReceiver(field.Local, method, locals);
                 foreach (var containing in field.ContainingFields)
                     instructions.Add(CilOpCodes.Ldflda, containing.ToFieldDescriptor());
                 instructions.Add(CilOpCodes.Ldfld, field.Field.ToFieldDescriptor());
@@ -1255,6 +1255,23 @@ public static class IlGenerator
             _ => null
         };
 
+    private static void LoadFieldReceiver(LocalVariable local, MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals)
+    {
+        // A value-type receiver must refer to its storage, not a copied stack value.
+        // Struct this and explicit byrefs already carry an address.
+        if (local.IsThis || local.Type is ByRefTypeAnalysisContext || local.Type is not { IsValueType: true })
+        {
+            LoadLocal(local, method, locals);
+            return;
+        }
+
+        var parameter = method.Parameters.FirstOrDefault(p => p.Name == local.Name);
+        if (parameter != null)
+            method.CilMethodBody!.Instructions.Add(CilOpCodes.Ldarga, parameter);
+        else
+            method.CilMethodBody!.Instructions.Add(CilOpCodes.Ldloca, locals[local]);
+    }
+
     private static void LoadLocal(LocalVariable local, MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals)
     {
         var instructions = method.CilMethodBody!.Instructions;
@@ -1306,7 +1323,7 @@ public static class IlGenerator
                 method.CilMethodBody!.LocalVariables.Add(scratch);
 
                 instructions.Add(CilOpCodes.Stloc, scratch);
-                LoadLocal(field.Local, method, locals);
+                LoadFieldReceiver(field.Local, method, locals);
                 foreach (var containing in field.ContainingFields)
                     instructions.Add(CilOpCodes.Ldflda, containing.ToFieldDescriptor());
                 instructions.Add(CilOpCodes.Ldloc, scratch);
