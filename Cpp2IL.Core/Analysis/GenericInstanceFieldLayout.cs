@@ -1,4 +1,6 @@
+using System;
 using System.Linq;
+using System.Reflection;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
 
@@ -33,13 +35,11 @@ public static class GenericInstanceFieldLayout
         definition = instance?.GenericType ?? definition;
         var pointerSize = definition.AppContext.Binary.PointerSizeBytes;
 
-        // TODO Support anything outside the trivial case.
-        for (var baseType = definition.BaseType; baseType != null; baseType = baseType.BaseType)
-            if ((baseType is GenericInstanceTypeAnalysisContext genericBase ? genericBase.GenericType : baseType)
-                .Fields.Any(f => !f.IsStatic))
-                return null;
-
-        var offset = 2L * pointerSize;
+        if ((definition.Attributes & TypeAttributes.LayoutMask) == TypeAttributes.ExplicitLayout
+            || definition.Definition is { PackingSize: > 0 })
+            return null;
+        if (BaseStorageEnd(instance?.BaseType ?? definition.BaseType, pointerSize) is not { } offset)
+            return null;
 
         foreach (var field in definition.Fields)
         {
@@ -62,6 +62,43 @@ public static class GenericInstanceFieldLayout
         }
 
         return null;
+    }
+
+    private static long? BaseStorageEnd(TypeAnalysisContext? type, int pointerSize)
+    {
+        var end = 2L * pointerSize;
+        uint? metadataSize = null;
+        for (; type != null; type = type.BaseType)
+        {
+            var definition = (type as GenericInstanceTypeAnalysisContext)?.GenericType ?? type;
+            if ((definition.Attributes & TypeAttributes.LayoutMask) == TypeAttributes.ExplicitLayout
+                || definition.Definition is { PackingSize: > 0 } or { ClassSizeIsDefault: false })
+                return null;
+            var fields = definition.Fields.Where(f => !f.IsStatic).ToList();
+            if (type is GenericInstanceTypeAnalysisContext || definition.GenericParameters.Count > 0)
+            {
+                // A fieldless generic wrapper adds no storage. Instantiated base fields
+                // still need a complete layout, not the definition's zero offsets.
+                if (fields.Count != 0)
+                    return null;
+                continue;
+            }
+            // System.Object contributes the target's two-pointer header, not fields.
+            if (definition.Definition is { } metadata && definition != type.AppContext.SystemTypes.SystemObjectType)
+                metadataSize ??= metadata.RawSizes.instance_size;
+            else if (fields.Count != 0)
+                return null;
+            foreach (var field in fields)
+            {
+                if (GetSizeAndAlignment(field.FieldType, pointerSize) is not { } layout
+                    || field.Offset < 2L * pointerSize || field.Offset % layout.Alignment != 0)
+                    return null;
+                end = Math.Max(end, field.Offset + layout.Size);
+            }
+        }
+        // Only accept an exact metadata extent. Tail padding may be reused by a
+        // derived class, so a rounded instance size is not a safe starting offset.
+        return end == (metadataSize ?? (uint)(2 * pointerSize)) ? end : null;
     }
 
     private static (long Size, long Alignment)? GetSizeAndAlignment(TypeAnalysisContext fieldType, int pointerSize)
