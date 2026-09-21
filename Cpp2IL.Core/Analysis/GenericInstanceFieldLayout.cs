@@ -1,5 +1,6 @@
 using System.Linq;
 using Cpp2IL.Core.Model.Contexts;
+using Cpp2IL.Core.Utils;
 
 namespace Cpp2IL.Core.Analysis;
 
@@ -28,6 +29,8 @@ public static class GenericInstanceFieldLayout
 
     public static FieldAnalysisContext? FindFieldAtOffset(TypeAnalysisContext definition, long targetOffset)
     {
+        var instance = definition as GenericInstanceTypeAnalysisContext;
+        definition = instance?.GenericType ?? definition;
         var pointerSize = definition.AppContext.Binary.PointerSizeBytes;
 
         // TODO Support anything outside the trivial case.
@@ -42,7 +45,11 @@ public static class GenericInstanceFieldLayout
             if (field.IsStatic)
                 continue;
 
-            if (GetSizeAndAlignment(field.FieldType, pointerSize) is not var (size, alignment))
+            // Substitute before measuring: T may be inline, while T[] remains a pointer
+            // even when T is a value type with an otherwise unknown layout.
+            var fieldType = instance == null ? field.FieldType
+                : GenericInstantiation.Instantiate(field.FieldType, instance.GenericArguments, []);
+            if (GetSizeAndAlignment(fieldType, pointerSize) is not var (size, alignment))
                 return null;
 
             offset = (offset + alignment - 1) & ~(alignment - 1);

@@ -295,10 +295,7 @@ public static class MetadataResolver
                 {
                     if (staticOwner == null && candidateOwner is GenericInstanceTypeAnalysisContext candidateGeneric)
                     {
-                        if (candidateGeneric.GenericArguments.Any(a => a.IsValueType))
-                            continue;
-
-                        field = GenericInstanceFieldLayout.FindFieldAtOffset(candidateGeneric.GenericType, fieldOffset);
+                        field = GenericInstanceFieldLayout.FindFieldAtOffset(candidateGeneric, fieldOffset);
                         if (field != null)
                             fieldGenericOwner = candidateGeneric;
 
