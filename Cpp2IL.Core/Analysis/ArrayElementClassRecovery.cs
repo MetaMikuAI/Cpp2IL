@@ -1,5 +1,7 @@
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
+using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 
@@ -16,13 +18,48 @@ public static class ArrayElementClassRecovery
             .Where(i => i.Destination is LocalVariable || i is { OpCode: OpCode.NewArr, Operands: [LocalVariable, _, _] })
             .GroupBy(i => (LocalVariable)(i.OpCode == OpCode.NewArr ? i.Operands[0] : i.Destination!)).Where(g => g.Count() == 1)
             .ToDictionary(g => g.Key, g => g.Single());
+        // A readonly field is stable outside its declaring initializer. Within that
+        // initializer, require a unique store that dominates this particular read.
+        bool IsStorage(IOperand? operand) => operand is LocalVariable { Type: StaticFieldStorageTypeAnalysisContext storage }
+            && ReferenceEquals(storage.OwnerType, method.DeclaringType);
+        // Raw storage used as a value/address, or an unresolved store into it, could
+        // modify the field through an alias that the direct-store count cannot see.
+        var storageEscapes = method.Name == ".cctor" && method.ControlFlowGraph.Instructions.Any(i => i.Sources.Any(IsStorage)
+            || i is { OpCode: OpCode.Move, Operands: [MemoryOperand memory, _] } && IsStorage(memory.Base));
+        var stores = method.ControlFlowGraph.Instructions.Where(i => method.Name == ".cctor" && !storageEscapes
+                && i is { OpCode: OpCode.Move, Operands: [FieldReference { Field: var field }, _] }
+                && field.IsStatic && (field.Attributes & FieldAttributes.InitOnly) != 0
+                && field.FieldType is SzArrayTypeAnalysisContext
+                && ReferenceEquals(field.DeclaringType, method.DeclaringType))
+            .GroupBy(i => ((FieldReference)i.Operands[0]).Field).Where(g => g.Count() == 1)
+            .Where(g => !method.ControlFlowGraph.Instructions.Any(i => i.Operands.Any(o =>
+                o is AddressOf { Target: FieldReference taken } && ReferenceEquals(taken.Field, g.Key))))
+            .ToDictionary(g => g.Key, g => g.Single());
+        DominatorInfo? dominators = null;
+        Dictionary<Instruction, Block>? blocks = null;
+
+        bool StoreDominatesRead(Instruction store, Instruction read)
+        {
+            blocks ??= method.ControlFlowGraph.Blocks.SelectMany(b => b.Instructions.Select(i => (i, b)))
+                .ToDictionary(pair => pair.i, pair => pair.b);
+            var from = blocks[store];
+            var to = blocks[read];
+            if (from == to) return from.Instructions.IndexOf(store) < from.Instructions.IndexOf(read);
+            dominators ??= new DominatorInfo(method.ControlFlowGraph);
+            return dominators.Dominates(from, to);
+        }
 
         IOperand Value(IOperand operand)
         {
             var seen = new HashSet<LocalVariable>();
             while (operand is LocalVariable local && seen.Add(local) && definitions.TryGetValue(local, out var definition)
                 && definition is { OpCode: OpCode.Move, Operands: [_, var source] })
+            {
+                if (source is FieldReference field && stores.TryGetValue(field.Field, out var store)
+                    && StoreDominatesRead(store, definition))
+                    source = store.Operands[1];
                 operand = source;
+            }
             return operand;
         }
 

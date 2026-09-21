@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System.Reflection;
 using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Graphs;
@@ -8,6 +9,68 @@ namespace Cpp2IL.Core.Tests.Analysis;
 
 public class ArrayElementClassRecoveryTests
 {
+    [TestCase("sameBlock", true)]
+    [TestCase("dominatingBlock", true)]
+    [TestCase("readBeforeStore", false)]
+    [TestCase("conditionalStore", false)]
+    [TestCase("multipleStores", false)]
+    [TestCase("mutable", false)]
+    [TestCase("instance", false)]
+    [TestCase("otherOwner", false)]
+    [TestCase("otherMethod", false)]
+    [TestCase("addressTaken", false)]
+    [TestCase("rawStorageAddress", false)]
+    [TestCase("rawStorageStore", false)]
+    [TestCase("unknownAllocation", false)]
+    public void ProvesReadonlyArrayAllocationWithinItsStaticInitializer(string shape, bool expected)
+    {
+        Cpp2IlApi.ResetInternalState();
+        var app = TestGameLoader.LoadSimple2022Game();
+        var root = app.SystemTypes.SystemObjectType;
+        var owner = new InjectedTypeAnalysisContext(root.DeclaringAssembly, "Tests", "ArrayOwner", root, TypeAttributes.Public);
+        var declared = new SzArrayTypeAnalysisContext(root);
+        var actual = new SzArrayTypeAnalysisContext(app.SystemTypes.SystemStringType);
+        var attributes = FieldAttributes.Static | FieldAttributes.InitOnly;
+        if (shape == "mutable") attributes &= ~FieldAttributes.InitOnly;
+        if (shape == "instance") attributes &= ~FieldAttributes.Static;
+        var field = new InjectedFieldAnalysisContext("Values", declared, attributes, shape == "otherOwner" ? root : owner, 0);
+        var storage = new LocalVariable("storage", new Register(null, "storage"), new StaticFieldStorageTypeAnalysisContext(owner, owner.DeclaringAssembly));
+        var allocated = new LocalVariable("allocated", new Register(null, "allocated"), declared);
+        var array = new LocalVariable("array", new Register(null, "array"), declared);
+        var klass = new LocalVariable("klass", new Register(null, "klass"));
+        var element = new LocalVariable("element", new Register(null, "element"));
+        var condition = new LocalVariable("condition", new Register(null, "condition"), app.SystemTypes.SystemBooleanType);
+        var store = new Instruction(1, OpCode.Move, new FieldReference(field, storage, 0), allocated);
+        var read = new Instruction(2, OpCode.Move, array, new FieldReference(field, storage, 0));
+        var load = new Instruction(4, OpCode.Move, element, new MemoryOperand(klass, addend: 0x40));
+        var instructions = new List<Instruction>
+        {
+            shape == "unknownAllocation" ? new(0, OpCode.Nop) : new(0, OpCode.NewArr, allocated, actual, new Immediate(1)),
+            store, read, new(3, OpCode.Move, klass, new MemoryOperand(array)), load, new(5, OpCode.Return)
+        };
+        switch (shape)
+        {
+            case "dominatingBlock": instructions.Insert(2, new(6, OpCode.Jump, read)); break;
+            case "readBeforeStore": instructions.Remove(read); instructions.Insert(1, read); break;
+            case "conditionalStore": instructions.Insert(1, new(6, OpCode.ConditionalJump, read, condition)); break;
+            case "multipleStores": instructions.Insert(2, new(6, OpCode.Move, new FieldReference(field, storage, 0), allocated)); break;
+            case "addressTaken": instructions.Insert(2, new(6, OpCode.CallVoid, new Immediate(123), new AddressOf(new FieldReference(field, storage, 0)))); break;
+            case "rawStorageAddress": instructions.Insert(2, new(6, OpCode.CallVoid, new Immediate(123), storage)); break;
+            case "rawStorageStore": instructions.Insert(2, new(6, OpCode.Move, new MemoryOperand(storage), new Immediate(0))); break;
+        }
+        var method = new InjectedMethodAnalysisContext(owner, shape == "otherMethod" ? "Initialize" : ".cctor", app.SystemTypes.SystemVoidType,
+            MethodAttributes.Static | MethodAttributes.Public, [])
+        {
+            ControlFlowGraph = new ISILControlFlowGraph(instructions),
+            Locals = [storage, allocated, array, klass, element, condition], ParameterLocals = []
+        };
+        ArrayElementClassRecovery.Run(method);
+        Assert.That(load.Operands[1] is RuntimeClassTypeAnalysisContext, Is.EqualTo(expected));
+        if (expected)
+            Assert.That(((RuntimeClassTypeAnalysisContext)load.Operands[1]).RepresentedType, Is.SameAs(app.SystemTypes.SystemStringType),
+                "The allocation, not the covariant declared object[] field type, proves the element class");
+    }
+
     [TestCase("metadata", true)]
     [TestCase("copy", true)]
     [TestCase("static_type_only", false)]
