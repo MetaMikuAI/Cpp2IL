@@ -293,12 +293,11 @@ public static class MetadataResolver
                 }
                 for (var candidateOwner = owner; candidateOwner != null && field == null; candidateOwner = candidateOwner.BaseType)
                 {
+                    // Substitute against the field's declaring base, not the receiver's type.
+                    fieldGenericOwner = candidateOwner as GenericInstanceTypeAnalysisContext;
                     if (staticOwner == null && candidateOwner is GenericInstanceTypeAnalysisContext candidateGeneric)
                     {
                         field = GenericInstanceFieldLayout.FindFieldAtOffset(candidateGeneric, fieldOffset);
-                        if (field != null)
-                            fieldGenericOwner = candidateGeneric;
-
                         continue;
                     }
 

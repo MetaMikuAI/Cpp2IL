@@ -150,6 +150,24 @@ public class DelegateInvokeRecoveryTests
 
     [TestCase(false)]
     [TestCase(true)]
+    public void PreservesNonGenericBaseFieldOwnerOnConstructedDelegate(bool tail)
+    {
+        var (caller, _, dispatch, receiver, _) = Create(tail, "raw");
+        receiver.Type = _app.AllTypes.First(t => t.FullName == "System.Action`1")
+            .MakeGenericInstanceType([_app.SystemTypes.SystemStringType]);
+        Assert.That(MetadataResolver.ResolveFieldOffsets(caller), Is.True);
+        var load = caller.ControlFlowGraph!.Instructions.First(i => i.OpCode == OpCode.Move);
+        var reference = (FieldReference)load.Operands[1];
+        Assert.That(reference.Field.DeclaringType.FullName, Is.EqualTo("System.Delegate"));
+        Assert.That(reference.Field, Is.Not.TypeOf<ConcreteGenericFieldAnalysisContext>());
+        DelegateInvokeRecovery.Run(caller);
+        Assert.That(dispatch.OpCode, Is.EqualTo(OpCode.CallVoid));
+        Assert.That(((ConcreteGenericMethodAnalysisContext)dispatch.Operands[0]).Parameters[0].ParameterType,
+            Is.SameAs(_app.SystemTypes.SystemStringType));
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
     public void DoesNotDropStackArguments(bool tail)
     {
         var (caller, invoke, dispatch, _, _) = Create(tail, "field");

@@ -34,7 +34,10 @@ public class GenericInstanceTypeAnalysisContext : ReferencedTypeAnalysisContext
         set => GenericType.OverrideNamespace = value;
     }
 
-    public sealed override TypeAnalysisContext? DefaultBaseType { get; }
+    // Resolve lazily: metadata-backed instances also need their inheritance chain,
+    // and a generic base must use this instance's arguments rather than open VARs.
+    public sealed override TypeAnalysisContext? DefaultBaseType => field ??=
+        GenericType.BaseType is { } baseType ? GenericInstantiation.Instantiate(baseType, GenericArguments, []) : null;
 
     public sealed override Il2CppTypeEnum Type => Il2CppTypeEnum.IL2CPP_TYPE_GENERICINST;
 
@@ -69,8 +72,6 @@ public class GenericInstanceTypeAnalysisContext : ReferencedTypeAnalysisContext
     {
         GenericType = genericType;
         GenericArguments.AddRange(genericArguments);
-        DefaultBaseType = genericType.BaseType;
-
         SetDeclaringType();
     }
 

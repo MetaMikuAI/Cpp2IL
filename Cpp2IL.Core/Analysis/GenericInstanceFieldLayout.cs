@@ -35,7 +35,8 @@ public static class GenericInstanceFieldLayout
 
         // TODO Support anything outside the trivial case.
         for (var baseType = definition.BaseType; baseType != null; baseType = baseType.BaseType)
-            if (baseType.Fields.Any(f => !f.IsStatic))
+            if ((baseType is GenericInstanceTypeAnalysisContext genericBase ? genericBase.GenericType : baseType)
+                .Fields.Any(f => !f.IsStatic))
                 return null;
 
         var offset = 2L * pointerSize;
