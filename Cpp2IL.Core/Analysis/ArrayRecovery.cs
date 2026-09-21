@@ -35,6 +35,8 @@ public static class ArrayRecovery
     {
         var cfg = method.ControlFlowGraph!;
         var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+        // Expose freshly allocated arrays while address definitions are still in SSA.
+        foreach (var instruction in cfg.Instructions) RecoverAllocation(instruction);
         var definitions = SingleDefinitions(cfg);
         var peers = new Dictionary<LocalVariable, List<Instruction>>();
         foreach (var block in cfg.Blocks)
@@ -53,6 +55,16 @@ public static class ArrayRecovery
                 if (instruction.Operands[i] is not MemoryOperand memory
                     || ResolveArrayAddress(memory.Base, definitions, 0) is not { } address)
                     continue;
+                // An interior pointer can still load the array header, e.g. [array + 32 - 8].
+                // Length is independent of the element layout; never rewrite a header store.
+                if (i == 1 && instruction.OpCode == OpCode.Move && instruction.Destination is LocalVariable length
+                    && memory.Index == null && memory.Scale == 0 && address.Offset.Root == null
+                    && address.Offset.Offset + memory.Addend == LengthOffset(pointerSize))
+                {
+                    instruction.SetOperand(i, new ArrayLength(address.Array));
+                    length.Type ??= method.AppContext.SystemTypes.SystemInt32Type;
+                    continue;
+                }
                 var stride = ElementSize(((SzArrayTypeAnalysisContext)address.Array.Type!).ElementType, pointerSize);
                 if (stride == 0)
                     continue;

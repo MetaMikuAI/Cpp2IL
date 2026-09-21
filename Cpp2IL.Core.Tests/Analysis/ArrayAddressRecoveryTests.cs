@@ -153,7 +153,8 @@ public class ArrayAddressRecoveryTests
         var load = new Instruction(1, OpCode.Move, result, new MemoryOperand(address));
         var method = Method(new(0, OpCode.Add, address, array, new Immediate(offset)), load, new(2, OpCode.Return));
         ArrayRecovery.RecoverSplitAccesses(method);
-        Assert.That(load.Operands[1], expected ? Is.TypeOf<ArrayAccess>() : Is.TypeOf<MemoryOperand>());
+        Assert.That(load.Operands[1], expected ? Is.TypeOf<ArrayAccess>()
+            : offset == 24 ? Is.TypeOf<ArrayLength>() : Is.TypeOf<MemoryOperand>());
         if (expected)
             Assert.That(((Immediate)((ArrayAccess)load.Operands[1]).Index).Value, Is.EqualTo((offset - 32) / 8));
     }
@@ -204,6 +205,59 @@ public class ArrayAddressRecoveryTests
         Assert.That(access.Operands[1], Is.TypeOf<MemoryOperand>());
         Assert.That(counter.Type, Is.Null);
         Assert.That(method.Locals.Count, Is.EqualTo(3));
+    }
+
+
+    [TestCase(false, false, false)]
+    [TestCase(true, false, false)]
+    [TestCase(false, true, false)]
+    [TestCase(true, true, false)]
+    [TestCase(false, false, true)]
+    [TestCase(true, true, true)]
+    public void RecoversLengthThroughInteriorPointers(bool is32Bit, bool allocated, bool structElement)
+    {
+        _app.Binary.is32Bit = is32Bit;
+        var pointerSize = _app.Binary.PointerSizeBytes;
+        var element = structElement ? _app.AllTypes.Single(t => t.FullName == "System.Decimal") : _app.SystemTypes.SystemStringType;
+        var arrayType = new SzArrayTypeAnalysisContext(element);
+        var array = Local("array", allocated ? null : arrayType);
+        var first = Local("first");
+        var second = Local("second");
+        var length = Local("length");
+        var allocation = allocated ? new Instruction(0, OpCode.Call, new StringLiteral("SzArrayNew"), array, arrayType, new Immediate(10))
+            : new Instruction(0, OpCode.Nop);
+        var load = new Instruction(3, OpCode.Move, length, new MemoryOperand(second, addend: -3 * pointerSize));
+        var method = Method(allocation,
+            new(1, OpCode.Add, first, array, new Immediate(4 * pointerSize)),
+            new(2, OpCode.Add, second, first, new Immediate(2 * pointerSize)),
+            load, new(4, OpCode.Return, length));
+        ArrayRecovery.RecoverSplitAccesses(method);
+        Assert.That(((ArrayLength)load.Operands[1]).Array, Is.SameAs(array));
+        Assert.That(length.Type, Is.SameAs(_app.SystemTypes.SystemInt32Type));
+        if (allocated) Assert.That(allocation.OpCode, Is.EqualTo(OpCode.NewArr));
+        ArrayRecovery.RecoverSplitAccesses(method);
+        DeadCodeEliminator.Run(method);
+        Assert.That(method.ControlFlowGraph!.Instructions.Any(i => i.OpCode == OpCode.Add), Is.False);
+        Assert.That(load.Operands[1], Is.TypeOf<ArrayLength>());
+    }
+
+    [TestCase("store")]
+    [TestCase("offset")]
+    [TestCase("index")]
+    [TestCase("unknownArray")]
+    [TestCase("ambiguousAddress")]
+    public void DoesNotGuessHeaderAccesses(string shape)
+    {
+        var array = Local("array", shape == "unknownArray" ? null : new SzArrayTypeAnalysisContext(_app.SystemTypes.SystemStringType));
+        var address = Local("address");
+        var result = Local("result");
+        var memory = new MemoryOperand(address, shape == "index" ? Local("index") : null, shape == "offset" ? -7 : -8);
+        var access = shape == "store" ? new Instruction(2, OpCode.Move, memory, result) : new Instruction(2, OpCode.Move, result, memory);
+        var method = Method(new(0, OpCode.Add, address, array, new Immediate(32)),
+            shape == "ambiguousAddress" ? new(1, OpCode.Move, address, new Immediate(0)) : new(1, OpCode.Nop),
+            access, new(3, OpCode.Return));
+        ArrayRecovery.RecoverSplitAccesses(method);
+        Assert.That(access.Operands[shape == "store" ? 0 : 1], Is.TypeOf<MemoryOperand>());
     }
 
 }
