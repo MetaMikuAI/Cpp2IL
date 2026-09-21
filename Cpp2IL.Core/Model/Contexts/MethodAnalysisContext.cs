@@ -450,14 +450,15 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Generic specialization is finished. Drop its hidden metadata and guessed arguments
         // while SSA phis still let interface cleanup prove that the native lookup is dead.
         CallArgumentTrimmer.Run(this);
-        // Inlined helper operands can finally expose boxing and release stale lookup arguments.
-        retryInterfaceCleanup?.Invoke();
-        retryResolvedInterfaceCleanup?.Invoke();
-
         PinnedArrayRecovery.Run(this);
         ArrayRecovery.RecoverSplitAccesses(this);
         LocalVariables.PropagateKnownTypes(this);
         BooleanFlagSimplifier.SimplifyLiteralOperations(this);
+
+        // Boxing and array allocation recovery release guessed native arguments. Retry
+        // only after both, while SSA phis still prove whether lookup values are dead.
+        retryInterfaceCleanup?.Invoke();
+        retryResolvedInterfaceCleanup?.Invoke();
 
         SsaForm.Remove(this);
 

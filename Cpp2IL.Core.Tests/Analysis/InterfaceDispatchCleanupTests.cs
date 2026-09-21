@@ -17,6 +17,10 @@ public class InterfaceDispatchCleanupTests
     [TestCase("runtimeClass", true)]
     [TestCase("lateInterface", true)]
     [TestCase("lateBox", true)]
+    [TestCase("lateArray", true)]
+    [TestCase("lateArraySpecific", true)]
+    [TestCase("lateArrayExport", true)]
+    [TestCase("lateArrayLive", false)]
     [TestCase("lateGeneric", true)]
     [TestCase("lateGenericLive", false)]
     [TestCase("earlyClass", true)]
@@ -148,6 +152,18 @@ public class InterfaceDispatchCleanupTests
             virtualCall.OpCode = OpCode.Call;
             virtualCall.SetOperands(new StringLiteral("il2cpp_value_box"), virtualResult, boxClass, boxPointer, stale);
         }
+        if (use.StartsWith("lateArray"))
+        {
+            var arrayType = new SzArrayTypeAnalysisContext(objectType);
+            virtualResult.Type = arrayType;
+            virtualCall.OpCode = OpCode.Call;
+            virtualCall.SetOperands(new StringLiteral(use switch
+            {
+                "lateArraySpecific" => "il2cpp_vm_array_new_specific",
+                "lateArrayExport" => "il2cpp_array_new_specific",
+                _ => "SzArrayNew"
+            }), virtualResult, arrayType, use == "lateArrayLive" ? stale : new Immediate(0), stale);
+        }
         instructions.Add(virtualCall);
         var field = new InjectedFieldAnalysisContext("Value", app.SystemTypes.SystemInt32Type, FieldAttributes.Public, objectType);
         IOperand? liveOperand = use switch
@@ -164,14 +180,15 @@ public class InterfaceDispatchCleanupTests
             instructions.Add(use == "fieldStore"
                 ? new(35, OpCode.Move, liveOperand, new Immediate(1))
                 : new(35, OpCode.CallVoid, new Immediate(0x5678), liveOperand));
-        instructions.Add(use == "lateBox" ? new(36, OpCode.Return, virtualResult) : new(36, OpCode.Return));
+        instructions.Add(use == "lateBox" || use.StartsWith("lateArray") ? new(36, OpCode.Return, virtualResult) : new(36, OpCode.Return));
         var cfg = new ISILControlFlowGraph(instructions);
         cfg.RemoveUnreachableBlocks();
         cfg.MergeCallBlocks();
         var merge = cfg.Blocks.Single(b => b.Instructions.Contains(invokePhi));
         invokePhi.SetOperands(new IOperand[] { merged }.Concat(merge.Predecessors.Select(b => b.Instructions.Contains(fastStart) ? fast : slow)).ToList());
         stalePhi.SetOperands(new IOperand[] { stale }.Concat(merge.Predecessors.Select(b => b.Instructions.Contains(fastStart) ? offset : slot)).ToList());
-        var caller = new InjectedMethodAnalysisContext(objectType, "Caller", use == "lateBox" ? objectType : app.SystemTypes.SystemVoidType,
+        var caller = new InjectedMethodAnalysisContext(objectType, "Caller", use.StartsWith("lateArray") ? virtualResult.Type!
+            : use == "lateBox" ? objectType : app.SystemTypes.SystemVoidType,
             MethodAttributes.Public | MethodAttributes.Static, [])
         {
             ControlFlowGraph = cfg, Locals = locals, ParameterLocals = []
@@ -214,17 +231,28 @@ public class InterfaceDispatchCleanupTests
             Assert.That(virtualCall.OpCode, Is.EqualTo(OpCode.Box));
             retryCleanup?.Invoke();
         }
+        if (use.StartsWith("lateArray"))
+        {
+            Assert.That(cfg.Instructions.Contains(slowCall), Is.True,
+                "The raw array allocation still holds a guessed lookup argument");
+            ArrayRecovery.RecoverSplitAccesses(caller);
+            Assert.That(virtualCall.OpCode, Is.EqualTo(OpCode.NewArr));
+            retryCleanup?.Invoke();
+            Assert.That(virtualCall.Operands.Count, Is.EqualTo(3));
+            if (use == "lateArrayLive") Assert.That(virtualCall.Operands[2], Is.SameAs(stale));
+        }
 
         Assert.That(dispatch.OpCode, Is.EqualTo(OpCode.CallVoid));
         Assert.That(dispatch.Operands[0], Is.SameAs(dispose));
-        Assert.That(virtualCall.OpCode, Is.EqualTo(use == "lateBox" ? OpCode.Box : use == "unresolved" ? OpCode.IndirectCall : OpCode.Call));
+        Assert.That(virtualCall.OpCode, Is.EqualTo(use.StartsWith("lateArray") ? OpCode.NewArr
+            : use == "lateBox" ? OpCode.Box : use == "unresolved" ? OpCode.IndirectCall : OpCode.Call));
         Assert.That(cfg.Instructions.Contains(slowCall), Is.EqualTo(!removed));
         if (use.StartsWith("earlyClass"))
             Assert.That(cfg.Instructions.Contains(unrelatedCall), Is.True);
         if (removed)
         {
             Assert.That(stalePhi.OpCode, Is.EqualTo(OpCode.Nop));
-            if (use != "lateBox")
+            if (use != "lateBox" && !use.StartsWith("lateArray"))
                 Assert.That(virtualCall.Operands, Is.EqualTo(new IOperand[] { virtualMethod, virtualResult, receiver }));
         }
         else if (use is "live" or "earlyClassLive" or "lateGenericLive" or "unresolved")
