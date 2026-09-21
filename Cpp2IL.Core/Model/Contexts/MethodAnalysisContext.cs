@@ -410,7 +410,6 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         var retryInterfaceCleanup = InterfaceDispatchRecovery.Run(this);
 
         LocalVariables.ResolveTypesAndFields(this);
-        retryInterfaceCleanup?.Invoke();
         MetadataInitGuardRemover.RunSsaClassGuards(this);
         KeyFunctionRecovery.Run(this);
 
@@ -425,6 +424,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         DeadCodeEliminator.Run(this);
 
         TypeHierarchyRecovery.Run(this);
+
+        // Class/RGCTX guards can retain stale interface lookup arguments until removed.
+        retryInterfaceCleanup?.Invoke();
 
         // Copy/constant propagation belongs in SSA, where one definition dominates all uses and phis
         // make joins explicit, so forwarding a value is an unconditional global substitution.

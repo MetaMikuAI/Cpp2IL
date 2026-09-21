@@ -12,6 +12,7 @@ namespace Cpp2IL.Core.Tests.Analysis;
 public class InterfaceDispatchCleanupTests
 {
     [TestCase("stale", true)]
+    [TestCase("classInit", true)]
     [TestCase("live", false)]
     [TestCase("unresolved", false)]
     [TestCase("sideEffect", false)]
@@ -81,8 +82,24 @@ public class InterfaceDispatchCleanupTests
             new(23, OpCode.Jump, invokePhi),
             invokePhi, stalePhi,
             new(32, OpCode.Move, target, new MemoryOperand(merged)),
-            dispatch, virtualCall,
+            dispatch,
         ]);
+        if (use == "classInit")
+        {
+            var flag = Local("initFlag");
+            var masked = Local("initMasked");
+            var pending = Local("initPending", app.SystemTypes.SystemBooleanType);
+            var initialized = Local("initialized");
+            var init = new Instruction(40, OpCode.Call, new Immediate(0x9876), initialized, klass, stale);
+            instructions.AddRange([
+                new(36, OpCode.Move, flag, new MemoryOperand(klass, addend: 0x135)),
+                new(37, OpCode.And, masked, flag, new Immediate(1)),
+                new(38, OpCode.CheckNotEqual, pending, masked, new Immediate(0)),
+                new(39, OpCode.ConditionalJump, virtualCall, pending),
+                init, new(41, OpCode.Jump, virtualCall),
+            ]);
+        }
+        instructions.Add(virtualCall);
         var field = new InjectedFieldAnalysisContext("Value", app.SystemTypes.SystemInt32Type, FieldAttributes.Public, objectType);
         IOperand? liveOperand = use switch
         {
@@ -116,6 +133,13 @@ public class InterfaceDispatchCleanupTests
         Assert.That(cfg.Instructions.Contains(slowCall), Is.True);
         LocalVariables.ResolveTypesAndFields(caller);
         retryCleanup?.Invoke();
+        if (use == "classInit")
+        {
+            Assert.That(cfg.Instructions.Contains(slowCall), Is.True,
+                "The initializer still holds a guessed argument from the interface lookup");
+            MetadataInitGuardRemover.RunSsaClassGuards(cfg, 0x135);
+            retryCleanup?.Invoke();
+        }
 
         Assert.That(dispatch.OpCode, Is.EqualTo(OpCode.CallVoid));
         Assert.That(dispatch.Operands[0], Is.SameAs(dispose));
