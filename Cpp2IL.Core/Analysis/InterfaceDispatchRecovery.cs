@@ -119,14 +119,17 @@ public static class InterfaceDispatchRecovery
         if (slowCall is not { Operands: [Immediate, _, _, LocalVariable interfaceArg, LocalVariable slotArg, ..] })
             return null;
 
-        if (ChaseCopies(definitions, interfaceArg) is not { OpCode: OpCode.Move, Operands: [_, TypeAnalysisContext declaringInterface] })
+        if (ResolveConstant(definitions, interfaceArg) is not TypeAnalysisContext declaringInterface)
             return null;
+
+        if (declaringInterface is RuntimeClassTypeAnalysisContext runtimeClass)
+            declaringInterface = runtimeClass.RepresentedType;
 
         if (declaringInterface is RuntimeMethodInfoAnalysisContext
             || !(declaringInterface is GenericInstanceTypeAnalysisContext { GenericType.IsInterface: true } || declaringInterface.IsInterface))
             return null;
 
-        if (ChaseCopies(definitions, slotArg) is not { OpCode: OpCode.Move, Operands: [_, Immediate slotImmediate] }
+        if (ResolveConstant(definitions, slotArg) is not Immediate slotImmediate
             || slotImmediate.Value is < 0 or > ushort.MaxValue)
             return null;
 
@@ -187,6 +190,16 @@ public static class InterfaceDispatchRecovery
         return klassCandidate;
     }
 
+    // Guard removal leaves single-input phis; they are copies, not unresolved joins.
+    internal static IOperand? ResolveConstant(Dictionary<LocalVariable, Instruction> definitions, IOperand operand)
+    {
+        if (operand is TypeAnalysisContext or Immediate) return operand;
+        return operand is LocalVariable local && ChaseCopies(definitions, local) is
+            { OpCode: OpCode.Move or OpCode.Phi, Operands: [_, var constant] }
+            && constant is TypeAnalysisContext or Immediate
+            ? constant : null;
+    }
+
     private static Instruction? Definition(Dictionary<LocalVariable, Instruction> definitions, LocalVariable local)
         => definitions.TryGetValue(local, out var definition) ? definition : null;
 
@@ -199,7 +212,7 @@ public static class InterfaceDispatchRecovery
             if (Definition(definitions, local) is not { } definition)
                 return null;
 
-            if (definition is { OpCode: OpCode.Move, Operands: [_, LocalVariable source] })
+            if (definition is { OpCode: OpCode.Move or OpCode.Phi, Operands: [_, LocalVariable source] })
             {
                 local = source;
                 continue;

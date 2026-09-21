@@ -13,6 +13,8 @@ public class InterfaceDispatchCleanupTests
 {
     [TestCase("stale", true)]
     [TestCase("classInit", true)]
+    [TestCase("runtimeClass", true)]
+    [TestCase("lateInterface", true)]
     [TestCase("live", false)]
     [TestCase("unresolved", false)]
     [TestCase("sideEffect", false)]
@@ -66,7 +68,8 @@ public class InterfaceDispatchCleanupTests
         var instructions = new List<Instruction>
         {
             new(0, OpCode.Move, klass, new MemoryOperand(receiver)),
-            new(1, OpCode.Move, iface, disposable),
+            new(1, OpCode.Move, iface, use == "runtimeClass"
+                ? new RuntimeClassTypeAnalysisContext(disposable, disposable.DeclaringAssembly) : disposable),
             new(2, OpCode.Move, condition, new MemoryOperand(klass, addend: 0x12E)),
             new(3, OpCode.ConditionalJump, slowStart, condition),
             fastStart,
@@ -128,6 +131,15 @@ public class InterfaceDispatchCleanupTests
             ControlFlowGraph = cfg, Locals = locals, ParameterLocals = []
         };
 
+        if (use == "lateInterface")
+        {
+            var interfaceLoad = cfg.Instructions.Single(i => i.Destination == iface);
+            interfaceLoad.SetOperand(1, new MemoryOperand(receiver, addend: 0x28));
+            Assert.That(InterfaceDispatchRecovery.Run(caller) is null, Is.True);
+            Assert.That(dispatch.OpCode, Is.EqualTo(OpCode.IndirectCall));
+            // Model the value produced when RGCTX resolution identifies the interface.
+            interfaceLoad.SetOperand(1, new RuntimeClassTypeAnalysisContext(disposable, disposable.DeclaringAssembly));
+        }
         var retryCleanup = InterfaceDispatchRecovery.Run(caller);
         // The first pass must retain values still referenced by an unresolved call.
         Assert.That(cfg.Instructions.Contains(slowCall), Is.True);
