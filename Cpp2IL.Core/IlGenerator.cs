@@ -86,6 +86,9 @@ public static class IlGenerator
             if (operand is FieldReference field)
                 local = field.Local;
 
+            if (operand is AddressOf { Target: FieldReference addressedField })
+                local = addressedField.Local;
+
             if (operand is LocalVariable local2)
                 local = local2;
 
@@ -1046,6 +1049,10 @@ public static class IlGenerator
                 break;
             case AddressOf { Target: LocalVariable addressed }:
                 instructions.Add(CilOpCodes.Ldloca, locals[addressed]);
+                break;
+            case AddressOf { Target: FieldReference fieldAddress }:
+                LoadLocal(fieldAddress.Local, method, locals);
+                instructions.Add(CilOpCodes.Ldflda, fieldAddress.Field.ToFieldDescriptor());
                 break;
             case AddressOf { Target: ArrayAccess elementAddress }:
                 LoadLocal(elementAddress.Array, method, locals);

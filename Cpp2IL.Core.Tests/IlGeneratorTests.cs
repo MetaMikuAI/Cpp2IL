@@ -206,6 +206,44 @@ public class IlGeneratorTests
         Assert.That(il.Any(i => i.OpCode == CilOpCodes.Not), Is.EqualTo(!boolean));
     }
 
+    [Test]
+    public void FieldAddressArgument_EmitsLdfldaAndRetainsReceiver()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var module = new ModuleDefinition("FieldAddress.dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        var owner = new TypeDefinition("Tests", "Owner", TypeAttributes.Public);
+        module.TopLevelTypes.Add(owner);
+        var fieldDefinition = new FieldDefinition("Value", FieldAttributes.Public, new FieldSignature(module.CorLibTypeFactory.Int32));
+        owner.Fields.Add(fieldDefinition);
+        var field = new InjectedFieldAnalysisContext("Value", app.SystemTypes.SystemInt32Type,
+            System.Reflection.FieldAttributes.Public, app.SystemTypes.SystemObjectType);
+        field.PutExtraData("AsmResolverField", fieldDefinition);
+        var receiver = new LocalVariable("receiver", new Register(null, "receiver"));
+        var target = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Consume", app.SystemTypes.SystemVoidType,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, [new ByRefTypeAnalysisContext(app.SystemTypes.SystemInt32Type)]);
+        var targetDefinition = new MethodDefinition("Consume", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void, [module.CorLibTypeFactory.Int32.MakeByReferenceType()]));
+        owner.Methods.Add(targetDefinition);
+        target.PutExtraData("AsmResolverMethod", targetDefinition);
+        var caller = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Caller", app.SystemTypes.SystemVoidType,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, [])
+        {
+            Locals = [], ParameterLocals = [],
+            ControlFlowGraph = new ISILControlFlowGraph([
+                new Instruction(0, OpCode.CallVoid, target, new AddressOf(new FieldReference(field, receiver, 0))),
+                new Instruction(1, OpCode.Return)]),
+        };
+        var generated = new MethodDefinition("Caller", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        owner.Methods.Add(generated);
+        IlGenerator.GenerateIl(caller, generated);
+        var il = generated.CilMethodBody!.Instructions;
+        Assert.That(caller.Locals, Does.Contain(receiver));
+        Assert.That(il.Count(i => i.OpCode == CilOpCodes.Ldflda), Is.EqualTo(1));
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldfld || i.OpCode == CilOpCodes.Add), Is.False);
+        Assert.That(il.Count(i => i.OpCode == CilOpCodes.Call), Is.EqualTo(1));
+    }
+
     [TestCase(false, false)]
     [TestCase(false, true)]
     [TestCase(true, false)]
