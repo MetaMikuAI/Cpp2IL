@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
 using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Graphs;
@@ -156,4 +157,53 @@ public class ArrayAddressRecoveryTests
         if (expected)
             Assert.That(((Immediate)((ArrayAccess)load.Operands[1]).Index).Value, Is.EqualTo((offset - 32) / 8));
     }
+
+    [TestCase(false, 0L, false)]
+    [TestCase(true, 0L, false)]
+    [TestCase(false, 48L, false)]
+    [TestCase(true, 24L, true)]
+    [TestCase(false, 0L, true)]
+    [TestCase(true, 0L, true)]
+    public void RecoversWholeElementBiasWithoutAPeerCounter(bool is32Bit, long offset, bool write)
+    {
+        _app.Binary.is32Bit = is32Bit;
+        var stride = _app.Binary.PointerSizeBytes;
+        var array = Local("array", new SzArrayTypeAnalysisContext(_app.SystemTypes.SystemStringType));
+        var counter = Local("counter", _app.SystemTypes.SystemInt32Type);
+        var value = Local("value", _app.SystemTypes.SystemStringType);
+        var memory = new MemoryOperand(array, counter, offset, stride);
+        var access = write ? new Instruction(0, OpCode.Move, memory, value) : new Instruction(0, OpCode.Move, value, memory);
+        var method = Method(access, new(1, OpCode.Return));
+        ArrayRecovery.RecoverSplitAccesses(method);
+        var element = (ArrayAccess)access.Operands[write ? 0 : 1];
+        var adjusted = (LocalVariable)element.Index;
+        var adjustment = method.ControlFlowGraph!.Instructions.Single(i => i.Destination == adjusted);
+        Assert.That(element.Array, Is.SameAs(array));
+        Assert.That(adjusted.Type, Is.SameAs(counter.Type));
+        Assert.That(method.Locals, Does.Contain(adjusted));
+        Assert.That(adjustment.OpCode, Is.EqualTo(OpCode.Add));
+        Assert.That(adjustment.Operands[1], Is.SameAs(counter));
+        Assert.That(((Immediate)adjustment.Operands[2]).Value, Is.EqualTo(offset / stride - 4));
+        var instructions = method.ControlFlowGraph.Instructions.ToList();
+        Assert.That(instructions.IndexOf(adjustment), Is.LessThan(instructions.IndexOf(access)));
+        ArrayRecovery.RecoverSplitAccesses(method);
+        Assert.That(method.ControlFlowGraph.Instructions.Count(), Is.EqualTo(instructions.Count));
+    }
+
+    [TestCase(1L, 8)]
+    [TestCase(0L, 4)]
+    [TestCase(0x4000000020L, 8)]
+    public void DoesNotGuessMisalignedWrongStrideOrOversizedBias(long offset, int stride)
+    {
+        var array = Local("array", new SzArrayTypeAnalysisContext(_app.SystemTypes.SystemStringType));
+        var counter = Local("counter");
+        var value = Local("value");
+        var access = new Instruction(0, OpCode.Move, value, new MemoryOperand(array, counter, offset, stride));
+        var method = Method(access, new(1, OpCode.Return));
+        ArrayRecovery.RecoverSplitAccesses(method);
+        Assert.That(access.Operands[1], Is.TypeOf<MemoryOperand>());
+        Assert.That(counter.Type, Is.Null);
+        Assert.That(method.Locals.Count, Is.EqualTo(3));
+    }
+
 }

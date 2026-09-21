@@ -45,7 +45,8 @@ public static class ArrayRecovery
                     peers[local] = phis;
         }
 
-        foreach (var instruction in cfg.Instructions)
+        foreach (var block in cfg.Blocks)
+        foreach (var instruction in block.Instructions.ToList())
         {
             for (var i = 0; i < instruction.Operands.Count; i++)
             {
@@ -75,6 +76,23 @@ public static class ArrayRecovery
                             index = candidate;
                             break;
                         }
+                // The native counter may already include the array header (or another
+                // whole-element bias). Solve byteOffset = header + index * stride exactly;
+                // prefer a matching induction variable above to avoid redundant arithmetic.
+                if (index == null && affine.Root != null && affine.Multiplier == stride
+                    && (affine.Offset - header) % stride == 0
+                    && (affine.Offset - header) / stride is >= int.MinValue and <= int.MaxValue)
+                {
+                    TypeIndex(affine.Root, method, definitions, new HashSet<LocalVariable>());
+                    var name = $"arrayIndex{method.Locals.Count}";
+                    var adjusted = new LocalVariable(name, new Register(null, name), affine.Root.Type);
+                    var adjustment = new Instruction(instruction.Index, OpCode.Add, adjusted, affine.Root,
+                        new Immediate((affine.Offset - header) / stride));
+                    method.Locals.Add(adjusted);
+                    block.Instructions.Insert(block.Instructions.IndexOf(instruction), adjustment);
+                    definitions[adjusted] = adjustment;
+                    index = adjusted;
+                }
                 if (index == null || index is LocalVariable typedIndex && !IsNativeIndex(typedIndex))
                     continue;
                 if (affine.Root != null)
