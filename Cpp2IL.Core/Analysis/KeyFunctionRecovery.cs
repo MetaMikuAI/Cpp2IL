@@ -44,7 +44,7 @@ public static class KeyFunctionRecovery
             .GroupBy(i => (LocalVariable)i.Destination!).Where(g => g.Count() == 1).ToDictionary(g => g.Key, g => g.Single());
         foreach (var instruction in method.ControlFlowGraph!.Blocks.SelectMany(block => block.Instructions))
         {
-            if (TryRewriteIsInst(instruction, method, definitions) || TryRewriteBox(instruction, method)
+            if (TryRewriteIsInst(instruction, method, definitions) || TryRewriteBox(instruction, method, definitions)
                 || ThreadStaticFieldRecovery.TryTypeLookup(instruction, method, definitions))
                 continue;
             if (instruction.Operands is not [StringLiteral { Value: var keyFunction }, ..])
@@ -134,11 +134,23 @@ public static class KeyFunctionRecovery
         instruction.SetOperands(exception);
     }
 
-    private static bool TryRewriteBox(Instruction instruction, MethodAnalysisContext method)
+    private static bool TryRewriteBox(Instruction instruction, MethodAnalysisContext method, Dictionary<LocalVariable, Instruction> definitions)
     {
         // function name, result, class, address of value.
-        if (instruction.OpCode != OpCode.Call || instruction.Operands is not [var target, var result, TypeAnalysisContext boxedType, var value, ..])
+        if (instruction.OpCode != OpCode.Call || instruction.Operands is not [var target, var result, var classOperand, var value, ..])
             return false;
+
+        // Use the actual SSA metadata/address definitions, not a class inferred from an
+        // arbitrary pointer's type. Waiting for late inlining lets guessed call arguments
+        // contaminate the stack value's type before the boxing helper can establish it.
+        var boxedType = ResolveCopies(classOperand) switch
+        {
+            RuntimeClassTypeAnalysisContext klass => klass.RepresentedType,
+            TypeAnalysisContext type when type is not RuntimeMethodInfoAnalysisContext => type,
+            _ => null
+        };
+        if (boxedType == null) return false;
+        value = ResolveCopies(value);
 
         if (target is not StringLiteral name || !BoxFunctions.Contains(name.Value))
         {
@@ -163,6 +175,15 @@ public static class KeyFunctionRecovery
         instruction.OpCode = OpCode.Box;
         instruction.SetOperands(result, boxedType, value);
         return true;
+
+        IOperand ResolveCopies(IOperand operand)
+        {
+            var seen = new HashSet<LocalVariable>();
+            while (operand is LocalVariable local && seen.Add(local) && definitions.TryGetValue(local, out var definition)
+                && definition is { OpCode: OpCode.Move or OpCode.Phi, Operands: [_, var source] })
+                operand = source;
+            return operand;
+        }
     }
 
     private static void RewriteTypeObject(Instruction instruction)

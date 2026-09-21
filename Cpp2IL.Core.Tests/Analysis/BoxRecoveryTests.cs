@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Reflection;
 using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Graphs;
@@ -100,5 +101,63 @@ public class BoxRecoveryTests
             _app.GetOrCreateKeyFunctionAddresses().il2cpp_vm_object_box = address + 16;
         Check(new Immediate(unchecked((long)address)), false, dynamicClass);
         Check(new Immediate(unchecked((long)address)), false, dynamicClass, "unknown");
+    }
+
+    [TestCase("copy", true)]
+    [TestCase("runtimeClass", true)]
+    [TestCase("mixedClass", false)]
+    [TestCase("mixedAddress", false)]
+    [TestCase("typedOnly", false)]
+    [TestCase("cycle", false)]
+    [TestCase("multipleDefinitions", false)]
+    [TestCase("mismatch", false)]
+    [TestCase("wrongHelper", false)]
+    public void RecoversOnlyProvenMetadataAndAddressCopies(string shape, bool expected)
+    {
+        var address = _app.Binary.GetVirtualAddressOfPrimaryExecutableSection();
+        _app.Binary.BaseStream.Position = _app.Binary.MapVirtualAddressToRaw(address);
+        _app.Binary.BaseStream.Write(BitConverter.GetBytes(0x14000004u));
+        _app.GetOrCreateKeyFunctionAddresses().il2cpp_vm_object_box = address + (shape == "wrongHelper" ? 32u : 16u);
+        var type = _app.SystemTypes.SystemInt32Type;
+        var value = new LocalVariable("value", new Register(null, "value"), shape == "mismatch" ? _app.SystemTypes.SystemInt64Type : null);
+        var result = new LocalVariable("result", new Register(null, "result"));
+        var klass = new LocalVariable("klass", new Register(null, "klass"));
+        var classCopy = new LocalVariable("classCopy", new Register(null, "classCopy"));
+        var pointer = new LocalVariable("pointer", new Register(null, "pointer"));
+        var pointerCopy = new LocalVariable("pointerCopy", new Register(null, "pointerCopy"));
+        var classLoad = new Instruction(0, OpCode.Move, klass,
+            shape == "runtimeClass" ? new RuntimeClassTypeAnalysisContext(type, type.DeclaringAssembly) : type);
+        var classPhi = new Instruction(1, OpCode.Phi, classCopy, klass);
+        var pointerLoad = new Instruction(2, OpCode.Move, pointer, new AddressOf(value));
+        var pointerPhi = new Instruction(3, OpCode.Phi, pointerCopy, pointer);
+        var call = new Instruction(4, OpCode.Call, new Immediate(unchecked((long)address)), result, classCopy, pointerCopy);
+        var instructions = new List<Instruction> { classLoad, classPhi, pointerLoad, pointerPhi, call, new(5, OpCode.Return, result) };
+        switch (shape)
+        {
+            case "mixedClass": classPhi.SetOperands(classCopy, klass, _app.SystemTypes.SystemInt64Type); break;
+            case "mixedAddress": pointerPhi.SetOperands(pointerCopy, pointer, new Immediate(0)); break;
+            case "typedOnly":
+                klass.Type = new RuntimeClassTypeAnalysisContext(type, type.DeclaringAssembly);
+                classLoad.OpCode = OpCode.Nop;
+                classLoad.SetOperands();
+                break;
+            case "cycle": pointerLoad.SetOperand(1, pointerCopy); break;
+            case "multipleDefinitions": instructions.Insert(1, new(6, OpCode.Move, klass, type)); break;
+        }
+        var method = new InjectedMethodAnalysisContext(_app.SystemTypes.SystemObjectType, "BoxCopies", _app.SystemTypes.SystemObjectType,
+            MethodAttributes.Public | MethodAttributes.Static, [])
+        {
+            ControlFlowGraph = new ISILControlFlowGraph(instructions),
+            Locals = [value, result, klass, classCopy, pointer, pointerCopy], ParameterLocals = []
+        };
+        KeyFunctionRecovery.Run(method);
+        Assert.That(call.OpCode, Is.EqualTo(expected ? OpCode.Box : OpCode.Call));
+        if (expected)
+        {
+            Assert.That(call.Operands, Is.EqualTo(new IOperand[] { result, type, new AddressOf(value) }));
+            Assert.That(value.Type, Is.SameAs(type));
+        }
+        else if (shape != "mismatch")
+            Assert.That(value.Type, Is.Null, "Rejected evidence must not type the stack value");
     }
 }
