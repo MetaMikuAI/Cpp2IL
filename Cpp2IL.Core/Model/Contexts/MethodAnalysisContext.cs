@@ -447,6 +447,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         InternalCallGuardRemover.Run(this);
         KeyFunctionRecovery.Run(this);
+        // Generic specialization is finished. Drop its hidden metadata and guessed arguments
+        // while SSA phis still let interface cleanup prove that the native lookup is dead.
+        CallArgumentTrimmer.Run(this);
         // Inlined helper operands can finally expose boxing and release stale lookup arguments.
         retryInterfaceCleanup?.Invoke();
         retryResolvedInterfaceCleanup?.Invoke();

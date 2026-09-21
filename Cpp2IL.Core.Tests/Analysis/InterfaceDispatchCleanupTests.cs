@@ -6,6 +6,7 @@ using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.InstructionSets;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
+using LibCpp2IL.BinaryStructures;
 
 namespace Cpp2IL.Core.Tests.Analysis;
 
@@ -16,6 +17,8 @@ public class InterfaceDispatchCleanupTests
     [TestCase("runtimeClass", true)]
     [TestCase("lateInterface", true)]
     [TestCase("lateBox", true)]
+    [TestCase("lateGeneric", true)]
+    [TestCase("lateGenericLive", false)]
     [TestCase("earlyClass", true)]
     [TestCase("earlyClassLive", false)]
     [TestCase("earlyClassSideEffect", false)]
@@ -69,6 +72,20 @@ public class InterfaceDispatchCleanupTests
         var virtualCall = new Instruction(34, OpCode.IndirectCall,
             new MemoryOperand(klass, addend: use == "unresolved" ? 1 : 0x138 + virtualMethod.Definition!.slot * 16),
             virtualResult, receiver, stale);
+        if (use.StartsWith("lateGeneric"))
+        {
+            var definition = new InjectedMethodAnalysisContext(objectType, "Consume", objectType,
+                MethodAttributes.Public | MethodAttributes.Static, []);
+            definition.GenericParameters.Add(new GenericParameterTypeAnalysisContext("T", 0, Il2CppTypeEnum.IL2CPP_TYPE_MVAR,
+                GenericParameterAttributes.None, definition));
+            definition.Parameters.Add(new InjectedParameterAnalysisContext("value", objectType, ParameterAttributes.None, 0, definition));
+            if (use == "lateGenericLive")
+                definition.Parameters.Add(new InjectedParameterAnalysisContext("lookup", objectType, ParameterAttributes.None, 1, definition));
+            virtualMethod = new ConcreteGenericMethodAnalysisContext(definition, [], [app.SystemTypes.SystemStringType]);
+            virtualCall.OpCode = OpCode.Call;
+            virtualCall.SetOperands(virtualMethod, virtualResult, receiver, stale,
+                new RuntimeMethodInfoAnalysisContext(virtualMethod, objectType.DeclaringAssembly));
+        }
         var instructions = new List<Instruction>
         {
             new(0, OpCode.Move, klass, new MemoryOperand(receiver)),
@@ -181,6 +198,13 @@ public class InterfaceDispatchCleanupTests
             MetadataInitGuardRemover.RunSsaClassGuards(cfg, 0x135);
             retryCleanup?.Invoke();
         }
+        if (use.StartsWith("lateGeneric"))
+        {
+            Assert.That(cfg.Instructions.Contains(slowCall), Is.True,
+                "Early trimming must preserve generic metadata until specialization finishes");
+            CallArgumentTrimmer.Run(caller);
+            retryCleanup?.Invoke();
+        }
         if (use == "lateBox")
         {
             Assert.That(cfg.Instructions.Contains(slowCall), Is.True,
@@ -203,7 +227,7 @@ public class InterfaceDispatchCleanupTests
             if (use != "lateBox")
                 Assert.That(virtualCall.Operands, Is.EqualTo(new IOperand[] { virtualMethod, virtualResult, receiver }));
         }
-        else if (use is "live" or "earlyClassLive" or "unresolved")
+        else if (use is "live" or "earlyClassLive" or "lateGenericLive" or "unresolved")
             Assert.That(virtualCall.Operands, Does.Contain(stale));
 
         retryCleanup?.Invoke();
