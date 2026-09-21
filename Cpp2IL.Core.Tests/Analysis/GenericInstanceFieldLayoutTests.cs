@@ -92,6 +92,30 @@ public class GenericInstanceFieldLayoutTests
     [TestCase(false, true)]
     [TestCase(true, false)]
     [TestCase(true, true)]
+    public void DoesNotUsePlaceholderOffsetsForNestedFields(bool open, bool write)
+    {
+        var instance = Create(_app.SystemTypes.SystemInt32Type, array: false);
+        TypeAnalysisContext owner = open ? instance.GenericType : instance;
+        // The count field has placeholder offset zero; Int32.m_value also has offset zero.
+        // Neither justifies treating a load from the object header as count.m_value.
+        var receiver = new LocalVariable("receiver", new Register(null, "receiver"), owner);
+        var value = new LocalVariable("value", new Register(null, "value"), _app.SystemTypes.SystemInt32Type);
+        var memory = new MemoryOperand(receiver);
+        var access = write ? new Instruction(0, OpCode.Move, memory, value) : new Instruction(0, OpCode.Move, value, memory);
+        var method = new InjectedMethodAnalysisContext(_app.SystemTypes.SystemObjectType, "UsePlaceholder", _app.SystemTypes.SystemVoidType,
+            MethodAttributes.Public | MethodAttributes.Static, [])
+        {
+            ControlFlowGraph = new ISILControlFlowGraph([access, new(1, OpCode.Return)]),
+            Locals = [receiver, value], ParameterLocals = []
+        };
+        Assert.That(MetadataResolver.ResolveFieldOffsets(method), Is.False);
+        Assert.That(access.Operands[write ? 0 : 1], Is.EqualTo(memory));
+    }
+
+    [TestCase(false, false)]
+    [TestCase(false, true)]
+    [TestCase(true, false)]
+    [TestCase(true, true)]
     public void StartsDerivedFieldsAfterExactMetadataBaseExtent(bool genericWrapper, bool write)
     {
         var parent = _app.AllTypes.Single(t => t.FullName == "UnityEngine.MonoBehaviour");

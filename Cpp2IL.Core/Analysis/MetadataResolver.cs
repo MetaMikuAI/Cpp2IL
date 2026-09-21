@@ -321,6 +321,10 @@ public static class MetadataResolver
                          candidateOwner != null && field == null;
                          candidateOwner = candidateOwner.BaseType)
                     {
+                        // Generic definition offsets are placeholders, not evidence for an
+                        // embedded member when the instantiated layout could not be proven.
+                        if (candidateOwner is GenericInstanceTypeAnalysisContext || candidateOwner.GenericParameters.Count > 0)
+                            continue;
                         var containing = candidateOwner.Fields.FirstOrDefault(f => !f.IsStatic
                             && f.FieldType.IsValueType
                             && f.Offset >= 0
