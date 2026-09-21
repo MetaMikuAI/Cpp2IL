@@ -126,10 +126,44 @@ public class IntegerArithmeticTypeTests
         Assert.That(Propagate(OpCode.ShiftRight, Local(type), Local("Int32")).Type, Is.SameAs(Type(type)));
     }
 
+    [TestCase(OpCode.And)]
+    [TestCase(OpCode.Or)]
+    [TestCase(OpCode.Xor)]
+    public void BooleanBitwiseLiteralsRequireAKnownBoolean(OpCode opcode)
+    {
+        var flag = Local("Boolean");
+        foreach (var value in new long[] { 0, 1 })
+        {
+            var literal = new Immediate(value);
+            Assert.That(Propagate(opcode, flag, literal).Type, Is.SameAs(Type("Boolean")));
+            Assert.That(Propagate(opcode, literal, flag).Type, Is.SameAs(Type("Boolean")));
+            Assert.That(Propagate(opcode, literal, new LocalVariable("unknown", new Register(null, "unknown"))).Type, Is.Null);
+            Assert.That(Propagate(opcode, literal, new Immediate(1)).Type, Is.Null);
+            Assert.That(Propagate(opcode, Local("Int32"), literal).Type, Is.SameAs(Type("Int32")));
+            Assert.That(Propagate(opcode, flag, literal, Type("Object")).Type, Is.SameAs(Type("Object")));
+        }
+        foreach (var value in new long[] { -1, 2, 255 })
+        {
+            Assert.That(Propagate(opcode, flag, new Immediate(value)).Type, Is.Null);
+            Assert.That(Propagate(opcode, new Immediate(value), flag).Type, Is.Null);
+        }
+        Assert.That(Propagate(opcode, flag, Local("Boolean")).Type, Is.SameAs(Type("Boolean")));
+        Assert.That(flag.Type, Is.SameAs(Type("Boolean")));
+    }
+
+    [Test]
+    public void BooleanLiteralInferenceWaitsForStorageAndIndexTypes()
+    {
+        var flag = Local("Boolean");
+        Assert.That(Propagate(OpCode.Xor, flag, new Immediate(1), late: false).Type, Is.Null);
+        Assert.That(Propagate(OpCode.Xor, flag, new Immediate(1), Type("IntPtr")).Type, Is.SameAs(Type("IntPtr")));
+        Assert.That(Propagate(OpCode.Xor, flag, new Immediate(1), Type("Int32")).Type, Is.SameAs(Type("Int32")));
+    }
+
     private static TypeAnalysisContext Type(string name) => Cpp2IlApi.CurrentAppContext!.AssembliesByName["mscorlib"].GetTypeByFullName("System." + name)!;
     private static LocalVariable Local(string type) => new(Guid.NewGuid().ToString(), new Register(null, Guid.NewGuid().ToString()), Type(type));
 
-    private static LocalVariable Propagate(OpCode opcode, IOperand left, IOperand right, TypeAnalysisContext? resultType = null)
+    private static LocalVariable Propagate(OpCode opcode, IOperand left, IOperand right, TypeAnalysisContext? resultType = null, bool late = true)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
         var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "IntegerArithmetic",
@@ -137,6 +171,8 @@ public class IntegerArithmeticTypeTests
         var result = new LocalVariable("result", new Register(null, "result"), resultType);
         method.ControlFlowGraph = new ISILControlFlowGraph([new Instruction(0, opcode, result, left, right), new Instruction(1, OpCode.Return)]);
         typeof(LocalVariables).GetMethod("PropagateTypesOnce", BindingFlags.Static | BindingFlags.NonPublic)!.Invoke(null, [method]);
+        if (late)
+            LocalVariables.PropagateKnownTypes(method);
         return result;
     }
 }

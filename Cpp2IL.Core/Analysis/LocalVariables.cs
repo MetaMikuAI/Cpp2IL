@@ -426,7 +426,20 @@ public static class LocalVariables
     // Propagate only those known types; do not rerun metadata or native-layout rewrites.
     internal static void PropagateKnownTypes(MethodAnalysisContext method)
     {
-        while (PropagateTypesOnce(method)) { }
+        bool changed;
+        do
+        {
+            changed = false;
+            // Seed bool/literal operations only after field and array recovery has established
+            // storage/index types. Early backward phi propagation can otherwise mistype those uses.
+            foreach (var instruction in method.ControlFlowGraph!.Instructions)
+                if (instruction is { OpCode: OpCode.And or OpCode.Or or OpCode.Xor,
+                        Operands: [LocalVariable destination, var left, var right] }
+                    && ((IsBoolean(left, method) && right is Immediate { Value: 0 or 1 })
+                        || (left is Immediate { Value: 0 or 1 } && IsBoolean(right, method))))
+                    changed |= SetTypeIfUnknown(destination, method.AppContext.SystemTypes.SystemBooleanType);
+            changed |= PropagateTypesOnce(method);
+        } while (changed);
     }
 
     // A single propagation sweep over every move and phi. Returns whether it filled in any type.
