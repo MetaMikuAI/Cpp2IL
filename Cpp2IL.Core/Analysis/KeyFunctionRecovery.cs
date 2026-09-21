@@ -131,7 +131,8 @@ public static class KeyFunctionRecovery
             // an entry-point B: calls or argument-adjusting wrappers are not equivalent.
             if (target is not Immediate address || method.AppContext.InstructionSet is not InstructionSets.NewArmV8InstructionSet
                 || !boxedType.IsValueType
-                || value is not AddressOf { Target: LocalVariable { Type: { } valueType } } || valueType != boxedType)
+                || value is not AddressOf { Target: LocalVariable valueLocal }
+                || valueLocal.Type != null && valueLocal.Type != boxedType)
                 return false;
             var implementation = NewArm64KeyFunctionAddresses.GetBranchThunkTarget(method.AppContext, address.UnsignedValue);
             if (implementation == 0)
@@ -139,6 +140,9 @@ public static class KeyFunctionRecovery
             var known = method.AppContext.GetOrCreateKeyFunctionAddresses();
             if (implementation != known.il2cpp_value_box && implementation != known.il2cpp_vm_object_box)
                 return false;
+            // The proven boxing helper and its class argument establish the pointee type.
+            // Do this only after verifying the target, and never overwrite a conflicting type.
+            valueLocal.Type ??= boxedType;
         }
 
         instruction.OpCode = OpCode.Box;

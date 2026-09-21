@@ -51,6 +51,8 @@ public class BoxRecoveryTests
         Assert.That(call.Operands, Is.EqualTo(expected
             ? new IOperand[] { result, type, pointer }
             : new IOperand[] { target, result, klass, pointer }));
+        if (valueKind == "unknown")
+            Assert.That(value.Type, expected ? Is.SameAs(type) : Is.Null);
         KeyFunctionRecovery.Run(method);
         Assert.That(call.OpCode, Is.EqualTo(expected ? OpCode.Box : OpCode.Call));
     }
@@ -73,9 +75,9 @@ public class BoxRecoveryTests
         _app.Binary.BaseStream.Write(BitConverter.GetBytes(word));
         _app.GetOrCreateKeyFunctionAddresses().il2cpp_vm_object_box = address + 16;
         Check(new Immediate(unchecked((long)address)), expected);
+        Check(new Immediate(unchecked((long)address)), expected, valueKind: "unknown");
     }
 
-    [TestCase("unknown")]
     [TestCase("mismatched")]
     [TestCase("raw")]
     public void DoesNotBoxUnsupportedPointees(string valueKind)
@@ -97,5 +99,6 @@ public class BoxRecoveryTests
         if (dynamicClass)
             _app.GetOrCreateKeyFunctionAddresses().il2cpp_vm_object_box = address + 16;
         Check(new Immediate(unchecked((long)address)), false, dynamicClass);
+        Check(new Immediate(unchecked((long)address)), false, dynamicClass, "unknown");
     }
 }
