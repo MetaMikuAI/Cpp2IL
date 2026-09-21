@@ -572,6 +572,9 @@ public static class LocalVariables
             FieldReference field => field.Field.FieldType,
             _ => null,
         };
+        // Native enum arithmetic operates on its declared underlying integer, not an object.
+        if (type?.IsEnumType == true)
+            type = type.EnumUnderlyingType;
         return type?.FullName switch
         {
             "System.Byte" or "System.SByte" or "System.Int16" or "System.UInt16" or "System.Char"

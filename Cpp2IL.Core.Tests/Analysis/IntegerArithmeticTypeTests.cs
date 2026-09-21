@@ -84,6 +84,31 @@ public class IntegerArithmeticTypeTests
         Assert.That(Propagate(OpCode.Add, Local("Int32"), new Immediate(1), Type("Int64")).Type, Is.SameAs(Type("Int64")));
     }
 
+    [TestCase("Byte", "Int32")]
+    [TestCase("SByte", "Int32")]
+    [TestCase("Int16", "Int32")]
+    [TestCase("UInt16", "Int32")]
+    [TestCase("Int32", "Int32")]
+    [TestCase("UInt32", "UInt32")]
+    [TestCase("Int64", "Int64")]
+    [TestCase("UInt64", "UInt64")]
+    public void EnumArithmeticUsesUnderlyingIntegerWithoutRetypingEnum(string underlying, string promoted)
+    {
+        var enumType = new InjectedTypeAnalysisContext(Type("Object").DeclaringAssembly,
+            "Tests", "State", Type("Enum"), TypeAttributes.Public)
+        {
+            OverrideEnumUnderlyingType = Type(underlying),
+        };
+        var state = new LocalVariable("state", new Register(null, "state"), enumType);
+        var biased = Propagate(OpCode.Subtract, state, new Immediate(1));
+        Assert.That(biased.Type, Is.SameAs(Type(promoted)));
+        Assert.That(Propagate(OpCode.Add, biased, new Immediate(2)).Type, Is.SameAs(Type(promoted)));
+        Assert.That(Propagate(OpCode.Subtract, state, state).Type, Is.SameAs(Type(promoted)));
+        Assert.That(state.Type, Is.SameAs(enumType));
+        Assert.That(Propagate(OpCode.Subtract, state, new LocalVariable("unknown", new Register(null, "unknown"))).Type, Is.Null);
+        Assert.That(Propagate(OpCode.Subtract, state, new Immediate(1), Type("Object")).Type, Is.SameAs(Type("Object")));
+    }
+
     [TestCase(OpCode.ShiftLeft)]
     [TestCase(OpCode.ShiftRight)]
     public void ShiftCountDoesNotTypeUnknownValue(OpCode opcode)
