@@ -150,6 +150,8 @@ public static class MetadataResolver
     {
         var pending = instructions.Where(i => i.OpCode is OpCode.Move or OpCode.Phi
             && i.Destination is LocalVariable).ToList();
+        var definitions = pending.GroupBy(i => (LocalVariable)i.Destination!)
+            .ToDictionary(g => g.Key, g => g.Count() == 1 ? g.Single() : null);
         bool changed;
         do
         {
@@ -164,6 +166,8 @@ public static class MetadataResolver
                 else if (instruction is { OpCode: OpCode.Move, Operands: [_, MemoryOperand
                     { Base: LocalVariable pointer, Index: null, Scale: 0, Addend: 0 }] })
                 {
+                    if (!resolved.ContainsKey(pointer))
+                        ResolveMetadataCopyCycle(pointer, definitions, resolved);
                     if (resolved.TryGetValue(pointer, out value)) instruction.SetOperand(1, value);
                 }
                 else if (instruction.OpCode == OpCode.Phi && instruction.Operands.Count > 1)
@@ -181,6 +185,51 @@ public static class MetadataResolver
                 changed = true;
             }
         } while (changed);
+    }
+
+    // A loop phi can depend on itself through several copies. Prove its entire copy
+    // graph has one metadata seed; waiting for every backedge to resolve cannot converge.
+    // Unknown leaves, computations and disagreeing seeds invalidate the whole proof.
+    private static void ResolveMetadataCopyCycle(LocalVariable root,
+        Dictionary<LocalVariable, Instruction?> definitions, Dictionary<LocalVariable, IOperand> resolved)
+    {
+        var pending = new Stack<IOperand>();
+        var visited = new HashSet<LocalVariable>();
+        IOperand? seed = null;
+        pending.Push(root);
+        while (pending.TryPop(out var operand))
+        {
+            if (operand is LocalVariable local)
+            {
+                if (resolved.TryGetValue(local, out var known)) operand = known;
+                else
+                {
+                    if (!visited.Add(local)) continue;
+                    if (visited.Count > 1024 || !definitions.TryGetValue(local, out var definition)
+                        || definition is not { OpCode: OpCode.Move or OpCode.Phi, Operands.Count: > 1 }) return;
+                    foreach (var source in definition.Operands.Skip(1)) pending.Push(source);
+                    continue;
+                }
+            }
+            if (operand is not (TypeAnalysisContext or StringLiteral) || seed != null && !Equals(seed, operand)) return;
+            seed = operand;
+        }
+        if (seed == null) return;
+        // Every subcycle needs an incoming seed of its own. A seeded outer phi must
+        // not give an otherwise uninitialized inner cycle a fabricated value.
+        var anchored = new HashSet<LocalVariable>();
+        bool changed;
+        do
+        {
+            changed = false;
+            foreach (var local in visited)
+                if (!anchored.Contains(local) && definitions[local]!.Operands.Skip(1).Any(source =>
+                    source is TypeAnalysisContext or StringLiteral
+                    || source is LocalVariable input && (resolved.ContainsKey(input) || anchored.Contains(input))))
+                    changed |= anchored.Add(local);
+        } while (changed);
+        if (anchored.Count != visited.Count) return;
+        foreach (var local in visited) resolved[local] = seed;
     }
 
     /// <summary>

@@ -9,7 +9,7 @@ public class MetadataPointerPropagationTests
     [TestCase("same", true)]
     [TestCase("different", false)]
     [TestCase("unknown", false)]
-    [TestCase("cycle", false)]
+    [TestCase("cycle", true)]
     public void ResolvesOnlyUnanimousMetadataAcrossOutOfOrderCopies(string input, bool expected)
     {
         LocalVariable Local(string name) => new(name, new Register(null, name));
@@ -46,5 +46,41 @@ public class MetadataPointerPropagationTests
         var load = new Instruction(0, OpCode.Move, loaded, new MemoryOperand(pointer, addend: offset));
         MetadataResolver.ResolveIndirectMetadataUsages([load], new() { [pointer] = metadata });
         Assert.That(Equals(load.Operands[1], metadata), Is.EqualTo(expected));
+    }
+
+    [TestCase("seeded", true)]
+    [TestCase("directSeed", true)]
+    [TestCase("different", false)]
+    [TestCase("unknown", false)]
+    [TestCase("unseeded", false)]
+    [TestCase("unseededInnerCycle", false)]
+    [TestCase("computed", false)]
+    [TestCase("multipleDefinitions", false)]
+    public void ResolvesClosedCopyCyclesOnlyWithOneProvenSeed(string kind, bool expected)
+    {
+        LocalVariable Local(string name) => new(name, new Register(null, name));
+        var first = Local("first");
+        var second = Local("second");
+        var copy = Local("copy");
+        var root = Local("root");
+        var other = Local("other");
+        var loaded = Local("loaded");
+        var metadata = new StringLiteral("metadata");
+        var resolved = new Dictionary<LocalVariable, IOperand> { [root] = metadata };
+        if (kind == "different") resolved[other] = new StringLiteral("different");
+        var load = new Instruction(0, OpCode.Move, loaded, new MemoryOperand(first));
+        var instructions = new List<Instruction>
+        {
+            load,
+            new(1, OpCode.Phi, first, second, kind == "unseeded" ? copy : kind == "directSeed" ? metadata : root),
+            new(2, OpCode.Phi, second, copy, kind is "different" or "unknown" ? other : kind == "unseededInnerCycle" ? second : first),
+            kind == "computed" ? new(3, OpCode.Add, copy, first, new Immediate(8))
+                : new(3, OpCode.Move, copy, kind == "unseededInnerCycle" ? second : first),
+        };
+        if (kind == "multipleDefinitions") instructions.Add(new(4, OpCode.Move, copy, other));
+        MetadataResolver.ResolveIndirectMetadataUsages(instructions, resolved);
+        Assert.That(Equals(load.Operands[1], metadata), Is.EqualTo(expected));
+        foreach (var local in new[] { first, second, copy, loaded })
+            Assert.That(resolved.ContainsKey(local), Is.EqualTo(expected), "failed proofs must not partially seed the cycle");
     }
 }
