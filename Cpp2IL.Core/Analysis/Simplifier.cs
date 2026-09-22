@@ -95,6 +95,14 @@ public static class Simplifier
                     // If it's move and it moves something to local, replace and remove it
                     if (instruction.OpCode == OpCode.Move && instruction.Operands[0] is LocalVariable local)
                     {
+                        // A load captures mutable storage, not a constant. Without alias analysis,
+                        // only substitute its single adjacent use; never delay or duplicate the read.
+                        if (instruction.Operands[1] is MemoryOperand or FieldReference or ArrayAccess or ArrayLength
+                            && (i + 1 >= block.Instructions.Count
+                                || block.Instructions[i + 1].Sources.Count(source => ReferenceEquals(source, local)) != 1
+                                || IsLocalUsedAfterInstruction(block, i + 2, local, out _)))
+                            continue;
+
                         if (IsLocalUsedAfterInstruction(block, i + 1, local, out var usedByMemory))
                         {
                             // This can't be inlined into memory operand

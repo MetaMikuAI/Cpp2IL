@@ -10,6 +10,37 @@ namespace Cpp2IL.Core.Tests.Analysis;
 
 public class SimplifierTests
 {
+    [TestCase(false, false)] [TestCase(false, true)]
+    [TestCase(true, false)] [TestCase(true, true)]
+    public void PreservesReadSnapshotAcrossStoreOrCall(bool fieldRead, bool call)
+    {
+        var receiver = new LocalVariable("receiver", new Register(null, "receiver"));
+        var snapshot = new LocalVariable("snapshot", new Register(null, "snapshot"));
+        var field = (FieldAnalysisContext)RuntimeHelpers.GetUninitializedObject(typeof(InjectedFieldAnalysisContext));
+        IOperand read = fieldRead ? new FieldReference(field, receiver, 0) : new MemoryOperand(receiver, accessSize: 8);
+        var capture = new Instruction(0, OpCode.Move, snapshot, read);
+        var mutation = call ? new Instruction(1, OpCode.CallVoid, Str("mutate"), receiver)
+            : new Instruction(1, OpCode.Move, read, Imm(0));
+        var use = new Instruction(2, OpCode.Return, snapshot);
+        var graph = new ISILControlFlowGraph([capture, mutation, use]);
+        Simplifier.Simplify(CreateMethod(graph, receiver, snapshot));
+        Assert.That(capture.OpCode, Is.EqualTo(OpCode.Move));
+        Assert.That(use.Operands[0], Is.SameAs(snapshot), "The value captured before the mutation must survive");
+    }
+
+    [Test]
+    public void DoesNotDuplicateAnAdjacentMemoryRead()
+    {
+        var snapshot = new LocalVariable("snapshot", new Register(null, "snapshot"));
+        var capture = new Instruction(0, OpCode.Move, snapshot, new MemoryOperand(addend: 0xAAAA, accessSize: 8));
+        var call = new Instruction(1, OpCode.CallVoid, Str("consume"), snapshot, snapshot);
+        var graph = new ISILControlFlowGraph([capture, call, new(2, OpCode.Return)]);
+        Simplifier.Simplify(CreateMethod(graph, snapshot));
+        Assert.That(capture.OpCode, Is.EqualTo(OpCode.Move));
+        Assert.That(call.Operands[1], Is.SameAs(snapshot));
+        Assert.That(call.Operands[2], Is.SameAs(snapshot));
+    }
+
     private static MethodAnalysisContext CreateMethod(ISILControlFlowGraph graph, params LocalVariable[] locals)
     {
         var method = (MethodAnalysisContext)RuntimeHelpers.GetUninitializedObject(typeof(MethodAnalysisContext));
