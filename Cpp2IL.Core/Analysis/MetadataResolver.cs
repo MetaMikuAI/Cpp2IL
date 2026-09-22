@@ -424,6 +424,11 @@ public static class MetadataResolver
                     continue;
                 }
 
+                // Bind the containing field before inspecting its members, so nested stores
+                // preserve both the substituted field type and the concrete declaring owner.
+                if (fieldGenericOwner != null && instruction.Operands[i] is not FieldReference { IsNested: true })
+                    field = new ConcreteGenericFieldAnalysisContext(field, fieldGenericOwner);
+
                 // A scalar store at the start of an embedded value type is a store to its first
                 // member, not an assignment of the whole aggregate (e.g. Vector2.x). The native
                 // compiler commonly emits this shape when initializing one component separately.
@@ -437,10 +442,6 @@ public static class MetadataResolver
                 {
                     instruction.SetOperand(i, new FieldReference(firstMember, fieldLocal, (int)fieldOffset, field));
                 }
-
-                // make sure we have a full GIT for field access. open type is bad.
-                if (fieldGenericOwner != null && instruction.Operands[i] is not FieldReference { IsNested: true })
-                    field = new ConcreteGenericFieldAnalysisContext(field, fieldGenericOwner);
 
                 if (instruction.Operands[i] is not FieldReference { IsNested: true })
                     instruction.SetOperand(i, new FieldReference(field, fieldLocal, (int)fieldOffset));

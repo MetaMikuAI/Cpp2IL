@@ -159,6 +159,44 @@ public class GenericInstanceFieldLayoutTests
     [TestCase(false, true)]
     [TestCase(true, false)]
     [TestCase(true, true)]
+    public void BindsGenericContainingFieldBeforeResolvingScalarStore(bool substituted, bool inherited)
+    {
+        var vector = _app.AllTypes.Single(t => t.FullName == "UnityEngine.Vector2");
+        var owner = Create(vector, array: false);
+        if (!substituted)
+            owner.GenericType.Fields[0].FieldType = vector;
+        TypeAnalysisContext receiverType = inherited
+            ? new InjectedTypeAnalysisContext(owner.DeclaringAssembly, "Tests", "Derived", owner, TypeAttributes.Public)
+            : owner;
+        var receiver = new LocalVariable("receiver", new Register(null, "receiver"), receiverType);
+        var value = new LocalVariable("value", new Register(null, "value"), vector.Fields.First(f => !f.IsStatic).FieldType);
+        var whole = new LocalVariable("whole", new Register(null, "whole"), vector);
+        var offset = 2 * _app.Binary.PointerSizeBytes;
+        var scalarStore = new Instruction(0, OpCode.Move, new MemoryOperand(receiver, addend: offset, accessSize: 4), value);
+        var wholeStore = new Instruction(1, OpCode.Move, new MemoryOperand(receiver, addend: offset, accessSize: 8), whole);
+        var method = new InjectedMethodAnalysisContext(_app.SystemTypes.SystemObjectType, "WriteInline", _app.SystemTypes.SystemVoidType,
+            MethodAttributes.Static | MethodAttributes.Public, [])
+        {
+            ControlFlowGraph = new ISILControlFlowGraph([scalarStore, wholeStore, new(2, OpCode.Return)]),
+            Locals = [receiver, value, whole], ParameterLocals = []
+        };
+        Assert.That(MetadataResolver.ResolveFieldOffsets(method), Is.True);
+        var nested = (FieldReference)scalarStore.Operands[0];
+        Assert.That(nested.Field.Name, Is.EqualTo("x"));
+        Assert.That(nested.ContainingField, Is.TypeOf<ConcreteGenericFieldAnalysisContext>());
+        Assert.That(nested.ContainingField!.DeclaringType, Is.SameAs(owner));
+        Assert.That(nested.ContainingField.FieldType, Is.SameAs(vector));
+        var aggregate = (FieldReference)wholeStore.Operands[0];
+        Assert.That(aggregate.IsNested, Is.False);
+        Assert.That(aggregate.Field.FieldType, Is.SameAs(vector));
+        Assert.That(aggregate.Field.DeclaringType, Is.SameAs(owner));
+        Assert.That(MetadataResolver.ResolveFieldOffsets(method), Is.False);
+    }
+
+    [TestCase(false, false)]
+    [TestCase(false, true)]
+    [TestCase(true, false)]
+    [TestCase(true, true)]
     public void DoesNotUsePlaceholderOffsetsForNestedFields(bool open, bool write)
     {
         var instance = Create(_app.SystemTypes.SystemInt32Type, array: false);
