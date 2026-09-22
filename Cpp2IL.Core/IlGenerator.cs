@@ -41,6 +41,7 @@ public static class IlGenerator
     {
         SingleFieldConstructorRecovery.Run(context);
         RedundantFieldStoreElimination.Run(context);
+        IteratorCurrentStoreOrdering.Run(context);
         var assembly = context.DeclaringType!.DeclaringAssembly;
         var module = definition.DeclaringModule!;
         var factory = module.CorLibTypeFactory;
