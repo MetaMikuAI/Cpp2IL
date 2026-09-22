@@ -39,6 +39,8 @@ public static class IlGenerator
 
     public static void GenerateIl(MethodAnalysisContext context, MethodDefinition definition)
     {
+        SingleFieldConstructorRecovery.Run(context);
+        RedundantFieldStoreElimination.Run(context);
         var assembly = context.DeclaringType!.DeclaringAssembly;
         var module = definition.DeclaringModule!;
         var factory = module.CorLibTypeFactory;
