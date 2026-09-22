@@ -408,11 +408,12 @@ public static class IlGenerator
             if (selector == null || selector.OpCode != CilOpCodes.Ldloc || selector.Operand is not CilLocalVariable selectorLocal)
                 continue;
 
-            // Walk back over the cached-delegate pattern to find the <>9__N field whose type knows the real args.
-            TypeSignature[]? delegateArgs = null;
-            TypeSignature? delegateType = null;
+            // Prefer actual assignments; retain nearby-cache recovery when the source cannot be proven.
+            var provenDelegateType = ResolveDelegateLocalType(instructions, selectorLocal, []);
+            TypeSignature? delegateType = provenDelegateType;
+            TypeSignature[]? delegateArgs = provenDelegateType?.TypeArguments.ToArray();
 
-            for (var j = i - 1; j >= Math.Max(0, i - 60); j--)
+            for (var j = i - 1; delegateArgs == null && j >= Math.Max(0, i - 60); j--)
             {
                 if (instructions[j].Operand is not IFieldDescriptor candidateField)
                     continue;
@@ -441,14 +442,98 @@ public static class IlGenerator
                 _ => null
             };
 
+            if (provenDelegateType != null)
+            {
+                var inferred = new Dictionary<int, TypeSignature>();
+                if (!MatchDelegateSignature(selectorParameter, provenDelegateType, inferred))
+                    continue;
+                newArgs = signature.TypeArguments.ToArray();
+                foreach (var (index, type) in inferred)
+                    if (index < newArgs.Length)
+                        newArgs[index] = type;
+            }
+
             if (newArgs == null)
                 continue;
 
+            var oldReturnType = specification.Method!.Signature!.ReturnType.InstantiateGenericTypes(GenericContext.FromMethod(specification));
             specification.Signature = new GenericInstanceMethodSignature(newArgs);
+
+            // Keep a single-assignment result local consistent with the recovered call signature.
+            if (i + 1 < instructions.Count && instructions[i + 1].OpCode == CilOpCodes.Stloc
+                && instructions[i + 1].Operand is CilLocalVariable resultLocal
+                && provenDelegateType != null
+                && SignatureComparer.Default.Equals(selectorParameter.InstantiateGenericTypes(GenericContext.FromMethod(specification)), delegateType)
+                && SignatureComparer.Default.Equals(resultLocal.VariableType, oldReturnType)
+                && instructions.Count(instruction => ReferenceEquals(instruction.Operand, resultLocal)
+                    && instruction.OpCode == CilOpCodes.Stloc) == 1
+                && !instructions.Any(instruction => ReferenceEquals(instruction.Operand, resultLocal)
+                    && instruction.OpCode == CilOpCodes.Ldloca))
+                resultLocal.VariableType = specification.Method.Signature.ReturnType.InstantiateGenericTypes(GenericContext.FromMethod(specification));
 
             if (delegateType != null)
                 selectorLocal.VariableType = delegateType;
         }
+    }
+
+    private static GenericInstanceTypeSignature? ResolveDelegateLocalType(CilInstructionCollection instructions,
+        CilLocalVariable local, HashSet<CilLocalVariable> visiting)
+    {
+        if (!visiting.Add(local))
+            return null;
+        GenericInstanceTypeSignature? result = null;
+        try
+        {
+            for (var i = 0; i < instructions.Count; i++)
+            {
+                if (!ReferenceEquals(instructions[i].Operand, local))
+                    continue;
+                if (instructions[i].OpCode == CilOpCodes.Ldloca)
+                    return null;
+                if (instructions[i].OpCode != CilOpCodes.Stloc)
+                    continue;
+                var previous = i - 1;
+                while (previous >= 0 && instructions[previous].OpCode == CilOpCodes.Nop)
+                    previous--;
+                if (previous < 0)
+                    return null;
+                var producer = instructions[previous];
+                var type = producer.OpCode.Code switch
+                {
+                    CilCode.Ldsfld when producer.Operand is IFieldDescriptor field => GetFieldType(field) as GenericInstanceTypeSignature,
+                    CilCode.Ldloc when producer.Operand is CilLocalVariable source => ResolveDelegateLocalType(instructions, source, visiting),
+                    CilCode.Newobj when producer.Operand is IMethodDescriptor { DeclaringType: TypeSpecification owner } => owner.Signature as GenericInstanceTypeSignature,
+                    _ => null
+                };
+                if (type == null || type.GenericType.Namespace?.ToString() != "System"
+                    || !IsDelegateTypeName(type.GenericType.Name?.ToString())
+                    || result != null && !SignatureComparer.Default.Equals(result, type))
+                    return null;
+                result = type;
+            }
+            return result;
+        }
+        finally
+        {
+            visiting.Remove(local);
+        }
+    }
+
+    private static bool MatchDelegateSignature(TypeSignature formal, TypeSignature actual, Dictionary<int, TypeSignature> inferred)
+    {
+        if (formal is GenericParameterSignature { ParameterType: GenericParameterType.Method } parameter)
+        {
+            if (inferred.TryGetValue(parameter.Index, out var existing))
+                return SignatureComparer.Default.Equals(existing, actual);
+            inferred[parameter.Index] = actual;
+            return true;
+        }
+        if (formal is GenericInstanceTypeSignature generic && actual is GenericInstanceTypeSignature instance
+            && SignatureComparer.Default.Equals(generic.GenericType, instance.GenericType)
+            && generic.TypeArguments.Count == instance.TypeArguments.Count)
+            return generic.TypeArguments.Zip(instance.TypeArguments)
+                .All(pair => MatchDelegateSignature(pair.First, pair.Second, inferred));
+        return SignatureComparer.Default.Equals(formal, actual);
     }
 
     /// <summary>
