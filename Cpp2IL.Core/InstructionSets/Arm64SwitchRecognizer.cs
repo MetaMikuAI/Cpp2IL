@@ -8,7 +8,7 @@ using Disarm;
 namespace Cpp2IL.Core.InstructionSets;
 
 internal sealed record Arm64SwitchDispatch(int LoadIndex, int GuardIndex, int Selector, int OffsetRegister,
-    int TargetRegister, ulong DefaultTarget, uint[] Offsets, ulong[] Targets);
+    int TargetRegister, ulong DefaultTarget, uint[] Offsets, ulong[] Targets, int? ProofStartIndex = null);
 
 // Clang's compact unsigned byte/halfword jump table, guarded by an unsigned W
 // comparison. Keep the original guard and preserve the dispatch scratch values.
@@ -73,31 +73,41 @@ internal static class Arm64SwitchRecognizer
             || ((words[loadIndex + 2] >> 5) & 31) != targetReg
             || new[] { selector, table, offsetReg, targetReg }.Any(r => r == 31)
             || table == targetReg || offsetReg == targetReg || selector == table || selector == targetReg) return null;
-        var page = words[loadIndex - 3];
+        var copy = words[loadIndex - 3];
+        var copiedSelector = (copy & 0xFFE0FFE0) == 0x2A0003E0 && (copy & 31) == selector; // MOV Wd,Wm
+        var comparedRegister = copiedSelector ? (int)((copy >> 16) & 31) : selector;
+        // ADRP executes before the copy, so it must not overwrite the compared value.
+        if (copiedSelector && (comparedRegister == table || comparedRegister == 31)) return null;
+        var pageIndex = loadIndex - (copiedSelector ? 4 : 3);
+        var page = words[pageIndex];
         var tableAdd = words[loadIndex - 2];
         var label = words[loadIndex - 1];
         if ((page & 0x9F000000) != 0x90000000 || (page & 31) != table
             || (tableAdd & 0xFFC00000) != 0x91000000 || (tableAdd & 31) != table || ((tableAdd >> 5) & 31) != table
             || (label & 0x9F000000) != 0x10000000 || (label & 31) != targetReg) return null;
-        var tableAddress = unchecked((ulong)((long)((start + (ulong)(loadIndex - 3) * 4) & ~0xFFFUL)
+        var tableAddress = unchecked((ulong)((long)((start + (ulong)pageIndex * 4) & ~0xFFFUL)
             + (AdrImmediate(page) << 12) + ((tableAdd >> 10) & 0xFFF)));
         var targetBase = unchecked((ulong)((long)start + (loadIndex - 1) * 4 + AdrImmediate(label)));
 
         // Permit only independent plain loads between the guard and table setup.
-        var guardIndex = loadIndex - 4;
-        while (guardIndex >= 2 && loadIndex - guardIndex <= 8 && IsPlainLoad(words[guardIndex])
-            && (words[guardIndex] & 31) != selector) guardIndex--;
-        if (guardIndex < 2 || loadIndex - guardIndex > 8) return null;
+        var guardIndex = pageIndex - 1;
+        var minimumGuard = copiedSelector ? 1 : 2;
+        while (guardIndex >= minimumGuard && loadIndex - guardIndex <= 8 && IsPlainLoad(words[guardIndex])
+            && (words[guardIndex] & 31) != selector && (words[guardIndex] & 31) != comparedRegister) guardIndex--;
+        if (guardIndex < minimumGuard || loadIndex - guardIndex > 8) return null;
         var guard = words[guardIndex];
         var condition = guard & 15;
         if ((guard & 0xFF000010) != 0x54000000 || condition is not (8 or 2)) return null; // HI / HS
         var compare = words[guardIndex - 1];
-        if ((compare & 0xFFC0001F) != 0x7100001F || ((compare >> 5) & 31) != selector) return null;
+        if ((compare & 0xFFC0001F) != 0x7100001F || ((compare >> 5) & 31) != comparedRegister) return null;
         // The X-index form requires proven zero upper bits, not just a W compare.
         // W ADD/SUB also proves this when normalizing a nonzero first case.
-        var definition = words[guardIndex - 2];
-        if ((definition & 31) != selector || (definition & 0xFFC00000) != 0xB9400000
-            && (definition & 0xFF800000) is not (0x11000000 or 0x51000000)) return null;
+        if (!copiedSelector)
+        {
+            var definition = words[guardIndex - 2];
+            if ((definition & 31) != selector || (definition & 0xFFC00000) != 0xB9400000
+                && (definition & 0xFF800000) is not (0x11000000 or 0x51000000)) return null;
+        }
         var count = (int)((compare >> 10) & 0xFFF) + (condition == 8 ? 1 : 0);
         if (count is < 2 or > 4096) return null;
         var defaultTarget = unchecked((ulong)((long)start + guardIndex * 4 + ConditionalOffset(guard)));
@@ -110,7 +120,8 @@ internal static class Arm64SwitchRecognizer
             offsets[i] = width == 1 ? data[i] : BinaryPrimitives.ReadUInt16LittleEndian(data.AsSpan(i * 2));
             targets[i] = targetBase + offsets[i] * 4UL;
         }
-        var candidate = new Arm64SwitchDispatch(loadIndex, guardIndex, selector, offsetReg, targetReg, defaultTarget, offsets, targets);
+        var candidate = new Arm64SwitchDispatch(loadIndex, guardIndex, selector, offsetReg, targetReg, defaultTarget, offsets, targets,
+            guardIndex - (copiedSelector ? 1 : 2));
         if (targets.Append(defaultTarget).Any(t => t < start || (t - start) % 4 != 0 || (t - start) / 4 >= (ulong)words.Length
             || InsideGuard(t, candidate, start))) return null;
         for (var i = 0; i < words.Length; i++)
@@ -124,7 +135,7 @@ internal static class Arm64SwitchRecognizer
     private static int ConditionalOffset(uint word) => (int)((word & 0x00FFFFE0) << 8) >> 11;
     private static long AdrImmediate(uint word) => (int)((((word >> 5) & 0x7FFFF) << 2 | (word >> 29) & 3) << 11) >> 11;
     private static bool InsideGuard(ulong target, Arm64SwitchDispatch dispatch, ulong start)
-        => target > start + (ulong)(dispatch.GuardIndex - 2) * 4 && target <= start + (ulong)(dispatch.LoadIndex + 2) * 4;
+        => target > start + (ulong)(dispatch.ProofStartIndex ?? dispatch.GuardIndex - 2) * 4 && target <= start + (ulong)(dispatch.LoadIndex + 2) * 4;
     private static ulong? DirectTarget(uint word, ulong pc)
     {
         long delta;

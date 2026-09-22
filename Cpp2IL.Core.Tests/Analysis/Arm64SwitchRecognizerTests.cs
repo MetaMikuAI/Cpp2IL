@@ -30,6 +30,75 @@ public class Arm64SwitchRecognizerTests
         return words;
     }
 
+    private static uint[] CopiedSelectorFixture()
+    {
+        var words = Fixture();
+        words[0] = 0xD503201F; // No definition of W20 needed before CMP.
+        words[1] = 0x71000E9F; // CMP W20,#3
+        words[3] = words[4]; // ADRP X9 before the copy
+        words[4] = 0x2A1403E8; // MOV W8,W20
+        return words;
+    }
+
+    [TestCase(false)] [TestCase(true)]
+    public void CopiedSelectorProvesBoundsAndUpperBits(bool halfword)
+    {
+        var words = CopiedSelectorFixture();
+        if (halfword) words[7] = 0x7868792B;
+        // ADRP is the last instruction on this page; MOV starts the next page.
+        const ulong start = 0x525AFF0;
+        var result = Arm64SwitchRecognizer.Decode(words, start, 7, (address, length) =>
+        {
+            Assert.That(address, Is.EqualTo(0x1ED7498UL));
+            Assert.That(length, Is.EqualTo(halfword ? 8 : 4));
+            return halfword ? [0, 0, 41, 0, 86, 0, 97, 0] : [0, 41, 86, 97];
+        });
+        Assert.That(result, Is.Not.Null);
+        Assert.That(result!.Selector, Is.EqualTo(8));
+        Assert.That(result.ProofStartIndex, Is.EqualTo(1));
+        Assert.That(result.Targets, Is.EqualTo(new ulong[] { start + 40, start + 204, start + 384, start + 428 }));
+    }
+
+    [TestCase("wrongSource")] [TestCase("wideCopy")] [TestCase("wrongDestination")]
+    [TestCase("tableOverwritesSource")] [TestCase("entryAtCopy")]
+    [TestCase("entryAtGuard")] [TestCase("entryAtTable")]
+    public void RejectsUnprovenSelectorCopies(string shape)
+    {
+        var words = CopiedSelectorFixture();
+        switch (shape)
+        {
+            case "wrongSource": words[4] = 0x2A1503E8; break; // MOV W8,W21
+            case "wideCopy": words[4] = 0xAA1403E8; break; // MOV X8,X20
+            case "wrongDestination": words[4] = 0x2A1403EC; break;
+            case "tableOverwritesSource":
+                words[1] = 0x71000D3F; // CMP W9,#3
+                words[4] = 0x2A0903E8; // MOV W8,W9 after ADRP X9
+                break;
+            case "entryAtCopy": words[12] = 0x17FFFFF8; break;
+            case "entryAtGuard": words[12] = 0x17FFFFF6; break;
+            case "entryAtTable": words[12] = 0x17FFFFF7; break;
+        }
+        Assert.That(Arm64SwitchRecognizer.Decode(words, Start, 7, (_, _) => [0, 41, 86, 97]), Is.Null);
+    }
+
+    [Test]
+    public void CopiedSelectorAllowsEntryAtComparison()
+    {
+        var words = CopiedSelectorFixture();
+        words[12] = 0x17FFFFF5; // Entry at CMP still executes the guard and W copy.
+        Assert.That(Arm64SwitchRecognizer.Decode(words, Start, 7, (_, _) => [0, 41, 86, 97]), Is.Not.Null);
+    }
+
+    [TestCase(20, false)] [TestCase(21, true)]
+    public void LoadsBetweenGuardAndCopyMustPreserveComparedValue(int destination, bool expected)
+    {
+        var words = CopiedSelectorFixture();
+        words[0] = words[1];
+        words[1] = words[2] + 0x20; // Guard moved back one instruction; keep target.
+        words[2] = 0xB9400260u | (uint)destination; // LDR Wd,[X19]
+        Assert.That(Arm64SwitchRecognizer.Decode(words, Start, 7, (_, _) => [0, 41, 86, 97]) != null, Is.EqualTo(expected));
+    }
+
     [TestCase(false)] [TestCase(true)]
     public void DecodesUnsignedCompactTablesAndPreservesScratchResults(bool halfword)
     {
