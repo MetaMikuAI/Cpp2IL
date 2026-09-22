@@ -40,6 +40,50 @@ public class Arm64SwitchRecognizerTests
         return words;
     }
 
+    private static uint[] ScheduledLoadFixture(int gap)
+    {
+        var original = Fixture();
+        var words = new uint[original.Length + gap];
+        Array.Copy(original, 0, words, gap, original.Length);
+        words[0] = original[0];
+        for (var i = 1; i <= gap; i++) words[i] = 0xF9400A74; // LDR X20,[X19,#16]
+        return words;
+    }
+
+    [TestCase(1, true)] [TestCase(3, true)] [TestCase(6, true)] [TestCase(7, false)]
+    public void FindsSelectorDefinitionAcrossBoundedIndependentLoads(int gap, bool expected)
+    {
+        var words = ScheduledLoadFixture(gap);
+        var result = Arm64SwitchRecognizer.Decode(words, Start, 7 + gap, (_, _) => [0, 41, 86, 97]);
+        Assert.That(result != null, Is.EqualTo(expected));
+        if (expected)
+        {
+            Assert.That(result!.ProofStartIndex, Is.Zero);
+            Assert.That(result.Targets, Is.EqualTo(new ulong[]
+                { Start + (ulong)gap * 4 + 40, Start + (ulong)gap * 4 + 204,
+                  Start + (ulong)gap * 4 + 384, Start + (ulong)gap * 4 + 428 }));
+        }
+    }
+
+    [TestCase(0xF9400A68u)] // LDR X8 clobbers selector without clearing upper bits.
+    [TestCase(0x94000001u)] // BL
+    [TestCase(0x14000001u)] // B
+    [TestCase(0xF8408674u)] // Post-indexed load changes its base too.
+    public void DefinitionSearchStopsAtUnprovenInstructions(uint instruction)
+    {
+        var words = ScheduledLoadFixture(2);
+        words[1] = instruction;
+        Assert.That(Arm64SwitchRecognizer.Decode(words, Start, 9, (_, _) => [0, 41, 86, 97]), Is.Null);
+    }
+
+    [TestCase(0, true)] [TestCase(1, false)] [TestCase(2, false)] [TestCase(3, false)]
+    public void EntryMustNotBypassScheduledSelectorDefinition(int targetIndex, bool expected)
+    {
+        var words = ScheduledLoadFixture(2);
+        words[14] = 0x14000000 | ((uint)(targetIndex - 14) & 0x03FFFFFF);
+        Assert.That(Arm64SwitchRecognizer.Decode(words, Start, 9, (_, _) => [0, 41, 86, 97]) != null, Is.EqualTo(expected));
+    }
+
     [TestCase(false)] [TestCase(true)]
     public void CopiedSelectorProvesBoundsAndUpperBits(bool halfword)
     {

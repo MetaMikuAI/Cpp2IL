@@ -102,9 +102,16 @@ internal static class Arm64SwitchRecognizer
         if ((compare & 0xFFC0001F) != 0x7100001F || ((compare >> 5) & 31) != comparedRegister) return null;
         // The X-index form requires proven zero upper bits, not just a W compare.
         // W ADD/SUB also proves this when normalizing a nonzero first case.
+        var proofStartIndex = guardIndex - 1;
         if (!copiedSelector)
         {
-            var definition = words[guardIndex - 2];
+            proofStartIndex--;
+            // Independent loads may be scheduled between the W definition and CMP.
+            // Stop at any other instruction or selector write; do not cross calls or branches.
+            while (proofStartIndex > 0 && guardIndex - proofStartIndex < 8
+                && IsPlainLoad(words[proofStartIndex]) && (words[proofStartIndex] & 31) != selector)
+                proofStartIndex--;
+            var definition = words[proofStartIndex];
             if ((definition & 31) != selector || (definition & 0xFFC00000) != 0xB9400000
                 && (definition & 0xFF800000) is not (0x11000000 or 0x51000000)) return null;
         }
@@ -121,7 +128,7 @@ internal static class Arm64SwitchRecognizer
             targets[i] = targetBase + offsets[i] * 4UL;
         }
         var candidate = new Arm64SwitchDispatch(loadIndex, guardIndex, selector, offsetReg, targetReg, defaultTarget, offsets, targets,
-            guardIndex - (copiedSelector ? 1 : 2));
+            proofStartIndex);
         if (targets.Append(defaultTarget).Any(t => t < start || (t - start) % 4 != 0 || (t - start) / 4 >= (ulong)words.Length
             || InsideGuard(t, candidate, start))) return null;
         for (var i = 0; i < words.Length; i++)
