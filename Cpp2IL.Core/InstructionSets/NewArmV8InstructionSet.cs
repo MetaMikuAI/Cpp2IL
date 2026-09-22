@@ -1309,6 +1309,12 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 if (!EmitTwoSArithmetic(OpCode.Multiply))
                     Add(address, OpCode.Multiply, ScalarOperand(0), ScalarOperand(1), ScalarOperand(2));
                 break;
+            case Arm64Mnemonic.SMULH:
+                if (IsReg31(instruction.Op0Reg))
+                    Add(address, OpCode.Nop);
+                else
+                    Add(address, OpCode.MultiplyHighSigned, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1), ConvertOperand(instruction, 2));
+                break;
             case Arm64Mnemonic.MNEG:
             case Arm64Mnemonic.SMNEGL:
             case Arm64Mnemonic.UMNEGL:

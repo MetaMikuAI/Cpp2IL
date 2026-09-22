@@ -99,6 +99,7 @@ public class Instruction : IOperand
             case OpCode.Add:
             case OpCode.Subtract:
             case OpCode.Multiply:
+            case OpCode.MultiplyHighSigned:
             case OpCode.Divide:
             case OpCode.Modulo:
             case OpCode.ShiftLeft:
@@ -165,7 +166,7 @@ public class Instruction : IOperand
 
             OpCode.Box or OpCode.IsInstance or OpCode.TryCast => [_operands[2]],
 
-            OpCode.Add or OpCode.Subtract or OpCode.Multiply
+            OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.MultiplyHighSigned
                 or OpCode.Divide or OpCode.Modulo or OpCode.ShiftLeft or OpCode.ShiftRight
                 or OpCode.And or OpCode.Or or OpCode.Xor
                 => [_operands[2], _operands[1]],

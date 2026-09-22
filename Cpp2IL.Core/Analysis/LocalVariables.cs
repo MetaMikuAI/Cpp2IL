@@ -239,6 +239,8 @@ public static class LocalVariables
         SeedMethodInfoTypes(method);
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
+            if (instruction is { OpCode: OpCode.MultiplyHighSigned, Destination: LocalVariable product })
+                product.Type = method.AppContext.SystemTypes.SystemInt64Type;
             if (instruction is { OpCode: OpCode.ConvertNumeric,
                 Operands: [LocalVariable converted, _, NumericConversion conversion] })
                 converted.Type = conversion.TargetType;

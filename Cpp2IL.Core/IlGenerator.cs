@@ -735,6 +735,15 @@ public static class IlGenerator
                 }
                 break;
 
+            case OpCode.MultiplyHighSigned:
+                LoadOperand(instruction.Operands[1], method, locals, writeLine, context.AppContext.SystemTypes.SystemInt64Type);
+                instructions.Add(CilOpCodes.Conv_I8);
+                LoadOperand(instruction.Operands[2], method, locals, writeLine, context.AppContext.SystemTypes.SystemInt64Type);
+                instructions.Add(CilOpCodes.Conv_I8);
+                MultiplyHighEmitter.Emit(method.CilMethodBody!);
+                StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+                break;
+
             case OpCode.ConvertNumeric:
                 var conversion = (NumericConversion)instruction.Operands[2];
                 LoadOperand(instruction.Operands[1], method, locals, writeLine, conversion.SourceType);

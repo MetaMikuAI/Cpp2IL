@@ -140,6 +140,9 @@ public enum OpCode
     /// <summary>Sign-extends the low op 3 bits of op 2 to Int64 in op 1.</summary>
     SignExtend,
 
+    /// <summary>Writes the high 64 bits of the signed 128-bit product of ops 2 and 3 into op 1.</summary>
+    MultiplyHighSigned,
+
     /// <summary>
     /// Throws a new instance of the exception type described by op 1.
     /// </summary>
