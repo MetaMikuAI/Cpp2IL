@@ -425,6 +425,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         DeadCodeEliminator.Run(this);
 
         TypeHierarchyRecovery.Run(this);
+        if (TypeTestFieldRecovery.Run(this))
+            LocalVariables.ResolveTypesAndFields(this);
 
         // Class/RGCTX guards can retain stale interface lookup arguments until removed.
         retryInterfaceCleanup?.Invoke();
