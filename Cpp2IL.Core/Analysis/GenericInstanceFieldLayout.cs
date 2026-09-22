@@ -90,10 +90,15 @@ public static class GenericInstanceFieldLayout
                 return null;
             foreach (var field in fields)
             {
-                if (GetSizeAndAlignment(field.FieldType, pointerSize) is not { } layout
-                    || field.Offset < 2L * pointerSize || field.Offset % layout.Alignment != 0)
+                var layout = GetSizeAndAlignment(field.FieldType, pointerSize);
+                // Base offsets are already supplied by metadata. An embedded non-generic
+                // value type needs only its managed extent here, not an inferred alignment.
+                var size = layout?.Size ?? (field.FieldType is { IsValueType: true, GenericParameters.Count: 0, Definition: not null }
+                    and not GenericInstanceTypeAnalysisContext ? TypeSizes.UnboxedSize(field.FieldType, pointerSize) : 0);
+                if (size <= 0 || field.Offset < 2L * pointerSize
+                    || layout is { } known && field.Offset % known.Alignment != 0)
                     return null;
-                end = Math.Max(end, field.Offset + layout.Size);
+                end = Math.Max(end, field.Offset + size);
             }
         }
         // Only accept an exact metadata extent. Tail padding may be reused by a
