@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using AsmResolver.DotNet;
+using AsmResolver.DotNet.Code.Cil;
 using AsmResolver.DotNet.Signatures;
 using AsmResolver.PE.DotNet.Cil;
 using AsmResolver.PE.DotNet.Metadata.Tables;
@@ -404,6 +405,59 @@ public class IlGeneratorTests
         Assert.That(receiverLoad.OpCode, Is.EqualTo(parameterReceiver
             ? (byRefReceiver ? CilOpCodes.Ldarg : CilOpCodes.Ldarga)
             : (valueReceiver ? CilOpCodes.Ldloca : CilOpCodes.Ldloc)));
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
+    public void NativeUnsignedComparisonsExecuteAtTheirDeclaredWidth(bool wide)
+    {
+        var types = Cpp2IlApi.CurrentAppContext!.SystemTypes;
+        long[] values = [0, 1, -1, int.MinValue, int.MaxValue, 0x100000000L, long.MinValue, long.MaxValue];
+        foreach (var operation in new[] { OpCode.CheckLess, OpCode.CheckGreater, OpCode.CheckLessOrEqual, OpCode.CheckGreaterOrEqual })
+        foreach (var left in values)
+        foreach (var right in values)
+        {
+            var result = new LocalVariable("result", new Register(null, "result"), types.SystemBooleanType);
+            var instruction = new Instruction(0, operation, result, new Immediate(left), new Immediate(right),
+                wide ? types.SystemUInt64Type : types.SystemUInt32Type);
+            var generated = GenerateSingle(instruction, result);
+            var a = wide ? unchecked((ulong)left) : unchecked((uint)left);
+            var b = wide ? unchecked((ulong)right) : unchecked((uint)right);
+            var expected = operation switch
+            {
+                OpCode.CheckLess => a < b, OpCode.CheckGreater => a > b,
+                OpCode.CheckLessOrEqual => a <= b, _ => a >= b
+            };
+            Assert.That(ExecuteBoolean(generated), Is.EqualTo(expected), $"{operation} {left}, {right}; wide={wide}");
+        }
+    }
+
+    // Execute the generated primitive CIL itself, including its conversions and local stores.
+    private static bool ExecuteBoolean(MethodDefinition definition)
+    {
+        var method = new System.Reflection.Emit.DynamicMethod("Compare", typeof(bool), []);
+        var emitter = method.GetILGenerator();
+        var body = definition.CilMethodBody!;
+        var locals = body.LocalVariables.Select(_ => emitter.DeclareLocal(typeof(bool))).ToArray();
+        var opcodes = typeof(System.Reflection.Emit.OpCodes).GetFields()
+            .Where(f => f.FieldType == typeof(System.Reflection.Emit.OpCode))
+            .Select(f => (System.Reflection.Emit.OpCode)f.GetValue(null)!).ToDictionary(o => o.Name!);
+        var labels = body.Instructions.ToDictionary(i => i, _ => emitter.DefineLabel(), (IEqualityComparer<CilInstruction>)ReferenceEqualityComparer.Instance);
+        foreach (var instruction in body.Instructions)
+        {
+            emitter.MarkLabel(labels[instruction]);
+            var opcode = opcodes[instruction.OpCode.Mnemonic];
+            switch (instruction.Operand)
+            {
+                case null: emitter.Emit(opcode); break;
+                case long value: emitter.Emit(opcode, value); break;
+                case int value: emitter.Emit(opcode, value); break;
+                case AsmResolver.DotNet.Code.Cil.CilLocalVariable local: emitter.Emit(opcode, locals[local.Index]); break;
+                case CilInstructionLabel label: emitter.Emit(opcode, labels[label.Instruction!]); break;
+                default: throw new InvalidOperationException($"Unexpected primitive CIL: {instruction}");
+            }
+        }
+        return method.CreateDelegate<Func<bool>>()();
     }
 
     private static MethodDefinition GenerateSingle(Instruction instruction, LocalVariable result)

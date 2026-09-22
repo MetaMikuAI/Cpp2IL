@@ -38,6 +38,47 @@ public class FlagConditionRecoveryTests
             .First(i => i.Destination is LocalVariable d && ReferenceEquals(d, condition));
     }
 
+    [TestCase(false, false)]
+    [TestCase(false, true)]
+    [TestCase(true, false)]
+    [TestCase(true, true)]
+    public void RecoversUnsignedRangeWithoutLosingWidth(bool lessOrEqual, bool inverted)
+    {
+        Cpp2IlApi.ResetInternalState();
+        var type = TestGameLoader.LoadSimple2019Game().SystemTypes.SystemUInt32Type;
+        var borrow = Flag("borrow"); var carry = Flag("carry"); var difference = Flag("difference");
+        var zero = Flag("zero"); var nonzero = Flag("nonzero"); var condition = Flag("condition");
+        var inverse = Flag("inverse");
+        var instructions = new List<Instruction>
+        {
+            new(0, OpCode.CheckLess, borrow, A, B, type),
+            new(1, OpCode.Not, carry, borrow),
+            new(2, OpCode.Subtract, difference, A, B),
+            new(3, OpCode.CheckEqual, zero, difference, Imm(0)),
+            new(4, OpCode.Not, nonzero, zero),
+            new(5, lessOrEqual ? OpCode.Or : OpCode.And, condition, lessOrEqual ? borrow : carry, lessOrEqual ? zero : nonzero),
+        };
+        if (inverted) instructions.Add(new(6, OpCode.Not, inverse, condition));
+        instructions.Add(new(7, OpCode.ConditionalJump, Imm(0), inverted ? inverse : condition));
+        var definition = RecoverAndGetConditionDef(instructions, inverted ? inverse : condition);
+        Assert.That(definition.OpCode, Is.EqualTo(lessOrEqual != inverted ? OpCode.CheckLessOrEqual : OpCode.CheckGreater));
+        Assert.That(definition.Operands.ToArray(), Is.EqualTo(new IOperand[] { inverted ? inverse : condition, A, B, type }));
+    }
+
+    [Test]
+    public void UnsignedSubtractComparedWithZeroIsNotASignedSignFlag()
+    {
+        Cpp2IlApi.ResetInternalState();
+        var type = TestGameLoader.LoadSimple2019Game().SystemTypes.SystemUInt32Type;
+        var difference = Flag("difference"); var condition = Flag("condition");
+        var definition = RecoverAndGetConditionDef([
+            new(0, OpCode.Subtract, difference, A, B),
+            new(1, OpCode.CheckLess, condition, difference, Imm(0), type),
+            new(2, OpCode.ConditionalJump, Imm(0), condition)], condition);
+        Assert.That(definition.Operands[1], Is.SameAs(difference));
+        Assert.That(definition.Operands[3], Is.SameAs(type));
+    }
+
     [Test]
     public void RecoversEquality()
     {

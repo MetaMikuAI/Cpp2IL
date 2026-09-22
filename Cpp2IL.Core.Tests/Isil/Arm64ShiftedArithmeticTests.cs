@@ -107,6 +107,26 @@ public class Arm64ShiftedArithmeticTests
     public void DoesNotShiftPlainCompareOperands(uint word)
         => Assert.That(Lift(word).Any(i => i.OpCode is OpCode.ShiftLeft or OpCode.ShiftRight), Is.False);
 
+    [TestCase(0x7100041Fu, "System.UInt32")] // cmp w0, #1
+    [TestCase(0xF100041Fu, "System.UInt64")] // cmp x0, #1
+    [TestCase(0x6B0802A8u, "System.UInt32")] // subs w8, w21, w8
+    [TestCase(0xEB0802A8u, "System.UInt64")]
+    [TestCase(0x7A410000u, "System.UInt32")] // ccmp w0, w1, #0, eq
+    [TestCase(0xFA410000u, "System.UInt64")]
+    public void SubtractionCarryPreservesUnsignedNativeWidth(uint word, string type)
+    {
+        var carry = Lift(word).Single(i => i.OpCode == OpCode.CheckLess && i.Destination is Register { Name: "C" });
+        Assert.That(carry.Operands.Count, Is.EqualTo(4));
+        Assert.That(((TypeAnalysisContext)carry.Operands[3]).FullName, Is.EqualTo(type));
+    }
+
+    [TestCase(0x1E212000u)] // fcmp s0, s1
+    [TestCase(0x1E612000u)] // fcmp d0, d1
+    public void FloatingComparisonsDoNotAcquireIntegerUnsignedConversions(uint word)
+    {
+        Assert.That(Lift(word).Where(i => i.OpCode == OpCode.CheckLess).All(i => i.Operands.Count == 3), Is.True);
+    }
+
     private static List<Instruction> Lift(uint word)
     {
         Cpp2IlApi.ResetInternalState();

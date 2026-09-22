@@ -98,6 +98,17 @@ public class TypeHierarchyRecoveryTests
 
     [TestCase(false)]
     [TestCase(true)]
+    public void RecognizesUnsignedHierarchyDepth(bool wide)
+    {
+        var (graph, locals, _, check) = Create();
+        var depth = graph.Instructions.Single(i => i.OpCode == OpCode.CheckLess);
+        depth.AddOperands([wide ? _app.SystemTypes.SystemUInt64Type : _app.SystemTypes.SystemUInt32Type]);
+        TypeHierarchyRecovery.Run(graph, locals, _app.SystemTypes.SystemBooleanType);
+        Assert.That(check.OpCode, Is.EqualTo(OpCode.IsInstance));
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
     public void RecoversClassCheckAndKeepsPolarity(bool inverted)
     {
         var (graph, locals, _, check) = Create(inverted);

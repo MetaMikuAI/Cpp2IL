@@ -811,7 +811,16 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             var temp3 = new Register(null, "TEMP3");
             var temp4 = new Register(null, "TEMP4");
 
-            Add(address, OpCode.CheckLess, flagC, op0, op1); // arm's C is the inverse of a borrow
+            // CMP/SUBS/CCMP set C from an unsigned subtraction at the native width.
+            // Do not impose integer ordering on floating comparisons or addition flags.
+            if (instruction.Mnemonic is Arm64Mnemonic.CMP or Arm64Mnemonic.SUBS or Arm64Mnemonic.CCMP)
+            {
+                var type = instruction.Op0Reg is >= Arm64Register.W0 and <= Arm64Register.W31
+                    ? context.AppContext.SystemTypes.SystemUInt32Type : context.AppContext.SystemTypes.SystemUInt64Type;
+                Add(address, OpCode.CheckLess, flagC, op0, op1, type);
+            }
+            else
+                Add(address, OpCode.CheckLess, flagC, op0, op1); // C is the inverse of a borrow
             Add(address, OpCode.Not, flagC, flagC);
             Add(address, OpCode.Subtract, temp1, op0, op1);
             Add(address, OpCode.CheckLess, flagN, temp1, Imm(0));

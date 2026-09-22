@@ -245,7 +245,10 @@ public static class TypeHierarchyRecovery
             var definition = Definition(condition);
             if (definition is { OpCode: OpCode.Not, Operands: [_, var source] })
                 return DepthCondition(source, klass, target, depth + 1) is { } nested ? !nested : null;
-            if (definition is not { Operands: [_, var a, var b] }) return null;
+            if (definition is not { Operands: [_, var a, var b, ..] }) return null;
+            // Hierarchy depths are uint8_t, so signed and explicitly unsigned ordering agree.
+            if (definition.Operands.Count > 3 && definition.Operands is not
+                [_, _, _, TypeAnalysisContext { FullName: "System.UInt32" or "System.UInt64" }]) return null;
             if (DepthOf(a, klass) && DepthOf(b, target))
                 return definition.OpCode switch { OpCode.CheckLess => false, OpCode.CheckGreaterOrEqual => true, _ => null };
             if (DepthOf(b, klass) && DepthOf(a, target))

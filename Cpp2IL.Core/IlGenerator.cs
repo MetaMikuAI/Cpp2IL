@@ -950,9 +950,20 @@ public static class IlGenerator
                 var floatConversion = FloatArithmeticConversion(instruction);
                 var shiftType = instruction is { OpCode: OpCode.ShiftLeft or OpCode.ShiftRight,
                     Operands: [_, _, _, TypeAnalysisContext explicitType] } ? explicitType.FullName : null;
-                var integerLiteralType = BinaryIntegerLiteralType(instruction);
+                var nativeComparisonType = instruction.OpCode is >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual
+                    && instruction.Operands is [_, _, _, TypeAnalysisContext compareType] ? compareType : null;
+                var comparisonType = nativeComparisonType?.FullName;
+                CilOpCode? comparisonConversion = comparisonType switch
+                {
+                    "System.UInt32" => CilOpCodes.Conv_U4,
+                    "System.UInt64" => CilOpCodes.Conv_U8,
+                    null => null,
+                    _ => throw new InvalidOperationException($"Invalid native comparison type: {comparisonType}")
+                };
+                var integerLiteralType = nativeComparisonType ?? BinaryIntegerLiteralType(instruction);
 
                 LoadOperand(instruction.Operands[1], method, locals, writeLine, integerLiteralType);
+                if (comparisonConversion is { } compareConv1) instructions.Add(compareConv1);
                 if (floatConversion is { } conv1)
                     instructions.Add(conv1);
                 if (shiftType != null)
@@ -965,14 +976,15 @@ public static class IlGenerator
                         _ => throw new InvalidOperationException($"Invalid native shift type: {shiftType}")
                     });
                 LoadOperand(instruction.Operands[2], method, locals, writeLine, integerLiteralType);
+                if (comparisonConversion is { } compareConv2) instructions.Add(compareConv2);
                 if (floatConversion is { } conv2)
                     instructions.Add(conv2);
 
                 switch (instruction.OpCode)
                 {
                     case OpCode.CheckEqual: instructions.Add(CilOpCodes.Ceq); break;
-                    case OpCode.CheckGreater: instructions.Add(CilOpCodes.Cgt); break;
-                    case OpCode.CheckLess: instructions.Add(CilOpCodes.Clt); break;
+                    case OpCode.CheckGreater: instructions.Add(comparisonType != null ? CilOpCodes.Cgt_Un : CilOpCodes.Cgt); break;
+                    case OpCode.CheckLess: instructions.Add(comparisonType != null ? CilOpCodes.Clt_Un : CilOpCodes.Clt); break;
 
                     // a != b  ==  (a == b) == 0
                     case OpCode.CheckNotEqual:
@@ -982,13 +994,13 @@ public static class IlGenerator
                         break;
                     // a >= b  ==  !(a < b)
                     case OpCode.CheckGreaterOrEqual:
-                        instructions.Add(CilOpCodes.Clt);
+                        instructions.Add(comparisonType != null ? CilOpCodes.Clt_Un : CilOpCodes.Clt);
                         instructions.Add(CilOpCodes.Ldc_I4_0);
                         instructions.Add(CilOpCodes.Ceq);
                         break;
                     // a <= b  ==  !(a > b)
                     case OpCode.CheckLessOrEqual:
-                        instructions.Add(CilOpCodes.Cgt);
+                        instructions.Add(comparisonType != null ? CilOpCodes.Cgt_Un : CilOpCodes.Cgt);
                         instructions.Add(CilOpCodes.Ldc_I4_0);
                         instructions.Add(CilOpCodes.Ceq);
                         break;

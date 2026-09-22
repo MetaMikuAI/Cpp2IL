@@ -18,7 +18,9 @@ namespace Cpp2IL.Core.Analysis;
 /// Runs in SSA form, where each flag/temporary has a single, version-stable definition, so the
 /// operands referenced at the branch are provably the ones captured at the compare.
 ///
-/// Note: the lifter lowers the unsigned conditions (ja/jae/jb/jbe) with the same flag expressions as
+/// ARM64 subtraction carry comparisons retain an explicit unsigned operand width.
+/// Their carry/zero conditions are recovered without discarding that width.
+/// Note: the x86 lifter lowers the unsigned conditions (ja/jae/jb/jbe) with the same flag expressions as
 /// their signed counterparts, so they are recovered as signed comparisons too - matching the
 /// existing (signed) behaviour rather than introducing a new inaccuracy.
 /// </summary>
@@ -40,6 +42,14 @@ public static class FlagConditionRecovery
                 if (instruction.Operands[1] is not LocalVariable condition)
                     continue;
 
+                if (TryUnsigned(condition, defOf, 0) is { } unsigned)
+                {
+                    var compare = defOf[condition];
+                    compare.OpCode = unsigned.Op;
+                    compare.SetOperands(compare.Operands[0], unsigned.Left, unsigned.Right, unsigned.Type);
+                    continue;
+                }
+
                 if (!TryClassify(condition, defOf, out var relop, out var op0, out var op1))
                     continue;
 
@@ -50,6 +60,42 @@ public static class FlagConditionRecovery
                 definition.SetOperands(definition.Operands[0], op0!, op1!);
             }
         }
+    }
+
+    private static (OpCode Op, IOperand Left, IOperand Right, TypeAnalysisContext Type)? TryUnsigned(
+        LocalVariable? condition, Dictionary<LocalVariable, Instruction> definitions, int depth)
+    {
+        if (depth > 16 || Def(condition, definitions) is not { } definition) return null;
+        if (definition is { OpCode: OpCode.CheckLess, Operands: [_, var a, var b,
+            TypeAnalysisContext { FullName: "System.UInt32" or "System.UInt64" } type] })
+            return (OpCode.CheckLess, a, b, type);
+        if (definition is { OpCode: OpCode.Not, Operands: [_, LocalVariable inner] }
+            && TryUnsigned(inner, definitions, depth + 1) is { } nested)
+            return (nested.Op switch
+            {
+                OpCode.CheckLess => OpCode.CheckGreaterOrEqual,
+                OpCode.CheckGreaterOrEqual => OpCode.CheckLess,
+                OpCode.CheckGreater => OpCode.CheckLessOrEqual,
+                _ => OpCode.CheckGreater
+            }, nested.Left, nested.Right, nested.Type);
+        if (definition.OpCode is not (OpCode.And or OpCode.Or)) return null;
+        for (var side = 1; side <= 2; side++)
+        {
+            if (TryUnsigned(AsLocal(definition.Operands[side]), definitions, depth + 1) is not { } ordered) continue;
+            var other = AsLocal(definition.Operands[3 - side]);
+            IOperand? z0, z1;
+            bool matches;
+            if (definition.OpCode == OpCode.And && ordered.Op == OpCode.CheckGreaterOrEqual)
+                matches = IsNotZeroFlag(other, definitions, out z0, out z1);
+            else if (definition.OpCode == OpCode.Or && ordered.Op == OpCode.CheckLess)
+                matches = IsZeroFlag(other, definitions, out z0, out z1);
+            else
+                continue;
+            if (matches && Equals(ordered.Left, z0) && Equals(ordered.Right, z1))
+                return (definition.OpCode == OpCode.And ? OpCode.CheckGreater : OpCode.CheckLessOrEqual,
+                    ordered.Left, ordered.Right, ordered.Type);
+        }
+        return null;
     }
 
     private static Dictionary<LocalVariable, Instruction> BuildDefMap(ISILControlFlowGraph cfg)
@@ -128,7 +174,7 @@ public static class FlagConditionRecovery
     {
         op0 = op1 = null;
         var def = Def(local, defOf);
-        if (def is not { OpCode: OpCode.CheckLess } || !IsZeroConstant(def.Operands[2]))
+        if (def is not { OpCode: OpCode.CheckLess, Operands.Count: 3 } || !IsZeroConstant(def.Operands[2]))
             return false;
         return IsSubtraction(AsLocal(def.Operands[1]), defOf, out op0, out op1);
     }
