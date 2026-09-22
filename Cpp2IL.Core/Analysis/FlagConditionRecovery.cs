@@ -87,11 +87,15 @@ public static class FlagConditionRecovery
                 if (IsSignEqualsOverflow(inner, defOf, out op0, out op1)) { relop = OpCode.CheckLess; return true; }    // !(SF==OF)  => <   (jl/jb)
                 // Conditional selects branch on the inverse of their native condition.
                 if (IsNotSignEqualsOverflow(inner, defOf, out op0, out op1)) { relop = OpCode.CheckGreaterOrEqual; return true; }
+                if (Def(inner, defOf) is { OpCode: OpCode.And } greater
+                    && IsSignGreater(greater, defOf, out op0, out op1)) { relop = OpCode.CheckLessOrEqual; return true; }
+                if (Def(inner, defOf) is { OpCode: OpCode.Or } lessOrEqual
+                    && IsSignLessOrEqual(lessOrEqual, defOf, out op0, out op1)) { relop = OpCode.CheckGreater; return true; }
                 return false;
 
             case OpCode.CheckEqual:
                 // SF == OF  =>  a >= b   (jge/jae)
-                if (IsSignFlag(AsLocal(definition.Operands[1]), defOf, out op0, out op1)) { relop = OpCode.CheckGreaterOrEqual; return true; }
+                if (IsSignEqualsOverflow(condition, defOf, out op0, out op1)) { relop = OpCode.CheckGreaterOrEqual; return true; }
                 return false;
 
             case OpCode.And:
@@ -141,14 +145,21 @@ public static class FlagConditionRecovery
         return true;
     }
 
-    // local := CheckEqual(SF, OF) - the signed "not less" test. Operands are taken from the SF side.
+    // local := CheckEqual(SF, OF). Both flags must describe the same subtraction:
+    // OF = ((a ^ b) & (a ^ (a - b))) < 0, SF = (a - b) < 0.
     private static bool IsSignEqualsOverflow(LocalVariable? local, Dictionary<LocalVariable, Instruction> defOf, out IOperand? op0, out IOperand? op1)
     {
         op0 = op1 = null;
         var def = Def(local, defOf);
-        if (def is not { OpCode: OpCode.CheckEqual })
+        if (def is not { OpCode: OpCode.CheckEqual, Operands: [_, var sign, var overflow] }
+            || Def(AsLocal(sign), defOf) is not { OpCode: OpCode.CheckLess, Operands: [_, LocalVariable difference, Immediate { Value: 0 }] }
+            || !IsSubtraction(difference, defOf, out op0, out op1)
+            || Def(AsLocal(overflow), defOf) is not { OpCode: OpCode.CheckLess, Operands: [_, var bits, Immediate { Value: 0 }] }
+            || Def(AsLocal(bits), defOf) is not { OpCode: OpCode.And, Operands: [_, var ab, var ar] }
+            || Def(AsLocal(ab), defOf) is not { OpCode: OpCode.Xor, Operands: [_, var a, var b] }
+            || Def(AsLocal(ar), defOf) is not { OpCode: OpCode.Xor, Operands: [_, var original, var result] })
             return false;
-        return IsSignFlag(AsLocal(def.Operands[1]), defOf, out op0, out op1);
+        return Equals(a, op0) && Equals(b, op1) && Equals(original, op0) && Equals(result, difference);
     }
 
     // local := Not(CheckEqual(SF, OF))
@@ -162,10 +173,11 @@ public static class FlagConditionRecovery
     }
 
     // local := Not(ZF)
-    private static bool IsNotZeroFlag(LocalVariable? local, Dictionary<LocalVariable, Instruction> defOf)
+    private static bool IsNotZeroFlag(LocalVariable? local, Dictionary<LocalVariable, Instruction> defOf, out IOperand? op0, out IOperand? op1)
     {
+        op0 = op1 = null;
         var def = Def(local, defOf);
-        return def is { OpCode: OpCode.Not } && IsZeroFlag(AsLocal(def.Operands[1]), defOf, out _, out _);
+        return def is { OpCode: OpCode.Not } && IsZeroFlag(AsLocal(def.Operands[1]), defOf, out op0, out op1);
     }
 
     // And((SF==OF), !ZF), in either operand order
@@ -174,9 +186,11 @@ public static class FlagConditionRecovery
         var left = AsLocal(and.Operands[1]);
         var right = AsLocal(and.Operands[2]);
 
-        if (IsSignEqualsOverflow(left, defOf, out op0, out op1) && IsNotZeroFlag(right, defOf))
+        if (IsSignEqualsOverflow(left, defOf, out op0, out op1) && IsNotZeroFlag(right, defOf, out var z0, out var z1)
+            && Equals(op0, z0) && Equals(op1, z1))
             return true;
-        if (IsSignEqualsOverflow(right, defOf, out op0, out op1) && IsNotZeroFlag(left, defOf))
+        if (IsSignEqualsOverflow(right, defOf, out op0, out op1) && IsNotZeroFlag(left, defOf, out z0, out z1)
+            && Equals(op0, z0) && Equals(op1, z1))
             return true;
 
         op0 = op1 = null;
@@ -189,9 +203,11 @@ public static class FlagConditionRecovery
         var left = AsLocal(or.Operands[1]);
         var right = AsLocal(or.Operands[2]);
 
-        if (IsNotSignEqualsOverflow(left, defOf, out op0, out op1) && IsZeroFlag(right, defOf, out _, out _))
+        if (IsNotSignEqualsOverflow(left, defOf, out op0, out op1) && IsZeroFlag(right, defOf, out var z0, out var z1)
+            && Equals(op0, z0) && Equals(op1, z1))
             return true;
-        if (IsNotSignEqualsOverflow(right, defOf, out op0, out op1) && IsZeroFlag(left, defOf, out _, out _))
+        if (IsNotSignEqualsOverflow(right, defOf, out op0, out op1) && IsZeroFlag(left, defOf, out z0, out z1)
+            && Equals(op0, z0) && Equals(op1, z1))
             return true;
 
         op0 = op1 = null;

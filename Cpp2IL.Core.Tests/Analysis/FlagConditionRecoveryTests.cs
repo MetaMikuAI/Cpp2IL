@@ -155,4 +155,63 @@ public class FlagConditionRecoveryTests
 
         Assert.That(def.OpCode, Is.EqualTo(OpCode.Move));
     }
+
+    [Test, Combinatorial]
+    public void RecoversCompoundSignedConditionsOnlyWithMatchingFlags(
+        [Values] bool greater, [Values] bool inverted, [Values] bool swapped,
+        [Values("none", "zero", "overflow")] string mutation)
+    {
+        var difference = Flag("difference");
+        var otherDifference = Flag("otherDifference");
+        var ab = Flag("ab");
+        var ar = Flag("ar");
+        var bits = Flag("bits");
+        var sign = Flag("sign");
+        var overflow = Flag("overflow");
+        var zero = Flag("zero");
+        var notZero = Flag("notZero");
+        var signEqualsOverflow = Flag("signEqualsOverflow");
+        var less = Flag("less");
+        var compound = Flag("compound");
+        var inverse = Flag("inverse");
+        var left = greater ? signEqualsOverflow : less;
+        var right = greater ? notZero : zero;
+        var condition = inverted ? inverse : compound;
+        var instructions = new List<Instruction>
+        {
+            new(0, OpCode.Subtract, difference, A, B),
+            new(1, OpCode.Subtract, otherDifference, B, A),
+            new(2, OpCode.Xor, ab, A, B),
+            new(3, OpCode.Xor, ar, mutation == "overflow" ? B : A, difference),
+            new(4, OpCode.And, bits, ab, ar),
+            new(5, OpCode.CheckLess, overflow, bits, Imm(0)),
+            new(6, OpCode.CheckLess, sign, difference, Imm(0)),
+            new(7, OpCode.CheckEqual, zero, mutation == "zero" ? otherDifference : difference, Imm(0)),
+            new(8, OpCode.Not, notZero, zero),
+            new(9, OpCode.CheckEqual, signEqualsOverflow, sign, overflow),
+            new(10, OpCode.Not, less, signEqualsOverflow),
+            new(11, greater ? OpCode.And : OpCode.Or, compound, swapped ? right : left, swapped ? left : right),
+            new(12, OpCode.Not, inverse, compound),
+            new(13, OpCode.ConditionalJump, Imm(0), condition),
+        };
+        var definition = RecoverAndGetConditionDef(instructions, condition);
+        if (mutation != "none")
+        {
+            Assert.That(definition.OpCode, Is.EqualTo(inverted ? OpCode.Not : greater ? OpCode.And : OpCode.Or));
+            return;
+        }
+        var expectedGreater = greater != inverted;
+        Assert.That(definition.OpCode, Is.EqualTo(expectedGreater ? OpCode.CheckGreater : OpCode.CheckLessOrEqual));
+        Assert.That(definition.Operands.Skip(1), Is.EqualTo(new IOperand[] { A, B }));
+        foreach (var a in new[] { int.MinValue, -1, 0, 1, int.MaxValue })
+        foreach (var b in new[] { int.MinValue, -1, 0, 1, int.MaxValue })
+        {
+            var delta = unchecked(a - b);
+            var sf = delta < 0;
+            var of = ((a ^ b) & (a ^ delta)) < 0;
+            var zf = delta == 0;
+            var original = greater ? sf == of && !zf : sf != of || zf;
+            Assert.That(inverted ? !original : original, Is.EqualTo(expectedGreater ? a > b : a <= b));
+        }
+    }
 }
