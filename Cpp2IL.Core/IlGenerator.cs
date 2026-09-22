@@ -397,6 +397,13 @@ public static class IlGenerator
             if (!LinqMethodNames.Contains(specification.Name ?? "") || specification.Signature is not { } signature)
                 continue;
 
+            // A nearby delegate cache does not make Take's count, Contains' value,
+            // or a predicate-free overload's source into a selector.
+            if (specification.Method?.Signature?.ParameterTypes.LastOrDefault() is not GenericInstanceTypeSignature selectorParameter
+                || selectorParameter.GenericType.Namespace?.ToString() != "System"
+                || !IsDelegateTypeName(selectorParameter.GenericType.Name?.ToString()))
+                continue;
+
             var selector = i > 0 ? instructions[i - 1] : null;
             if (selector == null || selector.OpCode != CilOpCodes.Ldloc || selector.Operand is not CilLocalVariable selectorLocal)
                 continue;
