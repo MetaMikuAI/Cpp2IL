@@ -643,6 +643,13 @@ public static class IlGenerator
                 }
                 break;
 
+            case OpCode.ConvertNumeric:
+                var conversion = (NumericConversion)instruction.Operands[2];
+                LoadOperand(instruction.Operands[1], method, locals, writeLine, conversion.SourceType);
+                NumericConversionEmitter.Emit(method.CilMethodBody!, conversion);
+                StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+                break;
+
             case OpCode.SignExtend:
                 LoadOperand(instruction.Operands[1], method, locals, writeLine);
                 instructions.Add(((Immediate)instruction.Operands[2]).Value switch

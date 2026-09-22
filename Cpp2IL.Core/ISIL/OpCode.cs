@@ -26,6 +26,9 @@ public enum OpCode
     /// <summary>Moves op 2 into op 1</summary>
     Move,
 
+    /// <summary>Converts op 2 into op 1 according to the numeric conversion in op 3.</summary>
+    ConvertNumeric,
+
     /// <summary>Moves the result of phi function into op 1, other operands are inputs</summary>
     Phi,
 

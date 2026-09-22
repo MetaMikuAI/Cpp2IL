@@ -56,6 +56,56 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
     // integer register 31 is SP or ZR depending on context, callers must decide which
     private static bool IsReg31(Arm64Register reg) => reg is Arm64Register.X31 or Arm64Register.W31;
 
+    internal static NumericConversion? GetNumericConversion(Arm64Instruction instruction, MethodAnalysisContext context)
+    {
+        if (instruction.Op0Kind != Arm64OperandKind.Register || instruction.Op1Kind != Arm64OperandKind.Register) return null;
+        var types = context.AppContext.SystemTypes;
+        TypeAnalysisContext? Floating(Arm64Register register) => register switch
+        {
+            >= Arm64Register.S0 and <= Arm64Register.S31 => types.SystemSingleType,
+            >= Arm64Register.D0 and <= Arm64Register.D31 => types.SystemDoubleType,
+            _ => null
+        };
+        TypeAnalysisContext? Integer(Arm64Register register, bool unsigned) => register switch
+        {
+            >= Arm64Register.W0 and <= Arm64Register.W31 or >= Arm64Register.S0 and <= Arm64Register.S31
+                => unsigned ? types.SystemUInt32Type : types.SystemInt32Type,
+            >= Arm64Register.X0 and <= Arm64Register.X31 or >= Arm64Register.D0 and <= Arm64Register.D31
+                => unsigned ? types.SystemUInt64Type : types.SystemInt64Type,
+            _ => null
+        };
+        var toFloat = instruction.Mnemonic is Arm64Mnemonic.SCVTF or Arm64Mnemonic.UCVTF;
+        var unsigned = instruction.Mnemonic is Arm64Mnemonic.UCVTF or Arm64Mnemonic.FCVTZU or Arm64Mnemonic.FCVTMU
+            or Arm64Mnemonic.FCVTNU or Arm64Mnemonic.FCVTPU or Arm64Mnemonic.FCVTAU;
+        var source = toFloat ? Integer(instruction.Op1Reg, unsigned) : Floating(instruction.Op1Reg);
+        var target = toFloat || instruction.Mnemonic == Arm64Mnemonic.FCVT
+            ? Floating(instruction.Op0Reg) : Integer(instruction.Op0Reg, unsigned);
+        var rounding = instruction.Mnemonic switch
+        {
+            Arm64Mnemonic.FCVTMS or Arm64Mnemonic.FCVTMU => NumericRounding.Floor,
+            Arm64Mnemonic.FCVTPS or Arm64Mnemonic.FCVTPU => NumericRounding.Ceiling,
+            Arm64Mnemonic.FCVTNS or Arm64Mnemonic.FCVTNU => NumericRounding.NearestEven,
+            Arm64Mnemonic.FCVTAS or Arm64Mnemonic.FCVTAU => NumericRounding.NearestAway,
+            _ => NumericRounding.Truncate
+        };
+        // Disarm currently decodes the GPR FCVTAS/AU encodings as FCVTNS/NU.
+        // Check the original opcode rather than silently changing midpoint semantics.
+        if (instruction.Mnemonic is Arm64Mnemonic.FCVTNS or Arm64Mnemonic.FCVTNU
+            && instruction.Op0Reg is >= Arm64Register.W0 and <= Arm64Register.W31 or >= Arm64Register.X0 and <= Arm64Register.X31)
+        {
+            var offset = instruction.Address - context.UnderlyingPointer;
+            if (instruction.Address < context.UnderlyingPointer || context.RawBytes.Length < 4
+                || offset > (ulong)(context.RawBytes.Length - 4)) return null;
+            var word = BinaryPrimitives.ReadUInt32LittleEndian(context.RawBytes.AsSpan().Slice((int)offset, 4));
+            if ((word & 0x7f3efc00) == 0x1e240000) rounding = NumericRounding.NearestAway;
+        }
+        var fractionalBits = instruction.Op2Kind == Arm64OperandKind.Immediate ? (int)instruction.Op2Imm : 0;
+        var integerType = toFloat ? source : target;
+        var width = integerType == types.SystemInt64Type || integerType == types.SystemUInt64Type ? 64 : 32;
+        if (source == null || target == null || fractionalBits < 0 || fractionalBits > width) return null;
+        return new NumericConversion(source, target, rounding, fractionalBits);
+    }
+
     private MethodAnalysisContext? ResolveMathMethod(ApplicationAnalysisContext app, string name, bool isDouble,
         int parameterCount)
         => _mathMethods.GetOrAdd((name, isDouble, parameterCount), key =>
@@ -815,7 +865,14 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.SXTW:
             case Arm64Mnemonic.UXTB:
             case Arm64Mnemonic.UXTH:
-            // conversions are moves for analysis purposes, same as the x86 handling of cvt*
+                if (instruction.Op0Kind == Arm64OperandKind.Register && IsReg31(instruction.Op0Reg))
+                {
+                    Add(address, OpCode.Nop); // write to xzr, discard
+                    break;
+                }
+
+                Add(address, OpCode.Move, ScalarOperand(0), ScalarOperand(1));
+                break;
             case Arm64Mnemonic.FCVT:
             case Arm64Mnemonic.FCVTZS:
             case Arm64Mnemonic.FCVTZU:
@@ -835,7 +892,10 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     break;
                 }
 
-                Add(address, OpCode.Move, ScalarOperand(0), ScalarOperand(1));
+                if (GetNumericConversion(instruction, context) is { } conversion)
+                    Add(address, OpCode.ConvertNumeric, ScalarOperand(0), ScalarOperand(1), conversion);
+                else
+                    Add(address, OpCode.NotImplemented, new StringLiteral($"Unsupported numeric conversion: {instruction}"));
                 break;
             case Arm64Mnemonic.DUP:
                 // Broadcast one value into every lane. Only the 2S arrangement is modelled, and only

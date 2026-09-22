@@ -94,6 +94,7 @@ public class Instruction : IOperand
         switch (OpCode)
         {
             case OpCode.Move:
+            case OpCode.ConvertNumeric:
             case OpCode.Phi:
             case OpCode.Add:
             case OpCode.Subtract:
@@ -155,7 +156,7 @@ public class Instruction : IOperand
     {
         var sources = OpCode switch
         {
-            OpCode.Move or OpCode.ConditionalJump
+            OpCode.Move or OpCode.ConvertNumeric or OpCode.ConditionalJump
                 or OpCode.ShiftStack or OpCode.Not or OpCode.Negate
                 or OpCode.Newobj or OpCode.ZeroExtend or OpCode.SignExtend
                 => [_operands[1]],

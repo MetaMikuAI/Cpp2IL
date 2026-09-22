@@ -239,6 +239,9 @@ public static class LocalVariables
         SeedMethodInfoTypes(method);
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
+            if (instruction is { OpCode: OpCode.ConvertNumeric,
+                Operands: [LocalVariable converted, _, NumericConversion conversion] })
+                converted.Type = conversion.TargetType;
             if (instruction is { OpCode: OpCode.ZeroExtend or OpCode.SignExtend, Destination: LocalVariable extended })
                 extended.Type = instruction.OpCode == OpCode.SignExtend
                     ? method.AppContext.SystemTypes.SystemInt64Type : method.AppContext.SystemTypes.SystemUInt64Type;
