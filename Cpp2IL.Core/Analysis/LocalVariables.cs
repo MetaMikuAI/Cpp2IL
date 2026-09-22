@@ -468,6 +468,8 @@ public static class LocalVariables
                 case OpCode.And or OpCode.Or or OpCode.Xor or OpCode.Not or OpCode.Negate
                     or OpCode.ShiftLeft or OpCode.ShiftRight:
                     changed |= PropagateBooleanResult(instruction, method);
+                    changed |= instruction.OpCode is (OpCode.And or OpCode.Or or OpCode.Xor)
+                        && PropagateKnownIntegerArithmetic(instruction, method);
                     changed |= PropagateIntegerResult(instruction, method);
                     break;
             }

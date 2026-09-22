@@ -117,6 +117,41 @@ public class IntegerArithmeticTypeTests
         Assert.That(Propagate(opcode, new LocalVariable("unknown", new Register(null, "unknown")), Local("Int32")).Type, Is.Null);
     }
 
+    [TestCase("Byte")]
+    [TestCase("SByte")]
+    [TestCase("Int16")]
+    [TestCase("UInt16")]
+    [TestCase("Int32")]
+    [TestCase("UInt32")]
+    [TestCase("Int64")]
+    [TestCase("UInt64")]
+    public void EnumBitwiseResultsMatchUnderlyingIntegerWidth(string underlying)
+    {
+        var enumType = new InjectedTypeAnalysisContext(Type("Object").DeclaringAssembly,
+            "Tests", "Flags", Type("Enum"), TypeAttributes.Public)
+        {
+            OverrideEnumUnderlyingType = Type(underlying),
+        };
+        var flags = new LocalVariable("flags", new Register(null, "flags"), enumType);
+        foreach (var opcode in new[] { OpCode.And, OpCode.Or, OpCode.Xor })
+        {
+            var expected = Propagate(opcode, Local(underlying), new Immediate(255)).Type;
+            Assert.That(expected, Is.Not.Null);
+            Assert.That(Propagate(opcode, flags, new Immediate(255)).Type, Is.SameAs(expected));
+            Assert.That(Propagate(opcode, new Immediate(255), flags).Type, Is.SameAs(expected));
+            Assert.That(Propagate(opcode, flags, flags).Type, Is.SameAs(expected));
+            Assert.That(Propagate(opcode, flags, new Immediate(255), Type("Object")).Type, Is.SameAs(Type("Object")));
+            Assert.That(Propagate(opcode, flags, new LocalVariable("unknown", new Register(null, "unknown"))).Type, Is.Null);
+            if (underlying == "Int32")
+                foreach (var mask in new[] { 0xFFFFFFFFL, 0xFFFFFFFEL, -4294967296L })
+                {
+                    Assert.That(Propagate(opcode, flags, new Immediate(mask)).Type, Is.Null, "a wide mask can pack native struct words");
+                    Assert.That(Propagate(opcode, new Immediate(mask), flags).Type, Is.Null);
+                }
+        }
+        Assert.That(flags.Type, Is.SameAs(enumType));
+    }
+
     [TestCase("UInt32")]
     [TestCase("UInt64")]
     [TestCase("Int64")]
