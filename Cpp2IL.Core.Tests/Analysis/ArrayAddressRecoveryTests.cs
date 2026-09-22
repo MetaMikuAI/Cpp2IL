@@ -170,6 +170,39 @@ public class ArrayAddressRecoveryTests
         }
     }
 
+    [TestCase(false, false)]
+    [TestCase(false, true)]
+    [TestCase(true, false)]
+    [TestCase(true, true)]
+    public void RecoversFieldLoadedIndexWithoutRereadingAfterMutation(bool is32Bit, bool write)
+    {
+        _app.Binary.is32Bit = is32Bit;
+        var owner = new InjectedTypeAnalysisContext(_app.SystemTypes.SystemObjectType.DeclaringAssembly,
+            "Tests", "Counter", _app.SystemTypes.SystemObjectType, TypeAttributes.Public);
+        var field = new InjectedFieldAnalysisContext("count", _app.SystemTypes.SystemInt32Type,
+            FieldAttributes.Public, owner, 2 * _app.Binary.PointerSizeBytes);
+        var receiver = Local("receiver", owner);
+        var count = new FieldReference(field, receiver, field.Offset);
+        var array = Local("array", new SzArrayTypeAnalysisContext(_app.SystemTypes.SystemStringType));
+        var index = Local("index", _app.SystemTypes.SystemInt32Type);
+        var scaled = Local("scaled");
+        var address = Local("address");
+        var value = Local("value", _app.SystemTypes.SystemStringType);
+        var snapshot = new Instruction(0, OpCode.Move, index, count);
+        var memory = new MemoryOperand(address, addend: 4 * _app.Binary.PointerSizeBytes,
+            accessSize: _app.Binary.PointerSizeBytes);
+        var access = write ? new Instruction(4, OpCode.Move, memory, value) : new Instruction(4, OpCode.Move, value, memory);
+        var method = Method(snapshot,
+            new(1, OpCode.ShiftLeft, scaled, index, new Immediate(is32Bit ? 2 : 3)),
+            new(2, OpCode.Add, address, array, scaled),
+            new(3, OpCode.Move, count, new Immediate(99)), access, new(5, OpCode.Return));
+        ArrayRecovery.RecoverSplitAccesses(method);
+        var recovered = (ArrayAccess)access.Operands[write ? 0 : 1];
+        Assert.That(recovered.Array, Is.SameAs(array));
+        Assert.That(recovered.Index, Is.SameAs(index), "use the captured index, not the mutated field");
+        Assert.That(snapshot.Operands[1], Is.SameAs(count));
+    }
+
     [Test]
     public void DoesNotTreatAnOffsetLoadAsAnAddressComputation()
     {

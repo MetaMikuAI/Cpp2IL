@@ -470,7 +470,8 @@ public static class ArrayRecovery
                     // expanding its arithmetic could move Int32 overflow past the extension.
                     { OpCode: OpCode.SignExtend, Operands: [_, LocalVariable { Type.FullName: "System.Int32" } source, Immediate { Value: 32 }] }
                         => new Affine(source, 1, 0),
-                    { OpCode: OpCode.Move, Operands: [_, ArrayAccess or ArrayLength] } => new Affine(local, 1, 0),
+                    // A field read is a captured value, not an address expression to expand.
+                    { OpCode: OpCode.Move, Operands: [_, FieldReference or ArrayAccess or ArrayLength] } => new Affine(local, 1, 0),
                     { OpCode: OpCode.Move, Operands: [_, MemoryOperand lea] } => allowLea ? EvaluateLea(lea, definitions, depth + 1) : new Affine(local, 1, 0),
                     { OpCode: OpCode.Move, Operands: [_, var source] } => Evaluate(source, definitions, depth + 1, allowLea),
                     { OpCode: OpCode.Add, Operands: [_, var left, var right] } => Sum(Evaluate(left, definitions, depth + 1, allowLea), Evaluate(right, definitions, depth + 1, allowLea)),
