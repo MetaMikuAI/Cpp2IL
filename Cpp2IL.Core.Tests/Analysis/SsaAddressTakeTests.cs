@@ -57,4 +57,55 @@ public class SsaAddressTakeTests
         Assert.That(((Block)jump.Operands[0]).Instructions[0], Is.SameAs(store));
         Assert.That(((AddressOf)take.Operands[1]).Target, Is.EqualTo(store.Destination));
     }
+
+    [TestCase("barrier", true)]
+    [TestCase("unknown", false)]
+    [TestCase("copy", false)]
+    [TestCase("store", false)]
+    [TestCase("pointerAddress", false)]
+    [TestCase("secondCall", false)]
+    [TestCase("noProof", false)]
+    [TestCase("unlifted", false)]
+    public void ReadOnlyBarrierAddressDoesNotInventANewSlotValue(string use, bool preserved)
+    {
+        var store = new Instruction(0, OpCode.Move, Reg("slot"), new Immediate(7));
+        var take = new Instruction(1, OpCode.Move, Reg("X0"), new AddressOf(Reg("slot")));
+        var call = new Instruction(2, OpCode.Call, new Immediate(use == "unknown" ? 0x2000 : 0x1000), Reg("X0"), Reg("X0"));
+        var middle = use switch
+        {
+            "unlifted" => new Instruction(3, OpCode.NotImplemented, new StringLiteral("unknown native effects")),
+            "copy" => new Instruction(3, OpCode.Move, Reg("alias"), Reg("X0")),
+            "store" => new Instruction(3, OpCode.Move, new MemoryOperand(Reg("X0")), new Immediate(0)),
+            "pointerAddress" => new Instruction(3, OpCode.Move, Reg("alias"), new AddressOf(Reg("X0"))),
+            "secondCall" => new Instruction(3, OpCode.Call, new Immediate(0x2000), Reg("X0"), Reg("X0")),
+            _ => new Instruction(3, OpCode.Nop)
+        };
+        var consumeAlias = use == "pointerAddress"
+            ? new Instruction(4, OpCode.CallVoid, new StringLiteral("consume"), Reg("alias"))
+            : new Instruction(4, OpCode.Nop);
+        var returned = new Instruction(6, OpCode.Return, Reg("slot"));
+        var graph = new ISILControlFlowGraph([store, take, call, middle,
+            consumeAlias, new(5, OpCode.Move, Reg("X0"), new Immediate(0)), returned]);
+        SsaForm.Build(graph, new DominatorInfo(graph), writeBarrier: use == "noProof" ? 0UL : 0x1000UL);
+        Assert.That(returned.Operands[0].Equals(store.Destination), Is.EqualTo(preserved));
+        Assert.That(((AddressOf)take.Operands[1]).Target.Equals(store.Destination), Is.EqualTo(preserved));
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
+    public void ChecksBothSuccessorPathsForBarrierPointerEscapes(bool escapes)
+    {
+        var store = new Instruction(0, OpCode.Move, Reg("slot"), new Immediate(7));
+        var take = new Instruction(1, OpCode.Move, Reg("X0"), new AddressOf(Reg("slot")));
+        var returned = new Instruction(7, OpCode.Return, Reg("slot"));
+        var other = escapes
+            ? new Instruction(6, OpCode.Call, new Immediate(0x2000), Reg("X0"), Reg("X0"))
+            : new Instruction(6, OpCode.Move, Reg("X0"), new Immediate(0));
+        var graph = new ISILControlFlowGraph([store, take,
+            new(2, OpCode.Call, new Immediate(0x1000), Reg("X0"), Reg("X0")),
+            new(3, OpCode.ConditionalJump, other, Reg("condition")),
+            new(4, OpCode.Move, Reg("X0"), new Immediate(0)), new(5, OpCode.Jump, returned), other, returned]);
+        SsaForm.Build(graph, new DominatorInfo(graph), writeBarrier: 0x1000);
+        Assert.That(returned.Operands[0].Equals(store.Destination), Is.EqualTo(!escapes));
+    }
 }
