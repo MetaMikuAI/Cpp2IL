@@ -28,6 +28,8 @@ public abstract class BaseCallingConventionResolver
     // false when the return buffer pointer lives outside the argument registers (e.g. arm64 uses x8)
     protected virtual bool HiddenBufferConsumesArgumentSlot => true;
 
+    protected virtual int IntegerArgumentSlots(ParameterAnalysisContext parameter) => 1;
+
     public IOperand[] ResolveForUnmanaged(ApplicationAnalysisContext app, ulong target)
     {
         var (integerRegisters, floatRegisters) = RawRegisters(app);
@@ -70,14 +72,14 @@ public abstract class BaseCallingConventionResolver
         var (integerRegisters, floatRegisters) = RawRegisters(app);
         var argBase = ArgBase(call);
 
-        var slots = new List<(bool IsFloat, bool Emit)>();
+        var slots = new List<(bool IsFloat, bool Emit, int Count)>();
         if (ReturnsViaHiddenBuffer(resolved) && HiddenBufferConsumesArgumentSlot)
-            slots.Add((false, false));
+            slots.Add((false, false, 1));
         if (!resolved.IsStatic)
-            slots.Add((false, true));
+            slots.Add((false, true, 1));
         foreach (var parameter in resolved.Parameters)
-            slots.Add((IsFloatingPoint(parameter), true));
-        slots.Add((false, true)); // the MethodInfo argument
+            slots.Add((IsFloatingPoint(parameter), true, IntegerArgumentSlots(parameter)));
+        slots.Add((false, true, 1)); // the MethodInfo argument
 
         var operands = new List<IOperand>(argBase + slots.Count);
         for (var i = 0; i < argBase; i++)
@@ -94,12 +96,14 @@ public abstract class BaseCallingConventionResolver
             // independent integer/float counters
             var (integer, floating) = (0, 0);
 
-            foreach (var (isFloat, emit) in slots)
+            foreach (var (isFloat, emit, count) in slots)
             {
-                if (isFloat ? floating >= floatRegisters.Length : integer >= integerRegisters.Length)
+                if (isFloat ? floating >= floatRegisters.Length : integer + count > integerRegisters.Length)
                     break;
 
-                var operand = call.Operands[argBase + (isFloat ? integerRegisters.Length + floating++ : integer++)];
+                var operand = call.Operands[argBase + (isFloat ? integerRegisters.Length + floating : integer)];
+                if (isFloat) floating++;
+                else integer += count;
                 if (emit)
                     operands.Add(operand);
             }

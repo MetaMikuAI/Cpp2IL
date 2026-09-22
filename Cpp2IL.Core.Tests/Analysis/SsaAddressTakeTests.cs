@@ -17,6 +17,27 @@ public class SsaAddressTakeTests
 
     [TestCase(false)]
     [TestCase(true)]
+    public void InitializesMutableVersionFromTheReachingValue(bool branch)
+    {
+        var store = new Instruction(0, OpCode.Move, Reg("slot"), new Immediate(7));
+        var take = new Instruction(3, OpCode.Move, Reg("pointer"), new AddressOf(Reg("slot")));
+        var returned = new Instruction(5, OpCode.Return, Reg("slot"));
+        var graph = new ISILControlFlowGraph(branch
+            ? [store, new(1, OpCode.ConditionalJump, take, Reg("condition")), new(2, OpCode.Return), take,
+                new(4, OpCode.CallVoid, new StringLiteral("readAndWrite"), Reg("pointer")), returned]
+            : [store, take, new(4, OpCode.CallVoid, new StringLiteral("readAndWrite"), Reg("pointer")), returned]);
+        SsaForm.Build(graph, new DominatorInfo(graph));
+        var current = ((AddressOf)take.Operands[1]).Target;
+        Assert.That(current, Is.Not.EqualTo(store.Destination));
+        var initialization = graph.Instructions.Single(i => i.OpCode == OpCode.Move && Equals(i.Destination, current));
+        Assert.That(initialization.Operands[1], Is.EqualTo(store.Destination));
+        Assert.That(returned.Operands[0], Is.EqualTo(current));
+        var block = graph.Blocks.Single(b => b.Instructions.Contains(take));
+        Assert.That(block.Instructions.IndexOf(initialization), Is.LessThan(block.Instructions.IndexOf(take)));
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
     public void AddressTakenBeforeStoreUsesStoredVersion(bool multipleStores)
     {
         var take = new Instruction(0, OpCode.Move, Reg("pointer"), new AddressOf(Reg("slot")));

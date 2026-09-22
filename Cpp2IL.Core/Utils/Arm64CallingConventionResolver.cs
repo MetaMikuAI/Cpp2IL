@@ -1,4 +1,6 @@
 using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 
@@ -40,6 +42,40 @@ public class Arm64CallingConventionResolver : BaseCallingConventionResolver
 
     protected override bool HiddenBufferConsumesArgumentSlot => false;
 
+    protected override int IntegerArgumentSlots(ParameterAnalysisContext parameter)
+        => IntegerArgumentSlots(parameter.ParameterType);
+
+    internal static int IntegerArgumentSlots(TypeAnalysisContext type)
+    {
+        // AAPCS64 C.12: an integer composite occupies consecutive X registers.
+        // Prove an ordinary flat integral/reference layout; HFA, packed, explicit
+        // and unknown layouts must not be classified by size alone.
+        if (!type.IsValueType || type.IsEnumType || type is GenericInstanceTypeAnalysisContext
+            || type.GenericParameters.Count != 0 || type.AppContext.Binary.PointerSizeBytes != PtrSize
+            || type.Definition is not { PackingSize: 0, ClassSizeIsDefault: true }
+            || (type.Attributes & TypeAttributes.LayoutMask) == TypeAttributes.ExplicitLayout
+            || TypeSizes.UnboxedSize(type, PtrSize) is not (> 8 and <= 16)) return 1;
+        var offset = 0;
+        var alignment = 1;
+        foreach (var field in type.Fields.Where(f => !f.IsStatic).OrderBy(f => f.Offset))
+        {
+            var size = !field.FieldType.IsValueType ? PtrSize : field.FieldType.FullName switch
+            {
+                "System.Boolean" or "System.Byte" or "System.SByte" => 1,
+                "System.Char" or "System.Int16" or "System.UInt16" => 2,
+                "System.Int32" or "System.UInt32" => 4,
+                "System.Int64" or "System.UInt64" or "System.IntPtr" or "System.UIntPtr" => 8,
+                _ => 0
+            };
+            if (size == 0) return 1;
+            alignment = System.Math.Max(alignment, size);
+            offset = (offset + size - 1) & -size;
+            if (field.Offset != offset) return 1;
+            offset += size;
+        }
+        return ((offset + alignment - 1) & -alignment) == TypeSizes.UnboxedSize(type, PtrSize) ? 2 : 1;
+    }
+
     public override IOperand[] ResolveForManaged(MethodAnalysisContext ctx)
     {
         var args = new List<IOperand>();
@@ -50,6 +86,7 @@ public class Arm64CallingConventionResolver : BaseCallingConventionResolver
 
         void AddParameter(ParameterAnalysisContext? par)
         {
+            var slots = par == null ? 1 : IntegerArgumentSlots(par);
             if (par != null && IsFloatingPoint(par))
             {
                 if (floating < FloatRegisters.Length)
@@ -58,14 +95,16 @@ public class Arm64CallingConventionResolver : BaseCallingConventionResolver
                     return;
                 }
             }
-            else if (integer < IntegerRegisters.Length)
+            else if (integer + slots <= IntegerRegisters.Length)
             {
-                args.Add(new Register(null, IntegerRegisters[integer++]));
+                args.Add(new Register(null, IntegerRegisters[integer]));
+                integer += slots;
                 return;
             }
+            else integer = IntegerRegisters.Length;
 
             args.Add(new StackOffset(stack));
-            stack += PtrSize;
+            stack += PtrSize * slots;
         }
 
         if (!ctx.IsStatic)
