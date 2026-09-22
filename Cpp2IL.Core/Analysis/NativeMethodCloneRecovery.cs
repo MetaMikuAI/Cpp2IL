@@ -66,6 +66,49 @@ internal static class NativeMethodCloneRecovery
         });
     }
 
+    internal static void BeforeSsa(MethodAnalysisContext method)
+    {
+        if (method.AppContext.InstructionSet is not NewArmV8InstructionSet || method.IsVoid || !method.ReturnType.IsValueType)
+            return;
+        var convention = method.AppContext.InstructionSet.CallingConventionResolver!;
+        if (convention.ReturnRegister(method).Name != "X0" || convention.ReturnsViaHiddenBuffer(method)) return;
+        var cache = Caches.GetValue(method.AppContext, app => new Cache(app));
+        var instructions = method.ConvertedIsil!;
+        for (var i = 0; i < instructions.Count; i++)
+        {
+            var call = instructions[i];
+            if (call is not { OpCode: OpCode.Call, Operands: [Immediate target, Register { Name: "X0" } result, ..] }
+                || method.AppContext.MethodsByAddress.ContainsKey(target.UnsignedValue)
+                || !convention.HasRawArgumentLayout(call, method.AppContext)
+                || !ReturnsUnchanged(instructions, i, result)) continue;
+            // The native return path proves the managed result type before SSA can
+            // split it into register pieces. Body identity still has to be unique.
+            var body = cache.Body(target.UnsignedValue);
+            if (body.Length == 0 || !cache.Index(method.ReturnType).TryGetValue(body, out var resolved) || resolved == null) continue;
+            call.SetOperand(0, resolved);
+            convention.RemapRawArguments(call, resolved);
+        }
+    }
+
+    internal static bool ReturnsUnchanged(IReadOnlyList<Instruction> instructions, int callIndex, Register result)
+    {
+        // Protect all possible aggregate return pieces, not just the low register.
+        bool ReturnPiece(Register register) => register.Number == result.Number
+            || register.Name is "X1" or "V0" or "V1" or "V2" or "V3";
+        for (var i = callIndex + 1; i < instructions.Count; i++)
+        {
+            var instruction = instructions[i];
+            if (instruction is { OpCode: OpCode.Return, Operands: [Register returned] })
+                return returned.Number == result.Number;
+            if (!instruction.IsFallThrough || instruction.IsCall || instruction.OpCode is OpCode.IndirectCall
+                    or OpCode.Invalid or OpCode.NotImplemented or OpCode.Interrupt
+                || instruction.Destination is Register destination && ReturnPiece(destination)
+                || instruction.ImplicitDefinition is { } implicitDefinition && ReturnPiece(implicitDefinition))
+                return false;
+        }
+        return false;
+    }
+
     internal static bool Run(MethodAnalysisContext method)
     {
         if (method.AppContext.InstructionSet is not NewArmV8InstructionSet) return false;

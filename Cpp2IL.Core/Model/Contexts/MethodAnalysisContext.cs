@@ -369,6 +369,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         if (ConvertedIsil.Count == 0)
             return; //Nothing to do, empty function
 
+        NativeMethodCloneRecovery.BeforeSsa(this);
         ControlFlowGraph = new ISILControlFlowGraph(ConvertedIsil);
 
         // Indirect jumps/calls should probably be resolved here before stack analysis

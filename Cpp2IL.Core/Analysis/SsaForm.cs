@@ -26,13 +26,15 @@ public class SsaForm
     private readonly Dictionary<int, Register> _repr = new();
 
     public static void Build(MethodAnalysisContext method)
-        => Build(method.ControlFlowGraph!, method.DominatorInfo!, method.StackAggregates.Keys.ToHashSet());
+        => Build(method.ControlFlowGraph!, method.DominatorInfo!, method.StackAggregates.Keys.ToHashSet(),
+            method.AppContext.GetOrCreateKeyFunctionAddresses().il2cpp_codegen_write_barrier);
 
-    public static void Build(ISILControlFlowGraph graph, DominatorInfo dominatorInfo, HashSet<int>? storage = null)
+    public static void Build(ISILControlFlowGraph graph, DominatorInfo dominatorInfo, HashSet<int>? storage = null,
+        ulong writeBarrier = 0)
     {
         DelayAddressTakesPastStores(graph);
         var ssa = new SsaForm();
-        ssa.FindClobberingAddressTakes(graph, storage);
+        ssa.FindClobberingAddressTakes(graph, storage, writeBarrier);
 
         graph.BuildUseDefLists(ssa._clobbering);
 
@@ -74,13 +76,20 @@ public class SsaForm
     // The address-takes whose slot is read again afterwards, and so have to be treated as definitions.
     private readonly HashSet<Instruction> _clobbering = [];
 
-    private void FindClobberingAddressTakes(ISILControlFlowGraph graph, HashSet<int>? storage)
+    private void FindClobberingAddressTakes(ISILControlFlowGraph graph, HashSet<int>? storage, ulong writeBarrier)
     {
         foreach (var block in graph.Blocks)
         {
             for (var i = 0; i < block.Instructions.Count; i++)
             {
                 var instruction = block.Instructions[i];
+                // The runtime write barrier marks GC cards; it does not write the
+                // addressed slot. Preserve its value only if this address cannot escape
+                // to any other use before its pointer register is overwritten.
+                if (writeBarrier != 0 && instruction is { OpCode: OpCode.Move,
+                        Operands: [Register pointer, AddressOf { Target: Register }] }
+                    && OnlyUsedByWriteBarrier(block, i, pointer, writeBarrier))
+                    continue;
 
                 foreach (var operand in instruction.Operands)
                 {
@@ -90,6 +99,53 @@ public class SsaForm
                 }
             }
         }
+    }
+
+    private static bool OnlyUsedByWriteBarrier(Block start, int index, Register pointer, ulong barrier)
+    {
+        var pending = new Queue<(Block Block, int From)>();
+        var visited = new HashSet<(Block, int)>();
+        pending.Enqueue((start, index + 1));
+        var seenBarrier = false;
+        while (pending.TryDequeue(out var location))
+        {
+            if (!visited.Add(location)) continue;
+            var (block, from) = location;
+            var overwritten = false;
+            foreach (var instruction in block.Instructions.Skip(from))
+            {
+                if (instruction.OpCode is OpCode.Invalid or OpCode.NotImplemented or OpCode.IndirectJump)
+                    return false; // Unknown native effects are not a non-escape proof.
+                if (instruction is { OpCode: OpCode.Call, Operands: [Immediate target, _, Register address, ..] }
+                    && target.UnsignedValue == barrier && address.Number == pointer.Number)
+                {
+                    // Its provisional call-result register is not a native assignment.
+                    seenBarrier = true;
+                    continue;
+                }
+                if (instruction.Sources.Any(source => source switch
+                    {
+                        Register register => register.Number == pointer.Number,
+                        AddressOf { Target: Register addressed } => addressed.Number == pointer.Number,
+                        MemoryOperand memory => memory.Base is Register b && b.Number == pointer.Number
+                            || memory.Index is Register i && i.Number == pointer.Number,
+                        _ => false
+                    })) return false;
+                // A store through the pointer is a use too, even though its memory
+                // destination is not included in Instruction.Sources.
+                if (instruction.Destination is MemoryOperand destination
+                    && (destination.Base is Register b && b.Number == pointer.Number
+                        || destination.Index is Register i && i.Number == pointer.Number)) return false;
+                if (instruction.Destination is Register written && written.Number == pointer.Number)
+                {
+                    overwritten = true;
+                    break;
+                }
+            }
+            if (!overwritten)
+                foreach (var successor in block.Successors) pending.Enqueue((successor, 0));
+        }
+        return seenBarrier;
     }
 
     private static bool IsReadAfter(Block block, int index, Register register)
