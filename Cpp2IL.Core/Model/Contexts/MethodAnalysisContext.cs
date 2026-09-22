@@ -443,7 +443,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         // Removing constant edges exposes trivial phis, which in turn expose constants.
         // Both folds are monotonic; keep phi/predecessor alignment until SSA destruction.
-        while (ConstantFolder.Run(this) | ConstantBranchFolder.PruneSsa(ControlFlowGraph!) | EquivalentBranchFolder.Run(ControlFlowGraph!))
+        while (ConstantFolder.Run(this) | ConstantBranchFolder.PruneSsa(ControlFlowGraph!) | EquivalentBranchFolder.Run(ControlFlowGraph!) | RedundantTypeCheckFolder.Run(ControlFlowGraph!))
             SsaSimplifier.Run(this);
 
         InternalCallGuardRemover.Run(this);

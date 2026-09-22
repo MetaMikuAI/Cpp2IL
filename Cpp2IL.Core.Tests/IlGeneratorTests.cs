@@ -86,6 +86,52 @@ public class IlGeneratorTests
             "expected exactly two Ldloc instructions for the two parameters of the target method");
     }
 
+    [TestCase("value")]
+    [TestCase("ref")]
+    [TestCase("receiver")]
+    [TestCase("mismatch")]
+    public void NativeAggregateAddress_RespectsManagedCallSignature(string kind)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var aggregate = app.AllTypes.Single(t => t.FullName == "UnityEngine.Bounds");
+        var module = new ModuleDefinition("AggregateCall.dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        var type = new TypeDefinition("Tests", "Aggregate", TypeAttributes.Public | TypeAttributes.SequentialLayout,
+            module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", "ValueType"));
+        module.TopLevelTypes.Add(type);
+        aggregate.PutExtraData("AsmResolverType", type);
+        var value = new LocalVariable("value", new Register(null, "value"), aggregate);
+        var parameterType = kind == "ref" ? new ByRefTypeAnalysisContext(aggregate)
+            : kind == "mismatch" ? app.SystemTypes.SystemInt32Type : aggregate;
+        var isStatic = kind != "receiver";
+        var target = new InjectedMethodAnalysisContext(aggregate, "Consume", app.SystemTypes.SystemVoidType,
+            ReflectionMethodAttributes.Public | (isStatic ? ReflectionMethodAttributes.Static : 0),
+            isStatic ? [parameterType] : []);
+        var signature = kind == "ref" ? type.ToTypeSignature(true).MakeByReferenceType()
+            : kind == "mismatch" ? module.CorLibTypeFactory.Int32 : type.ToTypeSignature(true);
+        var targetDefinition = new MethodDefinition("Consume", MethodAttributes.Public | (isStatic ? MethodAttributes.Static : 0),
+            isStatic ? MethodSignature.CreateStatic(module.CorLibTypeFactory.Void, [signature])
+                : MethodSignature.CreateInstance(module.CorLibTypeFactory.Void));
+        type.Methods.Add(targetDefinition);
+        target.PutExtraData("AsmResolverMethod", targetDefinition);
+        var caller = new InjectedMethodAnalysisContext(aggregate, "Caller", app.SystemTypes.SystemVoidType,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, [])
+        {
+            Locals = [value], ParameterLocals = [],
+            ControlFlowGraph = new ISILControlFlowGraph([
+                new Instruction(0, OpCode.CallVoid, target, new AddressOf(value)),
+                new Instruction(1, OpCode.Return)])
+        };
+        var generated = new MethodDefinition("Caller", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        type.Methods.Add(generated);
+        IlGenerator.GenerateIl(caller, generated);
+        var il = generated.CilMethodBody!.Instructions;
+        var call = il.ToList().FindIndex(i => i.OpCode == CilOpCodes.Call);
+        Assert.That(call, Is.GreaterThan(0));
+        Assert.That(il[call - 1].OpCode, Is.EqualTo(kind == "value" ? CilOpCodes.Ldloc : CilOpCodes.Ldloca));
+        Assert.That(il[call - 1].Operand, Is.SameAs(generated.CilMethodBody.LocalVariables[0]));
+    }
+
     [TestCase(8)]
     [TestCase(16)]
     [TestCase(32)]

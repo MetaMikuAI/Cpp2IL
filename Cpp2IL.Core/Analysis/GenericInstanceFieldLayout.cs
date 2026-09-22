@@ -50,7 +50,7 @@ public static class GenericInstanceFieldLayout
             // even when T is a value type with an otherwise unknown layout.
             var fieldType = instance == null ? field.FieldType
                 : GenericInstantiation.Instantiate(field.FieldType, instance.GenericArguments, []);
-            if (GetSizeAndAlignment(fieldType, pointerSize) is not var (size, alignment))
+            if (GetSizeAndAlignment(fieldType, pointerSize, allowMetadataStructs: !definition.IsValueType) is not var (size, alignment))
                 return null;
 
             offset = (offset + alignment - 1) & ~(alignment - 1);
@@ -106,14 +106,14 @@ public static class GenericInstanceFieldLayout
         return end == (metadataSize ?? (uint)(2 * pointerSize)) ? end : null;
     }
 
-    private static (long Size, long Alignment)? GetSizeAndAlignment(TypeAnalysisContext fieldType, int pointerSize)
+    private static (long Size, long Alignment)? GetSizeAndAlignment(TypeAnalysisContext fieldType, int pointerSize, bool allowMetadataStructs = false, int depth = 0)
     {
-        // TODO support user-defined value types
+        if (depth > 16) return null;
         if (fieldType is GenericParameterTypeAnalysisContext or PointerTypeAnalysisContext || !fieldType.IsValueType)
             return (pointerSize, pointerSize);
 
         if (fieldType.IsEnumType && fieldType.Fields.FirstOrDefault(f => !f.IsStatic) is { } underlying)
-            return GetSizeAndAlignment(underlying.FieldType, pointerSize);
+            return GetSizeAndAlignment(underlying.FieldType, pointerSize, allowMetadataStructs, depth + 1);
 
         return fieldType.FullName switch
         {
@@ -122,7 +122,34 @@ public static class GenericInstanceFieldLayout
             "System.Int32" or "System.UInt32" or "System.Single" => (4, 4),
             "System.Int64" or "System.UInt64" or "System.Double" => (8, 8),
             "System.IntPtr" or "System.UIntPtr" => (pointerSize, pointerSize),
-            _ => null // an arbitrary struct needs its own layout computed, bail rather than guess
+            _ => allowMetadataStructs ? MetadataValueTypeLayout(fieldType, pointerSize, depth + 1) : null
         };
     }
+
+    private static (long Size, long Alignment)? MetadataValueTypeLayout(TypeAnalysisContext type, int pointerSize, int depth)
+    {
+        // Infer natural alignment only for the 64-bit layout, where the scalar rules
+        // above apply. 32-bit targets differ in their alignment of 64-bit members.
+        if (pointerSize != 8 || type is GenericInstanceTypeAnalysisContext || type.GenericParameters.Count != 0
+            || type.Definition is not { PackingSize: 0, ClassSizeIsDefault: true } metadata
+            || (type.Attributes & TypeAttributes.LayoutMask) == TypeAttributes.ExplicitLayout)
+            return null;
+        var fields = type.Fields.Where(f => !f.IsStatic).ToArray();
+        if (fields.Length == 0) return null;
+        var end = 0L;
+        var alignment = 1L;
+        foreach (var field in fields)
+        {
+            if (GetSizeAndAlignment(field.FieldType, pointerSize, true, depth) is not { } layout) return null;
+            end = (end + layout.Alignment - 1) & ~(layout.Alignment - 1);
+            if (field.Offset != end) return null;
+            end += layout.Size;
+            alignment = Math.Max(alignment, layout.Alignment);
+        }
+        var size = (end + alignment - 1) & ~(alignment - 1);
+        // Both every member offset and the complete managed size must agree. Native
+        // marshalled sizes are not evidence for managed reference-containing structs.
+        return size == (long)metadata.RawSizes.instance_size - 2L * pointerSize ? (size, alignment) : null;
+    }
+
 }
