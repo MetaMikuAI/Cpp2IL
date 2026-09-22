@@ -94,8 +94,10 @@ internal static class Arm64SwitchRecognizer
         var compare = words[guardIndex - 1];
         if ((compare & 0xFFC0001F) != 0x7100001F || ((compare >> 5) & 31) != selector) return null;
         // The X-index form requires proven zero upper bits, not just a W compare.
+        // W ADD/SUB also proves this when normalizing a nonzero first case.
         var definition = words[guardIndex - 2];
-        if ((definition & 0xFFC00000) != 0xB9400000 || (definition & 31) != selector) return null;
+        if ((definition & 31) != selector || (definition & 0xFFC00000) != 0xB9400000
+            && (definition & 0xFF800000) is not (0x11000000 or 0x51000000)) return null;
         var count = (int)((compare >> 10) & 0xFFF) + (condition == 8 ? 1 : 0);
         if (count is < 2 or > 4096) return null;
         var defaultTarget = unchecked((ulong)((long)start + guardIndex * 4 + ConditionalOffset(guard)));

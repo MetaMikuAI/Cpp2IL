@@ -95,4 +95,27 @@ public class Arm64SwitchRecognizerTests
         });
         Assert.That(result, Is.Not.Null);
     }
+
+    [TestCase(0x51000C08u, true)] // SUB W8,W0,#3
+    [TestCase(0x51000908u, true)] // SUB W8,W8,#2
+    [TestCase(0x11000C08u, true)] // ADD W8,W0,#3 (negative first case)
+    [TestCase(0x51400408u, true)] // SUB W8,W0,#1,LSL #12
+    [TestCase(0x11400408u, true)] // ADD W8,W0,#1,LSL #12
+    [TestCase(0xD1000C08u, false)] // SUB X8,X0,#3 does not clear upper bits
+    [TestCase(0x91000C08u, false)] // ADD X8,X0,#3
+    [TestCase(0x51000C09u, false)] // W9 is not the guarded selector
+    [TestCase(0x4B000108u, false)] // Register SUB is not the supported immediate shape
+    [TestCase(0x51800C08u, false)] // Reserved opcode bit
+    public void NormalizedSelectorStillRequiresAProven32BitDefinition(uint definition, bool expected)
+    {
+        var words = Fixture();
+        words[0] = definition;
+        var result = Arm64SwitchRecognizer.Decode(words, Start, 7, (_, _) => [0, 41, 86, 97]);
+        Assert.That(result != null, Is.EqualTo(expected));
+        if (expected)
+        {
+            Assert.That(result!.Selector, Is.EqualTo(8));
+            Assert.That(result.Targets, Is.EqualTo(new ulong[] { 0x525A3A0, 0x525A444, 0x525A4F8, 0x525A524 }));
+        }
+    }
 }
