@@ -408,12 +408,15 @@ public static class MetadataResolver
                         continue;
                 }
 
-                // Width is evidence for a partial read only if a later member proves the
+                // Width is evidence for a partial access only if a later member proves the
                 // aggregate extends beyond it. Equal-sized whole-struct copies stay intact.
-                if (instruction.OpCode == OpCode.Move && i == 1 && fieldGenericOwner == null
-                    && instruction.Destination is LocalVariable result && !aggregateCopies.Contains(result)
+                if (instruction.OpCode == OpCode.Move && fieldGenericOwner == null
+                    && (i == 1 && instruction.Destination is LocalVariable result && !aggregateCopies.Contains(result)
+                        || i == 0 && (instruction.Operands[1] is Immediate
+                            || OperandType(instruction.Operands[1], method, definitions) is { } sourceType && !IsAggregate(sourceType))
+                            && !(instruction.Operands[1] is LocalVariable source && aggregateCopies.Contains(source)))
                     && instruction.Operands[i] is MemoryOperand { AccessSize: > 0 } sized
-                    && ResolvePartialStructLoad(field, fieldLocal, (int)fieldOffset, sized.AccessSize,
+                    && ResolvePartialStructAccess(field, fieldLocal, (int)fieldOffset, sized.AccessSize,
                         method.AppContext.Binary.PointerSizeBytes) is { } scalar)
                 {
                     instruction.SetOperand(i, scalar);
@@ -448,7 +451,7 @@ public static class MetadataResolver
         return changed;
     }
 
-    internal static FieldReference? ResolvePartialStructLoad(FieldAnalysisContext field, LocalVariable receiver,
+    internal static FieldReference? ResolvePartialStructAccess(FieldAnalysisContext field, LocalVariable receiver,
         int offset, int width, int pointerSize)
     {
         if (width <= 0 || field.IsStatic) return null;

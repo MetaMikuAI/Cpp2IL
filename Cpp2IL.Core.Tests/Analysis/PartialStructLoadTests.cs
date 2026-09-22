@@ -24,6 +24,14 @@ public class PartialStructLoadTests
     [TestCase("aggregateConsumer", false, false)]
     [TestCase("aggregateCopyChain", false, false)]
     [TestCase("aggregatePhi", false, false)]
+    [TestCase("storeZero", false, true)]
+    [TestCase("storeZero", true, true)]
+    [TestCase("storeScalar", false, true)]
+    [TestCase("storeWhole", false, false)]
+    [TestCase("storeUnknownWidth", false, false)]
+    [TestCase("storeWrongWidth", false, false)]
+    [TestCase("storeAggregate", false, false)]
+    [TestCase("storeUnknownSource", false, false)]
     public void RequiresPartialAccessAtEveryValueTypeLevel(string shape, bool is32Bit, bool expected)
     {
         Cpp2IlApi.ResetInternalState();
@@ -53,11 +61,17 @@ public class PartialStructLoadTests
             case "generic": inner.GenericParameters.Add(new GenericParameterTypeAnalysisContext("T", 0, Il2CppTypeEnum.IL2CPP_TYPE_VAR,
                 GenericParameterAttributes.None, inner)); break;
         }
-        var width = shape switch { "unknownWidth" => 0, "wholeCopy" => 2 * pointerSize, "wrongWidth" => 1, _ => pointerSize };
+        var width = shape switch { "unknownWidth" or "storeUnknownWidth" => 0,
+            "wholeCopy" or "storeWhole" => 2 * pointerSize, "wrongWidth" or "storeWrongWidth" => 1, _ => pointerSize };
         var receiver = new LocalVariable("receiver", new Register(null, "receiver"), owner);
-        var result = new LocalVariable("result", new Register(null, "result"), shape == "aggregateConsumer" ? field.FieldType : null);
+        var result = new LocalVariable("result", new Register(null, "result"), shape is "aggregateConsumer" or "storeAggregate"
+            ? field.FieldType : shape == "storeScalar" ? app.SystemTypes.SystemObjectType : null);
         var consumer = new LocalVariable("consumer", new Register(null, "consumer"), field.FieldType);
         var read = new Instruction(0, OpCode.Move, result, new MemoryOperand(receiver, addend: field.Offset, accessSize: width));
+        var store = shape.StartsWith("store");
+        if (store)
+            read.SetOperands(new MemoryOperand(receiver, addend: field.Offset, accessSize: width),
+                shape is "storeScalar" or "storeAggregate" or "storeUnknownSource" ? result : new Immediate(0));
         var use = shape switch
         {
             "aggregateCopyChain" => new Instruction(1, OpCode.Move, consumer, result),
@@ -70,7 +84,9 @@ public class PartialStructLoadTests
             Locals = [receiver, result, consumer], ParameterLocals = []
         };
         MetadataResolver.ResolveFieldOffsets(method);
-        var reference = (FieldReference)read.Operands[1];
+        var reference = (FieldReference)read.Operands[store ? 0 : 1];
+        if (store)
+            Assert.That(read.OpCode, Is.EqualTo(OpCode.Move), "A partial store must not become whole-aggregate initialization");
         Assert.That(reference.IsNested, Is.EqualTo(expected));
         if (expected)
         {
