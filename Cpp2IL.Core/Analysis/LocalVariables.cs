@@ -269,6 +269,7 @@ public static class LocalVariables
                 throw new DecompilerException($"Type and field resolution not settling! (looped {MaxTypePropagationLoopCount} times)");
 
             changed = false;
+            changed |= NativeMethodCloneRecovery.Run(method);
             changed |= MetadataResolver.ResolveCallsViaMethodInfo(method);
             changed |= MetadataResolver.ResolveAmbiguousCalls(method);
             // The allocation type may only become known during this fixpoint.
