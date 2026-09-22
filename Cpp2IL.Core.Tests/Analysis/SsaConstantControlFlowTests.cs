@@ -8,6 +8,56 @@ namespace Cpp2IL.Core.Tests.Analysis;
 
 public class SsaConstantControlFlowTests
 {
+    [TestCase("same", true)]
+    [TestCase("inverted", true)]
+    [TestCase("differentMask", false)]
+    [TestCase("wrongPolarity", false)]
+    [TestCase("call", false)]
+    [TestCase("load", false)]
+    [TestCase("store", false)]
+    [TestCase("escaping", false)]
+    [TestCase("differentPhi", false)]
+    public void FoldsOnlyEquivalentPureSuccessors(string mutation, bool expected)
+    {
+        var cfg = new ISILControlFlowGraph([]);
+        var input = Local("input");
+        var guardValue = Local("guard");
+        var leftMask = Local("leftMask");
+        var rightMask = Local("rightMask");
+        var leftCondition = Local("leftCondition");
+        var rightCondition = Local("rightCondition");
+        var negated = Local("negated");
+        var head = Block(cfg);
+        var left = Block(cfg,
+            new(-1, OpCode.And, leftMask, input, new Immediate(128)),
+            new(-1, OpCode.CheckEqual, leftCondition, leftMask, new Immediate(0)));
+        var right = Block(cfg,
+            new(-1, OpCode.And, rightMask, input, new Immediate(mutation == "differentMask" ? 64 : 128)),
+            new(-1, OpCode.CheckEqual, rightCondition, rightMask, new Immediate(0)));
+        var phi = new Instruction(-1, OpCode.Phi, Local("result"), new Immediate(7), new Immediate(mutation == "differentPhi" ? 8 : 7));
+        var yes = Block(cfg, phi, new(-1, OpCode.Return, mutation == "escaping" ? rightMask : phi.Operands[0]));
+        var no = Block(cfg, new Instruction(-1, OpCode.Return, new Immediate(0)));
+        if (mutation is "inverted" or "wrongPolarity")
+            right.AddInstruction(new(-1, OpCode.Not, negated, rightCondition));
+        if (mutation == "call") right.AddInstruction(new(-1, OpCode.CallVoid, new StringLiteral("effect")));
+        if (mutation == "load") right.AddInstruction(new(-1, OpCode.Move, Local("read"), new MemoryOperand(input)));
+        if (mutation == "store") right.AddInstruction(new(-1, OpCode.Move, new MemoryOperand(input), new Immediate(1)));
+        head.AddInstruction(new(-1, OpCode.ConditionalJump, left, guardValue));
+        left.AddInstruction(new(-1, OpCode.ConditionalJump, yes, leftCondition));
+        right.AddInstruction(new(-1, OpCode.ConditionalJump, mutation == "inverted" ? no : yes,
+            mutation is "inverted" or "wrongPolarity" ? negated : rightCondition));
+        Edge(cfg.EntryBlock, head);
+        Edge(head, left); Edge(head, right);
+        Edge(left, yes); Edge(left, no);
+        Edge(right, yes); Edge(right, no);
+        Edge(yes, cfg.ExitBlock); Edge(no, cfg.ExitBlock);
+        Assert.That(EquivalentBranchFolder.Run(cfg), Is.EqualTo(expected));
+        Assert.That(cfg.Blocks.Contains(right), Is.EqualTo(!expected));
+        Assert.That(phi.Operands.Count, Is.EqualTo(yes.Predecessors.Count + 1));
+        if (expected) Assert.That(phi.Operands[1], Is.EqualTo(new Immediate(7)));
+        Assert.That(EquivalentBranchFolder.Run(cfg), Is.False);
+    }
+
     private static LocalVariable Local(string name) => new(name, new Register(null, name));
     private static Block Block(ISILControlFlowGraph cfg, params Instruction[] instructions)
     {
