@@ -94,4 +94,53 @@ public class TypedConstantTests
         IlGenerator.GenerateIl(context, method);
         return method.CilMethodBody!.Instructions.First(i => i.OpCode != CilOpCodes.Nop);
     }
+
+    [TestCase(OpCode.Add, "Int64", "Int64", 1L, false, true)]
+    [TestCase(OpCode.Subtract, "UInt64", "UInt64", 1L, true, true)]
+    [TestCase(OpCode.And, "Int64", "Int64", 255L, false, true)]
+    [TestCase(OpCode.And, "Int32", "Int32", 2147483648L, false, false)]
+    [TestCase(OpCode.Or, "UInt32", "UInt32", 4294967295L, true, false)]
+    [TestCase(OpCode.CheckEqual, "Int64", "Boolean", 0L, false, true)]
+    [TestCase(OpCode.CheckEqual, "UInt32", "Boolean", 4294967295L, false, false)]
+    [TestCase(OpCode.CheckLess, "UInt32", "Boolean", 4294967295L, false, true)]
+    [TestCase(OpCode.CheckGreater, "UInt64", "Boolean", 1L, false, false)]
+    [TestCase(OpCode.ShiftRight, "Int64", "Int64", 1L, false, false)]
+    [TestCase(OpCode.And, "Int32", "Object", 4294967295L, false, true)]
+    [TestCase(OpCode.And, "Int32", "Int64", 4294967295L, false, true)]
+    [TestCase(OpCode.And, "Object", "Int32", 4294967295L, false, true)]
+    [TestCase(OpCode.And, "Int32", "Int32", 4294967296L, false, true)]
+    public void BinaryConstantsUseOnlyProvenIntegerWidths(OpCode opcode, string sourceName, string resultName,
+        long value, bool literalLeft, bool wide)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        TypeAnalysisContext Type(string name) => app.AssembliesByName["mscorlib"].GetTypeByFullName("System." + name)!;
+        var source = new LocalVariable("source", new Register(null, "source"), Type(sourceName));
+        var result = new LocalVariable("result", new Register(null, "result"), Type(resultName));
+        var literal = new Immediate(value);
+        var context = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "BinaryConstant",
+            app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, [])
+        {
+            ControlFlowGraph = new ISILControlFlowGraph([
+                new Instruction(0, opcode, result, literalLeft ? literal : source, literalLeft ? source : literal),
+                new Instruction(1, OpCode.Return)]),
+            Locals = [source, result], ParameterLocals = [], AnalysisWarnings = []
+        };
+        var module = new ModuleDefinition("BinaryConstantTests.dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        var owner = new TypeDefinition("Tests", "BinaryConstants", TypeAttributes.Public);
+        module.TopLevelTypes.Add(owner);
+        foreach (var type in new[] { source.Type!, result.Type! }.Distinct())
+            if (type.GetExtraData<TypeDefinition>("AsmResolverType") == null)
+            {
+                var placeholder = new TypeDefinition(type.Namespace, type.Name, TypeAttributes.Public);
+                module.TopLevelTypes.Add(placeholder);
+                type.PutExtraData("AsmResolverType", placeholder);
+            }
+        var method = new MethodDefinition("BinaryConstant", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        owner.Methods.Add(method);
+        IlGenerator.GenerateIl(context, method);
+        var load = method.CilMethodBody!.Instructions.First(i => i.OpCode == CilOpCodes.Ldc_I4 || i.OpCode == CilOpCodes.Ldc_I8);
+        Assert.That(load.OpCode, Is.EqualTo(wide ? CilOpCodes.Ldc_I8 : CilOpCodes.Ldc_I4));
+        Assert.That(Convert.ToInt64(load.Operand), Is.EqualTo(wide ? value : unchecked((int)value)));
+    }
 }

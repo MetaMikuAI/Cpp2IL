@@ -842,8 +842,9 @@ public static class IlGenerator
                 var floatConversion = FloatArithmeticConversion(instruction);
                 var shiftType = instruction is { OpCode: OpCode.ShiftLeft or OpCode.ShiftRight,
                     Operands: [_, _, _, TypeAnalysisContext explicitType] } ? explicitType.FullName : null;
+                var integerLiteralType = BinaryIntegerLiteralType(instruction);
 
-                LoadOperand(instruction.Operands[1], method, locals, writeLine);
+                LoadOperand(instruction.Operands[1], method, locals, writeLine, integerLiteralType);
                 if (floatConversion is { } conv1)
                     instructions.Add(conv1);
                 if (shiftType != null)
@@ -855,7 +856,7 @@ public static class IlGenerator
                         "System.UInt64" => CilOpCodes.Conv_U8,
                         _ => throw new InvalidOperationException($"Invalid native shift type: {shiftType}")
                     });
-                LoadOperand(instruction.Operands[2], method, locals, writeLine);
+                LoadOperand(instruction.Operands[2], method, locals, writeLine, integerLiteralType);
                 if (floatConversion is { } conv2)
                     instructions.Add(conv2);
 
@@ -984,6 +985,36 @@ public static class IlGenerator
         (operand as LocalVariable)?.Type?.FullName is
             "System.Byte" or "System.UInt16" or "System.UInt32" or "System.UInt64"
             or "System.UIntPtr" or "System.Char";
+
+    private static TypeAnalysisContext? BinaryIntegerLiteralType(Instruction instruction)
+    {
+        // Shift counts have their own stack width. Unknown native packing results
+        // must not acquire a width merely from one typed field/enum operand.
+        if (instruction.OpCode is OpCode.ShiftLeft or OpCode.ShiftRight)
+            return null;
+        var other = instruction.Operands[1] is Immediate ? instruction.Operands[2]
+            : instruction.Operands[2] is Immediate ? instruction.Operands[1] : null;
+        TypeAnalysisContext? IntegerType(IOperand? operand)
+        {
+            var type = operand switch { LocalVariable local => local.Type, FieldReference field => field.Field.FieldType, _ => null };
+            return type?.IsEnumType == true ? type.EnumUnderlyingType : type;
+        }
+        static int Width(TypeAnalysisContext? type) => type?.FullName switch
+        {
+            "System.Int32" or "System.UInt32" => 4,
+            "System.Int64" or "System.UInt64" => 8,
+            _ => 0
+        };
+        var sourceType = IntegerType(other);
+        var width = Width(sourceType);
+        // Ordered comparisons currently emit signed CIL. Do not silently change
+        // unsigned ordering while repairing the literal's stack width.
+        if (instruction.OpCode is OpCode.CheckLess or OpCode.CheckGreater or OpCode.CheckLessOrEqual or OpCode.CheckGreaterOrEqual
+            && sourceType?.FullName is "System.UInt32" or "System.UInt64")
+            return null;
+        return width != 0 && (instruction.OpCode is >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual
+            || Width(IntegerType(instruction.Destination)) == width) ? sourceType : null;
+    }
 
     private static CilOpCode? FloatArithmeticConversion(Instruction instruction)
     {
