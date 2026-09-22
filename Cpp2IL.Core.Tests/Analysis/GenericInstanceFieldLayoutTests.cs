@@ -152,6 +152,36 @@ public class GenericInstanceFieldLayoutTests
         Assert.That(field.FieldType, Is.SameAs(_app.SystemTypes.SystemStringType));
     }
 
+    [TestCase(false)]
+    [TestCase(true)]
+    public void ResolvesDerivedFieldAfterMetadataSizedValueTypeInBase(bool write)
+    {
+        var parent = _app.AllTypes.Single(t => t.FullName == "UnityEngine.Object");
+        var embedded = _app.AllTypes.Single(t => t.FullName == "System.DateTime");
+        var pointer = parent.Fields.Single(f => f.Name == "m_CachedPtr");
+        pointer.FieldType = embedded;
+        var owner = Create(_app.SystemTypes.SystemStringType, array: false);
+        owner.GenericType.BaseType = parent;
+        var start = parent.Definition!.RawSizes.instance_size;
+        Assert.That(embedded.Definition!.RawSizes.instance_size - 2 * _app.Binary.PointerSizeBytes,
+            Is.EqualTo(start - pointer.Offset));
+        var receiver = new LocalVariable("receiver", new Register(null, "receiver"), owner);
+        var value = new LocalVariable("value", new Register(null, "value"));
+        var memory = new MemoryOperand(receiver, addend: start);
+        var access = write ? new Instruction(0, OpCode.Move, memory, value) : new Instruction(0, OpCode.Move, value, memory);
+        var caller = new InjectedMethodAnalysisContext(_app.SystemTypes.SystemObjectType, "UseEmbeddedBase", _app.SystemTypes.SystemVoidType,
+            MethodAttributes.Static | MethodAttributes.Public, [])
+        {
+            ControlFlowGraph = new ISILControlFlowGraph([access, new(1, OpCode.Return)]),
+            Locals = [receiver, value], ParameterLocals = []
+        };
+        LocalVariables.ResolveTypesAndFields(caller);
+        var field = ((FieldReference)access.Operands[write ? 0 : 1]).Field;
+        Assert.That(field.Name, Is.EqualTo("data"));
+        Assert.That(field.DeclaringType, Is.SameAs(owner));
+        Assert.That(field.FieldType, Is.SameAs(_app.SystemTypes.SystemStringType));
+    }
+
     [TestCase("padding")]
     [TestCase("outOfExtent")]
     [TestCase("unknownStruct")]
