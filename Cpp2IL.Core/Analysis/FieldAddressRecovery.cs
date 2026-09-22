@@ -34,7 +34,13 @@ public static class FieldAddressRecovery
                 if (left is Immediate) (left, right) = (right, left);
                 // After SSA destruction, other locals can be reassigned between address creation
                 // and use. An unmodified implicit receiver remains the same object throughout.
-                if (left is not LocalVariable { IsThis: true, Type: { } owner } receiver
+                var receiver = left switch
+                {
+                    LocalVariable { IsThis: true } thisLocal => thisLocal,
+                    AddressOf { Target: LocalVariable storage } when method.StackAggregates.ContainsKey(storage.Register.Number) => storage,
+                    _ => null
+                };
+                if (receiver?.Type is not { } owner
                     || definitions.ContainsKey(receiver) || right is not Immediate { Value: >= 0 and <= int.MaxValue } offset
                     || owner is GenericInstanceTypeAnalysisContext || owner.GenericParameters.Count != 0)
                     continue;

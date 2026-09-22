@@ -741,7 +741,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 return new MemoryOperand(addend: offset, accessSize: size);
 
             if (IsReg31(baseReg))
-                return new StackOffset((int)offset);
+                return new StackOffset((int)offset, size);
 
             if (instruction.MemAddendReg != Arm64Register.INVALID)
                 return new MemoryOperand(Reg(baseReg), Reg(instruction.MemAddendReg), offset, 1 << instruction.MemExtendOrShiftAmount, size);

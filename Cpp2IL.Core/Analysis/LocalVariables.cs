@@ -31,7 +31,8 @@ public static class LocalVariables
         for (var i = 0; i < registers.Count; i++)
         {
             var register = registers[i];
-            locals.Add(register, new LocalVariable($"v{i}", register));
+            locals.Add(register, new LocalVariable($"v{i}", register,
+                method.StackAggregates.GetValueOrDefault(register.Number)));
         }
 
         // Replace registers with locals
@@ -67,6 +68,7 @@ public static class LocalVariables
         }
 
         method.Locals = locals.Select(kv => kv.Value).ToList();
+        StackAggregateRecovery.ResolveFields(method);
 
         // Return local names
         var retValIndex = 0;

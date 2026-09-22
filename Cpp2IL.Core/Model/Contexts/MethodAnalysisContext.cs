@@ -53,6 +53,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
     /// All ISIL local variables.
     /// </summary>
     public List<LocalVariable> Locals = [];
+    internal readonly Dictionary<int, TypeAnalysisContext> StackAggregates = [];
 
     /// <summary>
     /// Operands used as parameters.
@@ -499,6 +500,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
     {
         ConvertedIsil = null;
         NativeDisposals.Clear();
+        StackAggregates.Clear();
         ControlFlowGraph = null;
         DominatorInfo = null;
     }

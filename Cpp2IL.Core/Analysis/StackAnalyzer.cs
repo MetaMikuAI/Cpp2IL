@@ -46,6 +46,7 @@ public class StackAnalyzer
 
         analyzer.ResolveFrameAliases(graph);
         analyzer.CorrectOffsets(graph);
+        StackAggregateRecovery.Run(method);
         ReplaceStackWithRegisters(method);
 
         graph.RemoveNops();
@@ -102,7 +103,7 @@ public class StackAnalyzer
                         || memory.Addend is < int.MinValue or > int.MaxValue) continue;
                     var relativeOffset = (long)absoluteOffset + memory.Addend - state.Size;
                     if (relativeOffset is >= int.MinValue and <= int.MaxValue)
-                        instruction.SetOperand(i, new StackOffset((int)relativeOffset));
+                        instruction.SetOperand(i, new StackOffset((int)relativeOffset, memory.AccessSize));
                 }
                 Transfer(instruction, aliases);
             }
@@ -170,7 +171,7 @@ public class StackAnalyzer
                         // as doing so will make the dictionary lookup impossible.
                         state ??= _instructionState[instruction].Size;
 
-                        var actual = new StackOffset(state.Value + offset.Offset);
+                        var actual = new StackOffset(state.Value + offset.Offset, offset.AccessSize);
                         instruction.SetOperand(i, op is AddressOf ? new AddressOf(actual) : actual);
                     }
                 }

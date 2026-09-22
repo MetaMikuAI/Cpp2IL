@@ -65,6 +65,25 @@ public class FieldAddressRecoveryTests
         Assert.That(call.Operands[1], Is.TypeOf<LocalVariable>());
     }
 
+    [TestCase(true)]
+    [TestCase(false)]
+    public void OnlyProvenStableStackStorageCanSupplyAnInteriorFieldAddress(bool registeredStorage)
+    {
+        var (method, call, receiver, field) = Create(false, false, true);
+        receiver.IsThis = false;
+        if (registeredStorage) method.StackAggregates.Add(receiver.Register.Number, receiver.Type!);
+        var address = method.ControlFlowGraph!.Instructions.Single(i => i.OpCode == OpCode.Add);
+        address.SetOperand(1, new AddressOf(receiver));
+        FieldAddressRecovery.Run(method);
+        if (registeredStorage)
+        {
+            var recovered = (FieldReference)((AddressOf)call.Operands[1]).Target;
+            Assert.That(recovered.Local, Is.SameAs(receiver));
+            Assert.That(recovered.Field, Is.SameAs(field));
+        }
+        else Assert.That(call.Operands[1], Is.TypeOf<LocalVariable>());
+    }
+
     private static (MethodAnalysisContext, Instruction, LocalVariable, FieldAnalysisContext) Create(bool byRefArgument, bool reversed, bool valueOwner = false)
     {
         var app = Cpp2IlApi.CurrentAppContext!;

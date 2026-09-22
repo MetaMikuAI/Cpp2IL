@@ -26,13 +26,13 @@ public class SsaForm
     private readonly Dictionary<int, Register> _repr = new();
 
     public static void Build(MethodAnalysisContext method)
-        => Build(method.ControlFlowGraph!, method.DominatorInfo!);
+        => Build(method.ControlFlowGraph!, method.DominatorInfo!, method.StackAggregates.Keys.ToHashSet());
 
-    public static void Build(ISILControlFlowGraph graph, DominatorInfo dominatorInfo)
+    public static void Build(ISILControlFlowGraph graph, DominatorInfo dominatorInfo, HashSet<int>? storage = null)
     {
         DelayAddressTakesPastStores(graph);
         var ssa = new SsaForm();
-        ssa.FindClobberingAddressTakes(graph);
+        ssa.FindClobberingAddressTakes(graph, storage);
 
         graph.BuildUseDefLists(ssa._clobbering);
 
@@ -74,7 +74,7 @@ public class SsaForm
     // The address-takes whose slot is read again afterwards, and so have to be treated as definitions.
     private readonly HashSet<Instruction> _clobbering = [];
 
-    private void FindClobberingAddressTakes(ISILControlFlowGraph graph)
+    private void FindClobberingAddressTakes(ISILControlFlowGraph graph, HashSet<int>? storage)
     {
         foreach (var block in graph.Blocks)
         {
@@ -84,7 +84,8 @@ public class SsaForm
 
                 foreach (var operand in instruction.Operands)
                 {
-                    if (operand is AddressOf { Target: Register addressed } && IsReadAfter(block, i, addressed))
+                    if (operand is AddressOf { Target: Register addressed }
+                        && storage?.Contains(addressed.Number) != true && IsReadAfter(block, i, addressed))
                         _clobbering.Add(instruction);
                 }
             }
