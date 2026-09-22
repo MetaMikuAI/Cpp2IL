@@ -859,7 +859,15 @@ public static class IlGenerator
                     var parameterType = targetMethod.Parameters[i].ParameterType;
 
                     if (i < availableArgs)
-                        LoadOperand(instruction.Operands[callParamIndex + i], method, locals, writeLine, parameterType);
+                    {
+                        var argument = instruction.Operands[callParamIndex + i];
+                        // Native ABIs pass aggregate copies by address. A proven by-value
+                        // managed parameter consumes the value; ref/out and this retain addresses.
+                        if (argument is AddressOf { Target: LocalVariable value } && parameterType.IsValueType
+                            && value.Type == parameterType)
+                            argument = value;
+                        LoadOperand(argument, method, locals, writeLine, parameterType);
+                    }
                     else
                         PushDefaultOf(parameterType, instructions);
                 }

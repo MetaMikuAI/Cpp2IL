@@ -79,13 +79,80 @@ public class GenericInstanceFieldLayoutTests
     }
 
     [Test]
+    public void DoesNotExtendReferenceLayoutRulesToGenericValueTypeReceivers()
+    {
+        var owner = Create(_app.AllTypes.Single(t => t.FullName == "UnityEngine.Vector2"), array: false);
+        owner.GenericType.BaseType = _app.AllTypes.Single(t => t.FullName == "System.ValueType");
+        Assert.That(owner.IsValueType, Is.True);
+        Assert.That(GenericInstanceFieldLayout.FindFieldAtOffset(owner, 0), Is.Null);
+        Assert.That(GenericInstanceFieldLayout.FindFieldAtOffset(owner, 2 * _app.Binary.PointerSizeBytes), Is.Null);
+    }
+
+    [Test]
     public void DoesNotGuessUnknownInlineStructLayout()
     {
-        var argument = _app.AllTypes.Single(t => t.FullName == "System.Decimal");
+        var parent = _app.AllTypes.Single(t => t.FullName == "System.ValueType");
+        var argument = new InjectedTypeAnalysisContext(parent.DeclaringAssembly, "Tests", "UnknownStruct", parent, TypeAttributes.Public);
+        argument.Fields.Add(new InjectedFieldAnalysisContext("value", _app.SystemTypes.SystemInt32Type,
+            FieldAttributes.Public, argument, 0));
         var owner = Create(argument, array: false);
         var start = 2 * _app.Binary.PointerSizeBytes;
         Assert.That(GenericInstanceFieldLayout.FindFieldAtOffset(owner, start), Is.Null);
         Assert.That(GenericInstanceFieldLayout.FindFieldAtOffset(owner, start + _app.Binary.PointerSizeBytes), Is.Null);
+    }
+
+    [TestCase("UnityEngine.Vector2", 8, 20)]
+    [TestCase("UnityEngine.Bounds", 24, 20)]
+    [TestCase("System.Decimal", 16, 20)]
+    [TestCase("System.DateTime", 8, 24)]
+    public void ResolvesInlineStructWithMetadataProvenAlignment(string typeName, int size, int start)
+    {
+        Assert.That(_app.Binary.PointerSizeBytes, Is.EqualTo(8));
+        var argument = _app.AllTypes.Single(t => t.FullName == typeName);
+        var owner = Create(argument, array: false);
+        // A preceding byte distinguishes alignment 4 from guessing min(size, pointerSize).
+        owner.GenericType.Fields.Insert(0, new InjectedFieldAnalysisContext("flag", _app.SystemTypes.SystemBooleanType,
+            FieldAttributes.Public, owner.GenericType, 0));
+        Assert.That(GenericInstanceFieldLayout.FindFieldAtOffset(owner, start)?.Name, Is.EqualTo("data"));
+        Assert.That(GenericInstanceFieldLayout.FindFieldAtOffset(owner, start + size)?.Name, Is.EqualTo("count"));
+        Assert.That(GenericInstanceFieldLayout.FindFieldAtOffset(owner, start + 4), Is.Null);
+        var receiver = new LocalVariable("receiver", new Register(null, "receiver"), owner);
+        var value = new LocalVariable("value", new Register(null, "value"));
+        var load = new Instruction(0, OpCode.Move, value, new MemoryOperand(receiver, addend: start));
+        var method = new InjectedMethodAnalysisContext(_app.SystemTypes.SystemObjectType, "ReadInline", _app.SystemTypes.SystemVoidType,
+            MethodAttributes.Static | MethodAttributes.Public, [])
+        {
+            ControlFlowGraph = new ISILControlFlowGraph([load, new(1, OpCode.Return)]),
+            Locals = [receiver, value], ParameterLocals = []
+        };
+        LocalVariables.ResolveTypesAndFields(method);
+        var resolved = ((FieldReference)load.Operands[1]).Field;
+        Assert.That(resolved.FieldType, Is.SameAs(argument));
+        Assert.That(resolved.DeclaringType, Is.SameAs(owner));
+    }
+
+    [TestCase("offset")]
+    [TestCase("packing")]
+    [TestCase("explicit")]
+    [TestCase("customSize")]
+    [TestCase("missingFields")]
+    [TestCase("recursive")]
+    [TestCase("32bit")]
+    public void RejectsUnprovenInlineStructAlignment(string problem)
+    {
+        var argument = _app.AllTypes.Single(t => t.FullName == "UnityEngine.Vector2");
+        var owner = Create(argument, array: false);
+        switch (problem)
+        {
+            case "offset": argument.Fields.First(f => !f.IsStatic).Offset = 4; break;
+            case "packing": argument.Definition!.Bitfield = (argument.Definition.Bitfield & ~(0xFu << 6)) | (1u << 6); break;
+            case "explicit": argument.Attributes = (argument.Attributes & ~TypeAttributes.LayoutMask) | TypeAttributes.ExplicitLayout; break;
+            case "customSize": argument.Definition!.Bitfield &= ~(1u << 11); break;
+            case "missingFields": argument.Fields.Remove(argument.Fields.Last(f => !f.IsStatic)); break;
+            case "recursive": argument.Fields.First(f => !f.IsStatic).FieldType = argument; break;
+            case "32bit": _app.Binary.is32Bit = true; break;
+        }
+        Assert.That(GenericInstanceFieldLayout.FindFieldAtOffset(owner, 2 * _app.Binary.PointerSizeBytes), Is.Null);
     }
 
     [TestCase(false, false)]
