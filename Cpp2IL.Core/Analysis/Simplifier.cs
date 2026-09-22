@@ -29,6 +29,7 @@ public static class Simplifier
         private readonly Dictionary<Block, Dictionary<Instruction, OperandList>> _sourceCache = [];
         private readonly MethodAnalysisContext _method = method;
         private readonly ISILControlFlowGraph _graph = method.ControlFlowGraph!;
+        private readonly HashSet<int> _addressed = SsaSimplifier.AddressedRegisters(method.ControlFlowGraph!);
 
         public void Process()
         {
@@ -95,6 +96,9 @@ public static class Simplifier
                     // If it's move and it moves something to local, replace and remove it
                     if (instruction.OpCode == OpCode.Move && instruction.Operands[0] is LocalVariable local)
                     {
+                        if (_addressed.Contains(local.Register.Number)
+                            || instruction.Operands[1] is LocalVariable source && _addressed.Contains(source.Register.Number))
+                            continue;
                         // A load captures mutable storage, not a constant. Without alias analysis,
                         // only substitute its single adjacent use; never delay or duplicate the read.
                         // Earlier rewrites leave Nops behind; they are not intervening operations.
@@ -169,6 +173,8 @@ public static class Simplifier
                     // If it's move and it moves local to local, replace and remove it
                     if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable local, LocalVariable source] })
                     {
+                        if (_addressed.Contains(local.Register.Number) || _addressed.Contains(source.Register.Number))
+                            continue;
                         // A local with several definitions is not in SSA form, so its value at a join
                         // depends on the path taken; don't carry this definition across that join.
                         var stopAtJoins = definitionCounts.TryGetValue(local, out var defs) && defs > 1;

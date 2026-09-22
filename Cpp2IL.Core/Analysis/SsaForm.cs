@@ -350,7 +350,7 @@ public class SsaForm
             // Register numbers newly defined in this block, so we can pop their versions on the way out.
             var definedHere = new List<int>();
 
-            foreach (var instruction in block.Instructions)
+            foreach (var instruction in block.Instructions.ToArray())
             {
                 // A phi's operands belong to the incoming edges, so they are filled by predecessors;
                 // only its destination is renamed here.
@@ -367,12 +367,20 @@ public class SsaForm
 
                 for (var i = 0; i < instruction.Operands.Count; i++)
                 {
-                    // Taking a slot's address lets the callee assign it, so the slot stops holding anything that reached this point, UNLESS
-                    // nothing reads it afterwards, in which case any write is unobservable and the callee is only reading the value it has now
+                    // A callee can read before writing through the address. A new
+                    // mutable version must therefore start with the reaching value.
                     if (instruction.Operands[i] is AddressOf { Target: Register addressed })
-                        instruction.SetOperand(i, new AddressOf(_clobbering.Contains(instruction)
-                            ? NewName(addressed, definedHere)
-                            : CurrentVersion(addressed.Number)));
+                    {
+                        var previous = CurrentVersion(addressed.Number);
+                        var current = previous;
+                        if (_clobbering.Contains(instruction))
+                        {
+                            current = NewName(addressed, definedHere);
+                            block.Instructions.Insert(block.Instructions.IndexOf(instruction),
+                                new Instruction(-1, OpCode.Move, current, previous));
+                        }
+                        instruction.SetOperand(i, new AddressOf(current));
+                    }
                 }
             }
 

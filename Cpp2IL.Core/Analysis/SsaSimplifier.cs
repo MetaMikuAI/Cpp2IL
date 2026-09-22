@@ -14,6 +14,7 @@ public static class SsaSimplifier
 
     public static void Run(ISILControlFlowGraph cfg, List<LocalVariable> parameterLocals)
     {
+        var addressed = AddressedRegisters(cfg);
         // dest -> value for every forwardable copy/constant. SSA's single-assignment property means a
         // local is defined at most once, so there is never a conflicting entry for the same key.
         var forwarded = new Dictionary<LocalVariable, IOperand>();
@@ -23,6 +24,8 @@ public static class SsaSimplifier
                 if (instruction.OpCode == OpCode.Move
                     && instruction.Operands[0] is LocalVariable dest
                     && !parameterLocals.Contains(dest)
+                    && !addressed.Contains(dest.Register.Number)
+                    && !(instruction.Operands[1] is LocalVariable source && addressed.Contains(source.Register.Number))
                     && IsForwardable(instruction.Operands[1]))
                     forwarded[dest] = instruction.Operands[1];
 
@@ -53,6 +56,15 @@ public static class SsaSimplifier
                     instruction.OpCode = OpCode.Nop;
                     instruction.SetOperands();
                 }
+    }
+
+    internal static HashSet<int> AddressedRegisters(ISILControlFlowGraph cfg)
+    {
+        var result = new HashSet<int>();
+        foreach (var instruction in cfg.Instructions)
+            foreach (var operand in instruction.Operands)
+                if (operand is AddressOf { Target: LocalVariable local }) result.Add(local.Register.Number);
+        return result;
     }
 
     // Follows local-to-local copies to the end of the chain. The visited set guards against a cycle a

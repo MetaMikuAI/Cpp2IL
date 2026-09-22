@@ -12,6 +12,25 @@ public class SimplifierTests
 {
     [TestCase(false)]
     [TestCase(true)]
+    public void KeepsMutableSlotAndSnapshotAcrossByReferenceCall(bool ssa)
+    {
+        var slot = new LocalVariable("slot", new Register(null, "slot"));
+        var snapshot = new LocalVariable("snapshot", new Register(null, "snapshot"));
+        var initialize = new Instruction(0, OpCode.Move, slot, Imm(7));
+        var capture = new Instruction(1, OpCode.Move, snapshot, slot);
+        var mutate = new Instruction(2, OpCode.CallVoid, Str("readAndWrite"), new AddressOf(slot));
+        var consume = new Instruction(3, OpCode.CallVoid, Str("consume"), snapshot, slot);
+        var graph = new ISILControlFlowGraph([initialize, capture, mutate, consume, new(4, OpCode.Return)]);
+        if (ssa) SsaSimplifier.Run(graph, []);
+        else Simplifier.Simplify(CreateMethod(graph, slot, snapshot));
+        Assert.That(initialize.OpCode, Is.EqualTo(OpCode.Move));
+        Assert.That(capture.OpCode, Is.EqualTo(OpCode.Move));
+        Assert.That(consume.Operands[1], Is.SameAs(snapshot));
+        Assert.That(consume.Operands[2], Is.SameAs(slot));
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
     public void InlinesSingleReadAcrossNops(bool fieldRead)
     {
         var receiver = new LocalVariable("receiver", new Register(null, "receiver"));
