@@ -66,7 +66,7 @@ public static class ArrayRecovery
                     continue;
                 }
                 var stride = ElementSize(((SzArrayTypeAnalysisContext)address.Array.Type!).ElementType, pointerSize);
-                if (stride == 0)
+                if (stride == 0 || memory.AccessSize != 0 && memory.AccessSize != stride)
                     continue;
                 var offset = Sum(address.Offset, new Affine(null, 0, memory.Addend));
                 if (memory.Index != null)
@@ -172,7 +172,8 @@ public static class ArrayRecovery
     }
 
     private static bool IsNativeIndex(LocalVariable local) => local.Type == null
-        || local.Type.FullName is "System.Int32" or "System.UInt32" or "System.IntPtr" or "System.UIntPtr";
+        || local.Type.FullName is "System.SByte" or "System.Byte" or "System.Int16" or "System.UInt16" or "System.Char"
+            or "System.Int32" or "System.UInt32" or "System.IntPtr" or "System.UIntPtr";
 
     // Array indices and proven byte counters are native integers, not object references.
     // Follow only copies, phis and constant increments; never infer a pointer's pointee type.
@@ -465,6 +466,11 @@ public static class ArrayRecovery
 
                 return definition switch
                 {
+                    // SXTW preserves an Int32 array index. Keep the source as a root:
+                    // expanding its arithmetic could move Int32 overflow past the extension.
+                    { OpCode: OpCode.SignExtend, Operands: [_, LocalVariable { Type.FullName: "System.Int32" } source, Immediate { Value: 32 }] }
+                        => new Affine(source, 1, 0),
+                    { OpCode: OpCode.Move, Operands: [_, ArrayAccess or ArrayLength] } => new Affine(local, 1, 0),
                     { OpCode: OpCode.Move, Operands: [_, MemoryOperand lea] } => allowLea ? EvaluateLea(lea, definitions, depth + 1) : new Affine(local, 1, 0),
                     { OpCode: OpCode.Move, Operands: [_, var source] } => Evaluate(source, definitions, depth + 1, allowLea),
                     { OpCode: OpCode.Add, Operands: [_, var left, var right] } => Sum(Evaluate(left, definitions, depth + 1, allowLea), Evaluate(right, definitions, depth + 1, allowLea)),

@@ -125,6 +125,51 @@ public class ArrayAddressRecoveryTests
         Assert.That(index.Type, Is.SameAs(type));
     }
 
+    [TestCase(32, "Int32", 1, 1, false, true)]
+    [TestCase(32, "Int32", 8, 8, true, true)]
+    [TestCase(16, "Int32", 1, 1, false, false)]
+    [TestCase(8, "Int32", 1, 1, false, false)]
+    [TestCase(32, "UInt32", 1, 1, false, false)]
+    [TestCase(32, "Int64", 1, 1, false, false)]
+    [TestCase(32, "unknown", 1, 1, false, false)]
+    [TestCase(32, "Int32", 1, 8, false, false)]
+    [TestCase(32, "Int32", 8, 4, true, false)]
+    public void RecoversOnlyValuePreservingSignedIndexExtensions(int bits, string kind, int stride, int accessSize, bool write, bool expected)
+    {
+        _app.Binary.is32Bit = false;
+        var type = kind switch
+        {
+            "Int32" => _app.SystemTypes.SystemInt32Type,
+            "UInt32" => _app.SystemTypes.SystemUInt32Type,
+            "Int64" => _app.SystemTypes.SystemInt64Type,
+            _ => null
+        };
+        var element = stride == 1 ? _app.SystemTypes.SystemByteType : _app.SystemTypes.SystemStringType;
+        var array = Local("array", new SzArrayTypeAnalysisContext(element));
+        var original = Local("original", type);
+        var index = Local("index", type);
+        var extended = Local("extended", _app.SystemTypes.SystemInt64Type);
+        var scaled = Local("scaled", _app.SystemTypes.SystemInt64Type);
+        var address = Local("address");
+        var value = Local("value", element);
+        var memory = new MemoryOperand(address, addend: 32, accessSize: accessSize);
+        var access = write ? new Instruction(4, OpCode.Move, memory, value) : new Instruction(4, OpCode.Move, value, memory);
+        var increment = new Instruction(0, OpCode.Add, index, original, new Immediate(1));
+        var method = Method(increment,
+            new(1, OpCode.SignExtend, extended, index, new Immediate(bits)),
+            new(2, OpCode.Multiply, scaled, extended, new Immediate(stride)),
+            new(3, OpCode.Add, address, array, scaled), access, new(5, OpCode.Return));
+        ArrayRecovery.RecoverSplitAccesses(method);
+        var operand = access.Operands[write ? 0 : 1];
+        Assert.That(operand, expected ? Is.TypeOf<ArrayAccess>() : Is.TypeOf<MemoryOperand>());
+        if (expected)
+        {
+            Assert.That(((ArrayAccess)operand).Index, Is.SameAs(index), "retain the Int32 overflow boundary");
+            Assert.That(((ArrayAccess)operand).Array, Is.SameAs(array));
+            Assert.That(increment.OpCode, Is.EqualTo(OpCode.Add));
+        }
+    }
+
     [Test]
     public void DoesNotTreatAnOffsetLoadAsAnAddressComputation()
     {
@@ -139,6 +184,38 @@ public class ArrayAddressRecoveryTests
             new(1, OpCode.Add, address, array, offset), load, new(3, OpCode.Return));
         ArrayRecovery.RecoverSplitAccesses(method);
         Assert.That(load.Operands[1], Is.TypeOf<MemoryOperand>());
+    }
+
+    [TestCase("Byte")]
+    [TestCase("SByte")]
+    [TestCase("Int16")]
+    [TestCase("UInt16")]
+    [TestCase("Char")]
+    public void RecoveredSmallIntegerElementsCanIndexAnotherArray(string kind)
+    {
+        _app.Binary.is32Bit = false;
+        var element = kind switch
+        {
+            "Byte" => _app.SystemTypes.SystemByteType,
+            "SByte" => _app.SystemTypes.SystemSByteType,
+            "Int16" => _app.SystemTypes.SystemInt16Type,
+            "UInt16" => _app.SystemTypes.SystemUInt16Type,
+            _ => _app.SystemTypes.SystemCharType
+        };
+        var stride = kind is "Byte" or "SByte" ? 1 : 2;
+        var data = Local("data", new SzArrayTypeAnalysisContext(element));
+        var table = Local("table", new SzArrayTypeAnalysisContext(_app.SystemTypes.SystemStringType));
+        var index = Local("index");
+        var scaled = Local("scaled");
+        var value = Local("value");
+        var load = new Instruction(0, OpCode.Move, index, new MemoryOperand(data, addend: 32, accessSize: stride));
+        var lookup = new Instruction(2, OpCode.Move, value, new MemoryOperand(table, scaled, 32, accessSize: 8));
+        var method = Method(load, new(1, OpCode.ShiftLeft, scaled, index, new Immediate(3)), lookup, new(3, OpCode.Return));
+        ArrayRecovery.RecoverSplitAccesses(method);
+        Assert.That(load.Operands[1], Is.TypeOf<ArrayAccess>());
+        Assert.That(((ArrayAccess)lookup.Operands[1]).Index, Is.SameAs(index));
+        Assert.That(index.Type, Is.SameAs(element));
+        Assert.That(value.Type, Is.SameAs(_app.SystemTypes.SystemStringType));
     }
 
     [TestCase(32, true)]
