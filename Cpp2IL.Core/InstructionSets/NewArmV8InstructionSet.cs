@@ -305,6 +305,9 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
     {
         var insns = NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(context.AppContext.Binary, context.UnderlyingPointer);
 
+        var switches = Arm64SwitchRecognizer.Find(context, insns);
+        var switchCases = new List<Instruction>();
+
         if (adrpOffsets == null) // initializers for ThreadStatic fields only run on the first thread
             adrpOffsets = new();
         else
@@ -331,8 +334,33 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 twoSLaneRegisters.Add(NormalizeRegister(instruction.Op2Reg));
         }
 
-        foreach (var instruction in insns)
-            ConvertInstructionStatement(instruction, instructions, addresses, context, twoSLaneRegisters);
+        for (var nativeIndex = 0; nativeIndex < insns.Count; nativeIndex++)
+        {
+            if (switches.TryGetValue(nativeIndex, out var dispatch))
+            {
+                var operands = new List<IOperand> { new Register(null, $"X{dispatch.Selector}"), Imm(0), Imm(4), Imm(dispatch.DefaultTarget) };
+                for (var caseIndex = 0; caseIndex < dispatch.Targets.Length; caseIndex++)
+                {
+                    // Preserve the exact scratch-register results rather than
+                    // assuming they are dead on every case path.
+                    var entry = new Instruction(-1, OpCode.Move, new Register(null, $"X{dispatch.OffsetRegister}"), Imm(dispatch.Offsets[caseIndex]));
+                    switchCases.Add(entry);
+                    switchCases.Add(new Instruction(-1, OpCode.Move, new Register(null, $"X{dispatch.TargetRegister}"), Imm(dispatch.Targets[caseIndex])));
+                    switchCases.Add(new Instruction(-1, OpCode.Jump, Imm(dispatch.Targets[caseIndex])));
+                    operands.Add(entry);
+                }
+                addresses.Add(insns[nativeIndex].Address);
+                instructions.Add(new Instruction(instructions.Count, OpCode.Switch, operands));
+                foreach (var name in new[] { $"X{dispatch.OffsetRegister}", $"X{dispatch.TargetRegister}" })
+                {
+                    integerConstants.Remove(name);
+                    adrpOffsets.Remove(name);
+                }
+                nativeIndex += 2;
+                continue;
+            }
+            ConvertInstructionStatement(insns[nativeIndex], instructions, addresses, context, twoSLaneRegisters);
+        }
 
         for (var i = 0; i < addresses.Count; i++)
             instructions[i].NativeAddress = addresses[i];
@@ -348,10 +376,27 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 instructions.Add(new Instruction(index, OpCode.Return, CallingConventions.ReturnRegister(context)));
         }
 
+        foreach (var entry in switchCases)
+        {
+            entry.Index = instructions.Count;
+            instructions.Add(entry);
+        }
+
         // fix branches
         for (var i = 0; i < instructions.Count; i++)
         {
             var instruction = instructions[i];
+
+            if (instruction.OpCode == OpCode.Switch)
+            {
+                // Case entries already refer to synthetic instructions. Only
+                // the default is still a native address.
+                var target = ((Immediate)instruction.Operands[3]).UnsignedValue;
+                var switchTargetIndex = addresses.FindIndex(address => address == target);
+                if (switchTargetIndex < 0) throw new InvalidOperationException($"Validated ARM64 switch target missing: {target:X}");
+                instruction.SetOperand(3, instructions[switchTargetIndex]);
+                continue;
+            }
 
             if (instruction.OpCode != OpCode.Jump && instruction.OpCode != OpCode.ConditionalJump)
                 continue;
