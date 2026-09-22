@@ -30,9 +30,13 @@ public abstract class BaseCallingConventionResolver
 
     public IOperand[] ResolveForUnmanaged(ApplicationAnalysisContext app, ulong target)
     {
-        // We don't know the callee's signature, so preserve every argument register.
-
         var (integerRegisters, floatRegisters) = RawRegisters(app);
+        // A proven ELF import has a native signature and no hidden MethodInfo or FP args.
+        if (this is Arm64CallingConventionResolver
+            && Arm64ImportResolver.IntegerArgumentCount(Arm64ImportResolver.Resolve(app.Binary, target)) is { } count)
+            return integerRegisters.Take(count).Select(name => (IOperand)new Register(null, name)).ToArray();
+
+        // Unknown signatures still preserve every argument register.
         return integerRegisters.Concat(floatRegisters).Select(name => (IOperand)new Register(null, name)).ToArray();
     }
 

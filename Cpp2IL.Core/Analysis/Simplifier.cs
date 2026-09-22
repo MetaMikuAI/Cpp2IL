@@ -97,10 +97,14 @@ public static class Simplifier
                     {
                         // A load captures mutable storage, not a constant. Without alias analysis,
                         // only substitute its single adjacent use; never delay or duplicate the read.
+                        // Earlier rewrites leave Nops behind; they are not intervening operations.
+                        var next = i + 1;
+                        while (next < block.Instructions.Count && block.Instructions[next].OpCode == OpCode.Nop)
+                            next++;
                         if (instruction.Operands[1] is MemoryOperand or FieldReference or ArrayAccess or ArrayLength
-                            && (i + 1 >= block.Instructions.Count
-                                || block.Instructions[i + 1].Sources.Count(source => ReferenceEquals(source, local)) != 1
-                                || IsLocalUsedAfterInstruction(block, i + 2, local, out _)))
+                            && (next >= block.Instructions.Count
+                                || block.Instructions[next].Sources.Count(source => ReferenceEquals(source, local)) != 1
+                                || IsLocalUsedAfterInstruction(block, next + 1, local, out _)))
                             continue;
 
                         if (IsLocalUsedAfterInstruction(block, i + 1, local, out var usedByMemory))

@@ -10,6 +10,22 @@ namespace Cpp2IL.Core.Tests.Analysis;
 
 public class SimplifierTests
 {
+    [TestCase(false)]
+    [TestCase(true)]
+    public void InlinesSingleReadAcrossNops(bool fieldRead)
+    {
+        var receiver = new LocalVariable("receiver", new Register(null, "receiver"));
+        var snapshot = new LocalVariable("snapshot", new Register(null, "snapshot"));
+        var field = (FieldAnalysisContext)RuntimeHelpers.GetUninitializedObject(typeof(InjectedFieldAnalysisContext));
+        IOperand read = fieldRead ? new FieldReference(field, receiver, 0) : new MemoryOperand(receiver, accessSize: 8);
+        var capture = new Instruction(0, OpCode.Move, snapshot, read);
+        var use = new Instruction(3, OpCode.Return, snapshot);
+        var graph = new ISILControlFlowGraph([capture, new(1, OpCode.Nop), new(2, OpCode.Nop), use]);
+        Simplifier.Simplify(CreateMethod(graph, receiver, snapshot));
+        Assert.That(capture.OpCode, Is.EqualTo(OpCode.Nop));
+        Assert.That(use.Operands[0], Is.SameAs(read));
+    }
+
     [TestCase(false, false)] [TestCase(false, true)]
     [TestCase(true, false)] [TestCase(true, true)]
     public void PreservesReadSnapshotAcrossStoreOrCall(bool fieldRead, bool call)

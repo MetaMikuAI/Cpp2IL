@@ -35,6 +35,40 @@ public class ArrayAddressRecoveryTests
         ControlFlowGraph = new ISILControlFlowGraph([.. instructions]), Locals = [.. _locals], ParameterLocals = []
     };
 
+    [TestCase(false, false, false, true)]
+    [TestCase(false, true, false, true)]
+    [TestCase(true, false, true, true)]
+    [TestCase(true, true, true, true)]
+    [TestCase(false, false, false, false)]
+    public void PreservesFieldReadAsArrayIndex(bool is32Bit, bool write, bool isStatic, bool integer)
+    {
+        _app.Binary.is32Bit = is32Bit;
+        var owner = _app.SystemTypes.SystemObjectType;
+        var type = integer ? _app.SystemTypes.SystemByteType : owner;
+        var field = new InjectedFieldAnalysisContext("Index", type,
+            FieldAttributes.Public | (isStatic ? FieldAttributes.Static : 0), owner, 0);
+        var receiver = Local("receiver", owner);
+        var index = Local("index", type);
+        var array = Local("array", new SzArrayTypeAnalysisContext(_app.SystemTypes.SystemByteType));
+        var address = Local("address");
+        var value = Local("value");
+        var memory = new MemoryOperand(address, addend: 4 * _app.Binary.PointerSizeBytes, accessSize: 1);
+        var access = write ? new Instruction(3, OpCode.Move, memory, value)
+            : new Instruction(3, OpCode.Move, value, memory);
+        var read = new Instruction(0, OpCode.Move, index, new FieldReference(field, receiver, 0));
+        var mutation = new Instruction(1, OpCode.Move, new FieldReference(field, receiver, 0), new Immediate(0));
+        var method = Method(read, mutation, new(2, OpCode.Add, address, array, index), access, new(4, OpCode.Return));
+        ArrayRecovery.RecoverSplitAccesses(method);
+        var operand = access.Operands[write ? 0 : 1];
+        Assert.That(operand, integer ? Is.TypeOf<ArrayAccess>() : Is.TypeOf<MemoryOperand>());
+        if (integer)
+        {
+            Assert.That(((ArrayAccess)operand).Index, Is.SameAs(index), "retain the value read before the field mutation");
+            Assert.That(((ArrayAccess)operand).Array, Is.SameAs(array));
+            Assert.That(read.OpCode, Is.EqualTo(OpCode.Move));
+        }
+    }
+
     private (MethodAnalysisContext Method, Instruction Load, Instruction Store, LocalVariable Index) Loop(
         bool is32Bit = false, string elementKind = "reference", string mismatch = "none")
     {

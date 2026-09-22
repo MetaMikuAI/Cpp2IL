@@ -719,7 +719,8 @@ public static class IlGenerator
                     // the constructor declares (i.e. drop methodInfo)
                     var constructorArgs = constructorCall.Operands.Skip(ConstructorReceiverIndex(constructorCall) + 1).Take(constructor.Parameters.Count).ToList();
                     for (var i = 0; i < constructorArgs.Count; i++)
-                        LoadOperand(constructorArgs[i], method, locals, writeLine, constructor.Parameters[i].ParameterType);
+                        LoadOperand(ManagedValueArgument(constructorArgs[i], constructor.Parameters[i].ParameterType),
+                            method, locals, writeLine, constructor.Parameters[i].ParameterType);
 
                     instructions.Add(CilOpCodes.Newobj, constructor.ToMethodDescriptor());
                     StoreToOperand(instruction.Operands[0], method, locals, writeLine);
@@ -859,7 +860,8 @@ public static class IlGenerator
                     var parameterType = targetMethod.Parameters[i].ParameterType;
 
                     if (i < availableArgs)
-                        LoadOperand(instruction.Operands[callParamIndex + i], method, locals, writeLine, parameterType);
+                        LoadOperand(ManagedValueArgument(instruction.Operands[callParamIndex + i], parameterType),
+                            method, locals, writeLine, parameterType);
                     else
                         PushDefaultOf(parameterType, instructions);
                 }
@@ -1390,6 +1392,15 @@ public static class IlGenerator
 
     private static bool IsZeroConstant(IOperand operand) => operand is Immediate { Value: 0 };
     
+    // Native ABIs can pass a by-value aggregate through an address. Managed calls
+    // need its value; ref/out and the instance receiver still need their address.
+    private static IOperand ManagedValueArgument(IOperand operand, TypeAnalysisContext expected) =>
+        operand is AddressOf address && expected.IsValueType && !expected.IsEnumType
+        && expected.Type is Il2CppTypeEnum.IL2CPP_TYPE_VALUETYPE or Il2CppTypeEnum.IL2CPP_TYPE_GENERICINST
+        && DestinationType(address.Target) is { } actual
+        && actual.FullName == expected.FullName && actual.DeclaringAssembly == expected.DeclaringAssembly
+            ? address.Target : operand;
+
     private static TypeAnalysisContext? DestinationType(IOperand destination) =>
         destination switch
         {
