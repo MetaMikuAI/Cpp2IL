@@ -465,6 +465,13 @@ public static class LocalVariables
                 case OpCode.Phi:
                     changed |= PropagatePhi(instruction);
                     break;
+                case OpCode.Box:
+                    // Boxing metadata proves the addressed payload type, not the
+                    // reference type of the boxed result or its native address.
+                    if (instruction.Operands is [_, TypeAnalysisContext { IsValueType: true } boxedType,
+                        AddressOf { Target: LocalVariable payload }])
+                        changed |= SetTypeIfUnknown(payload, boxedType);
+                    break;
                 case OpCode.Add or OpCode.Subtract or OpCode.Multiply:
                     changed |= PropagateArithmetic(instruction, method) || PropagateKnownIntegerArithmetic(instruction, method);
                     break;
