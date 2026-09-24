@@ -1553,6 +1553,9 @@ public static class IlGenerator
                     instructions.Add(CilOpCodes.Stloc, locals[local2]);
                     break;
                 }
+                // The store cannot be expressed; report it like an unmanaged load instead of dropping it silently.
+                instructions.Add(CilOpCodes.Ldstr, Diagnostic("Unmanaged memory store: " + operand));
+                instructions.Add(CilOpCodes.Call, writeLine);
                 instructions.Add(CilOpCodes.Pop);
                 break;
 

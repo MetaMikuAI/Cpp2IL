@@ -460,6 +460,17 @@ public class IlGeneratorTests
         return method.CreateDelegate<Func<bool>>()();
     }
 
+    [Test]
+    public void UnresolvedMemoryStore_IsReportedRatherThanDropped()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var value = new LocalVariable("value", new Register(null, "value"), app.SystemTypes.SystemInt32Type);
+        var pointer = new LocalVariable("pointer", new Register(null, "pointer"), app.SystemTypes.SystemInt64Type);
+        var store = new Instruction(0, OpCode.Move, new MemoryOperand(pointer, addend: 8, accessSize: 4), value);
+        var il = GenerateSingle(store, value).CilMethodBody!.Instructions;
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldstr && i.Operand is string s && s.StartsWith("Unmanaged memory store: ")), Is.True);
+    }
+
     private static MethodDefinition GenerateSingle(Instruction instruction, LocalVariable result)
     {
         var app = Cpp2IlApi.CurrentAppContext!;
