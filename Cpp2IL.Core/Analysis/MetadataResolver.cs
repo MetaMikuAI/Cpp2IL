@@ -678,6 +678,8 @@ public static class MetadataResolver
 
             if (keyFunctionAddresses.IsKeyFunctionAddress(target))
             {
+                // A codegen thunk that only branches to a key function is handled as that function.
+                target = keyFunctionAddresses.ResolveKeyFunctionAddress(target);
                 HandleKeyFunction(method.AppContext, callInstruction, target, keyFunctionAddresses);
 
                 if (target == keyFunctionAddresses.il2cpp_codegen_initialize_runtime_metadata_inline

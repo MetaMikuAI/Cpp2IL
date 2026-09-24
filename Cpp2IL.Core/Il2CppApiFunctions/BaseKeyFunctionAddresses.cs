@@ -64,10 +64,34 @@ public abstract class BaseKeyFunctionAddresses
     private readonly Dictionary<string, ulong> resolvedAddressMap = [];
     private readonly HashSet<ulong> resolvedAddressSet = [];
 
-    public bool IsKeyFunctionAddress(ulong address)
+    // Bounds how far ResolveKeyFunctionAddress follows chained branch thunks.
+    private const int MaxThunkHops = 4;
+
+    public bool IsKeyFunctionAddress(ulong address) => ResolveKeyFunctionAddress(address) != 0;
+
+    /// <summary>
+    /// Returns the key function that a call to <paramref name="address"/> runs: the address itself if it is one,
+    /// else the key function reached through functions that consist of nothing but an unconditional branch
+    /// (codegen emits tables of these and calls them in place of the helpers). Returns 0 if neither applies.
+    /// </summary>
+    public ulong ResolveKeyFunctionAddress(ulong address)
     {
-        return address != 0 && resolvedAddressSet.Contains(address);
+        for (var hops = 0; address != 0 && hops <= MaxThunkHops; hops++)
+        {
+            if (resolvedAddressSet.Contains(address))
+                return address;
+
+            address = GetBranchThunkTarget(address);
+        }
+
+        return 0;
     }
+
+    /// <summary>
+    /// If the function at <paramref name="address"/> is a single unconditional branch, returns its target, else 0.
+    /// Calling such a function is calling its target: the branch leaves every argument and the return address as they are.
+    /// </summary>
+    protected virtual ulong GetBranchThunkTarget(ulong address) => 0;
 
     private void FindExport(string name, out ulong ptr)
     {
@@ -340,7 +364,7 @@ public abstract class BaseKeyFunctionAddresses
         _appContext = context;
     }
 
-    private void InitializeResolvedAddresses()
+    protected void InitializeResolvedAddresses()
     {
         resolvedAddressMap.Clear();
         resolvedAddressSet.Clear();
