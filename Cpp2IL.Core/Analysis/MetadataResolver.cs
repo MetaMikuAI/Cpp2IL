@@ -442,7 +442,8 @@ public static class MetadataResolver
                     continue;
                 }
 
-                var resolved = new FieldReference(field, fieldLocal, (int)fieldOffset) { ContainingFields = containingFields };
+                var resolved = new FieldReference(field, fieldLocal, (int)fieldOffset)
+                    { ContainingFields = containingFields, AccessSize = memory.AccessSize };
 
                 // A scalar store at the start of an embedded value type is a store to its first
                 // member, not an assignment of the whole aggregate (e.g. Vector2.x). The native
