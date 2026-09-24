@@ -436,7 +436,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         retryInterfaceCleanup?.Invoke();
 
         // RGCTX loads can reveal the declaring interface only after type resolution.
-        var retryResolvedInterfaceCleanup = InterfaceDispatchRecovery.Run(this);
+        var retryResolvedInterfaceCleanup = InterfaceDispatchRecovery.Run(this, afterTypeResolution: true);
         if (retryResolvedInterfaceCleanup != null)
         {
             LocalVariables.ResolveTypesAndFields(this);

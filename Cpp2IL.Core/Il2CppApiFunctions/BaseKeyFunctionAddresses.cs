@@ -54,6 +54,12 @@ public abstract class BaseKeyFunctionAddresses
 
     public ulong AddrPInvokeLookup; //TODO Re-find this and fix name
 
+    // Runtime helpers of inlined virtual dispatch. Both are located through Object::GetVirtualMethod (behind the
+    // exported il2cpp_object_get_virtual_method) and are recovered only as part of the dispatch that calls them,
+    // so they are deliberately not published as key functions.
+    public ulong il2cpp_vm_class_get_interface_invoke_data_slow_path; //GetInterfaceInvokeDataFromVTableSlowPath(obj, itf, slot), called when the inline klass->interfaceOffsets scan misses.
+    public ulong il2cpp_vm_runtime_get_generic_virtual_method; //Runtime::GetGenericVirtualMethod(vtableSlotMethod, genericMethod), picks the inflated override of a generic virtual method.
+
     public IEnumerable<KeyValuePair<string, ulong>> Pairs => resolvedAddressMap;
 
     protected ApplicationAnalysisContext _appContext = null!; //Always initialized before used
@@ -101,6 +107,25 @@ public abstract class BaseKeyFunctionAddresses
         }
 
         return 0;
+    }
+
+    /// <summary>
+    /// Whether a call to <paramref name="address"/> runs <paramref name="function"/>, directly or through branch thunks.
+    /// </summary>
+    public bool CallReaches(ulong address, ulong function)
+    {
+        if (function == 0)
+            return false;
+
+        for (var hops = 0; address != 0 && hops <= MaxThunkHops; hops++)
+        {
+            if (address == function)
+                return true;
+
+            address = GetBranchThunkTarget(address);
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -170,6 +195,8 @@ public abstract class BaseKeyFunctionAddresses
 
         AttemptInstructionAnalysisToFillGaps();
 
+        FindVirtualDispatchHelpers();
+
         FindThunks();
         InitializeResolvedAddresses();
     }
@@ -214,6 +241,11 @@ public abstract class BaseKeyFunctionAddresses
         => FindAllThunkFunctions(metadataInit).FirstOrDefault();
 
     protected virtual void AttemptInstructionAnalysisToFillGaps()
+    {
+    }
+
+    // Fills il2cpp_vm_class_get_interface_invoke_data_slow_path and il2cpp_vm_runtime_get_generic_virtual_method.
+    protected virtual void FindVirtualDispatchHelpers()
     {
     }
 
