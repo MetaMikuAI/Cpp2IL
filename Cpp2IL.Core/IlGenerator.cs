@@ -960,7 +960,12 @@ public static class IlGenerator
                     null => null,
                     _ => throw new InvalidOperationException($"Invalid native comparison type: {comparisonType}")
                 };
-                var integerLiteralType = nativeComparisonType ?? BinaryIntegerLiteralType(instruction);
+                // Unresolved native jumps leave incomplete managed control flow; preserve its existing
+                // lowering rather than exposing malformed tails to new decompiler transforms.
+                var referenceEqualityType = instruction.OpCode is OpCode.CheckEqual or OpCode.CheckNotEqual
+                    && !context.ControlFlowGraph!.Instructions.Any(i => i.OpCode == OpCode.IndirectJump)
+                    ? ReferenceEqualityType(instruction) : null;
+                var integerLiteralType = nativeComparisonType ?? referenceEqualityType ?? BinaryIntegerLiteralType(instruction);
 
                 LoadOperand(instruction.Operands[1], method, locals, writeLine, integerLiteralType);
                 if (comparisonConversion is { } compareConv1) instructions.Add(compareConv1);
@@ -1105,6 +1110,18 @@ public static class IlGenerator
         (operand as LocalVariable)?.Type?.FullName is
             "System.Byte" or "System.UInt16" or "System.UInt32" or "System.UInt64"
             or "System.UIntPtr" or "System.Char";
+
+    private static TypeAnalysisContext? ReferenceEqualityType(Instruction instruction)
+    {
+        if (instruction.OpCode is not (OpCode.CheckEqual or OpCode.CheckNotEqual))
+            return null;
+        var other = IsZeroConstant(instruction.Operands[1]) ? instruction.Operands[2]
+            : IsZeroConstant(instruction.Operands[2]) ? instruction.Operands[1] : null;
+        var type = other switch { LocalVariable local => local.Type, FieldReference field => field.Field.FieldType, _ => null };
+        // Native null is zero, but managed reference equality must compare against ldnull.
+        return type is { IsValueType: false }
+            and not (PointerTypeAnalysisContext or ByRefTypeAnalysisContext or GenericParameterTypeAnalysisContext) ? type : null;
+    }
 
     private static TypeAnalysisContext? BinaryIntegerLiteralType(Instruction instruction)
     {

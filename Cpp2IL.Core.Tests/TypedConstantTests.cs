@@ -1,5 +1,6 @@
 using System;
 using System.Linq;
+using ReflectionBindingFlags = System.Reflection.BindingFlags;
 using AsmResolver.DotNet;
 using AsmResolver.DotNet.Signatures;
 using AsmResolver.PE.DotNet.Cil;
@@ -65,6 +66,39 @@ public class TypedConstantTests
     {
         Assert.That(GenerateReturn("Int32", 4294967296L).OpCode, Is.EqualTo(CilOpCodes.Ldc_I8));
         Assert.That(GenerateReturn("Single", 1).OpCode, Is.EqualTo(CilOpCodes.Ldc_I4));
+    }
+
+    [TestCase(OpCode.CheckEqual, "Object", 0L, false, true)]
+    [TestCase(OpCode.CheckNotEqual, "Object", 0L, true, true)]
+    [TestCase(OpCode.CheckEqual, "String", 0L, true, true)]
+    [TestCase(OpCode.CheckEqual, "Int32", 0L, false, false)]
+    [TestCase(OpCode.CheckEqual, "IntPtr", 0L, false, false)]
+    [TestCase(OpCode.CheckEqual, "Object", 1L, false, false)]
+    [TestCase(OpCode.CheckGreater, "Object", 0L, false, false)]
+    [TestCase(OpCode.And, "Object", 0L, false, false)]
+    [TestCase(OpCode.CheckEqual, "Pointer", 0L, false, false)]
+    [TestCase(OpCode.CheckEqual, "ByRef", 0L, false, false)]
+    [TestCase(OpCode.CheckEqual, "Generic", 0L, false, false)]
+    public void ReferenceEqualityRecognizesManagedReferenceNullChecks(OpCode opcode, string typeName,
+        long value, bool literalLeft, bool expected)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var type = typeName switch
+        {
+            "Pointer" => new PointerTypeAnalysisContext(app.SystemTypes.SystemInt32Type),
+            "ByRef" => new ByRefTypeAnalysisContext(app.SystemTypes.SystemObjectType),
+            "Generic" => new GenericParameterTypeAnalysisContext("T", 0,
+                LibCpp2IL.BinaryStructures.Il2CppTypeEnum.IL2CPP_TYPE_VAR,
+                System.Reflection.GenericParameterAttributes.None, app.SystemTypes.SystemObjectType),
+            _ => app.AssembliesByName["mscorlib"].GetTypeByFullName("System." + typeName)!
+        };
+        var source = new LocalVariable("source", new Register(null, "source"), type);
+        var result = new LocalVariable("result", new Register(null, "result"), app.SystemTypes.SystemBooleanType);
+        var literal = new Immediate(value);
+        var instruction = new Instruction(0, opcode, result, literalLeft ? literal : source, literalLeft ? source : literal);
+        var helper = typeof(IlGenerator).GetMethod("ReferenceEqualityType", ReflectionBindingFlags.NonPublic | ReflectionBindingFlags.Static)!;
+        var actual = helper.Invoke(null, [instruction]);
+        Assert.That(actual, Is.SameAs(expected ? type : null));
     }
 
     private static CilInstruction GenerateReturn(string type, long value)
