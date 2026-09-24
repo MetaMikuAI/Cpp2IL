@@ -24,6 +24,8 @@ public class SsaForm
     private readonly Dictionary<int, int> _counter = new();
     // An unversioned representative register per number, used to build phi nodes and the entry value.
     private readonly Dictionary<int, Register> _repr = new();
+    // The versions calls give the registers they clobber (Instruction.CallClobbers).
+    private readonly HashSet<Register> _callClobbered = [];
 
     public static void Build(MethodAnalysisContext method)
         => Build(method.ControlFlowGraph!, method.DominatorInfo!, method.StackAggregates.Keys.ToHashSet(),
@@ -41,6 +43,13 @@ public class SsaForm
         ssa.CollectRegisters(graph);
         ssa.InsertPhiFunctions(graph, dominatorInfo);
         ssa.Rename(graph.EntryBlock, dominatorInfo);
+
+        // The versions a call gives its clobbered registers have no value: they only keep reads
+        // dominated by the call from reaching definitions before it. They are not definition
+        // sites for phi placement and never flow into a phi (see ReachingValue), so a merge
+        // with a path through a call keeps the prior value. Nothing downstream needs the list.
+        foreach (var instruction in graph.Instructions)
+            instruction.CallClobbers = null;
     }
 
     // Native code can form &slot before assigning slot. Move the pure address
@@ -238,6 +247,9 @@ public class SsaForm
         if (instruction.ImplicitDefinition is { } clobbered)
             yield return clobbered;
 
+        foreach (var callClobbered in instruction.CallClobbers ?? [])
+            yield return callClobbered;
+
         foreach (var operand in instruction.Operands)
         {
             if (operand is Register register)
@@ -365,6 +377,10 @@ public class SsaForm
                 if (instruction.ImplicitDefinition is { } clobbered)
                     instruction.ImplicitDefinition = NewName(clobbered, definedHere);
 
+                if (instruction.CallClobbers is { } callClobbers)
+                    for (var i = 0; i < callClobbers.Length; i++)
+                        _callClobbered.Add(callClobbers[i] = NewName(callClobbers[i], definedHere));
+
                 for (var i = 0; i < instruction.Operands.Count; i++)
                 {
                     // A callee can read before writing through the address. A new
@@ -397,7 +413,7 @@ public class SsaForm
                         continue;
 
                     var regNumber = ((Register)phi.Operands[0]).Number;
-                    phi.SetOperand(1 + predIndex, CurrentVersion(regNumber));
+                    phi.SetOperand(1 + predIndex, ReachingValue(regNumber));
                 }
             }
 
@@ -409,13 +425,17 @@ public class SsaForm
 
     private void RewriteUses(Instruction instruction)
     {
+        var firstArgument = instruction.OpCode == OpCode.CallVoid ? 1 : 2;
+        var declaredEnd = instruction.DeclaredArguments > 0 ? firstArgument + instruction.DeclaredArguments : 0;
         for (var i = 0; i < instruction.Operands.Count; i++)
         {
             var operand = instruction.Operands[i];
 
             if (operand is Register register)
             {
-                instruction.SetOperand(i, CurrentVersion(register.Number));
+                instruction.SetOperand(i, i >= firstArgument && i < declaredEnd
+                    ? ReachingValue(register.Number)
+                    : CurrentVersion(register.Number));
             }
             else if (operand is MemoryOperand memory)
             {
@@ -433,6 +453,21 @@ public class SsaForm
     /// The version of <paramref name="regNumber"/> currently in scope, or the entry value
     /// (version -1) if it has not been defined on the current path.
     /// </summary>
+    // Valid native code never merges a register a call left undefined into a value that is read:
+    // such a path does not return (a throw helper the CFG still falls through) or the phi is dead.
+    // Likewise a declared argument register left undefined since a call is one the callee never
+    // reads (LLVM dead-argument elimination, e.g. an unused 'this'); any value is equivalent there.
+    // Use the definition before the call instead of a version that has no value.
+    private Register ReachingValue(int regNumber)
+    {
+        if (_stacks.TryGetValue(regNumber, out var stack))
+            foreach (var version in stack)
+                if (!_callClobbered.Contains(version))
+                    return version;
+
+        return _repr.TryGetValue(regNumber, out var register) ? register : new Register(regNumber, null);
+    }
+
     private Register CurrentVersion(int regNumber)
     {
         if (_stacks.TryGetValue(regNumber, out var stack) && stack.Count > 0)
