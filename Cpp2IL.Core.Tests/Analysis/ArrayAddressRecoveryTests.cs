@@ -204,6 +204,45 @@ public class ArrayAddressRecoveryTests
         }
     }
 
+    [TestCase(32, "unknown", true)]
+    [TestCase(16, "unknown", false)]
+    [TestCase(32, "UInt32", false)]
+    [TestCase(32, "Int64", false)]
+    public void RecoversSignedLoopIndexAndDownstreamElementFields(int bits, string kind, bool expected)
+    {
+        _app.Binary.is32Bit = false;
+        var root = _app.SystemTypes.SystemObjectType;
+        var element = new InjectedTypeAnalysisContext(root.DeclaringAssembly, "Tests", "Cell", root, TypeAttributes.Public);
+        var field = new InjectedFieldAnalysisContext("Index", _app.SystemTypes.SystemInt32Type, FieldAttributes.Public, element, 16);
+        element.Fields.Add(field);
+        var array = Local("array", new SzArrayTypeAnalysisContext(element));
+        var index = Local("index", kind == "UInt32" ? _app.SystemTypes.SystemUInt32Type
+            : kind == "Int64" ? _app.SystemTypes.SystemInt64Type : null);
+        var extended = Local("extended");
+        var scaled = Local("scaled");
+        var address = Local("address");
+        var value = Local("value");
+        var result = Local("result");
+        var load = new Instruction(3, OpCode.Move, value, new MemoryOperand(address, addend: 32, accessSize: 8));
+        var readField = new Instruction(4, OpCode.Move, result, new MemoryOperand(value, addend: 16, accessSize: 4));
+        var method = Method(new(0, OpCode.SignExtend, extended, index, new Immediate(bits)),
+            new(1, OpCode.ShiftLeft, scaled, extended, new Immediate(3)),
+            new(2, OpCode.Add, address, array, scaled), load, readField, new(5, OpCode.Return));
+        LocalVariables.ResolveTypesAndFields(method);
+        ArrayRecovery.RecoverSplitAccesses(method);
+        while (MetadataResolver.ResolveFieldOffsets(method))
+            LocalVariables.PropagateKnownTypes(method);
+        Assert.That(load.Operands[1], expected ? Is.TypeOf<ArrayAccess>() : Is.TypeOf<MemoryOperand>());
+        if (expected)
+        {
+            Assert.That(index.Type, Is.SameAs(_app.SystemTypes.SystemInt32Type));
+            Assert.That(((ArrayAccess)load.Operands[1]).Index, Is.SameAs(index));
+            var recoveredField = (FieldReference)readField.Operands[1];
+            Assert.That(recoveredField.Field == field || recoveredField.ContainingFields.Contains(field), Is.True);
+            Assert.That(result.Type, Is.SameAs(_app.SystemTypes.SystemInt32Type));
+        }
+    }
+
     [TestCase(false, false)]
     [TestCase(false, true)]
     [TestCase(true, false)]

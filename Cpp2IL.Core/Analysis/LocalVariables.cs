@@ -246,6 +246,9 @@ public static class LocalVariables
             if (instruction is { OpCode: OpCode.ConvertNumeric,
                 Operands: [LocalVariable converted, _, NumericConversion conversion] })
                 converted.Type = conversion.TargetType;
+            if (instruction is { OpCode: OpCode.SignExtend,
+                Operands: [_, LocalVariable { Type: null } source, Immediate { Value: 32 }] })
+                source.Type = method.AppContext.SystemTypes.SystemInt32Type;
             if (instruction is { OpCode: OpCode.ZeroExtend or OpCode.SignExtend, Destination: LocalVariable extended })
                 extended.Type = instruction.OpCode == OpCode.SignExtend
                     ? method.AppContext.SystemTypes.SystemInt64Type : method.AppContext.SystemTypes.SystemUInt64Type;

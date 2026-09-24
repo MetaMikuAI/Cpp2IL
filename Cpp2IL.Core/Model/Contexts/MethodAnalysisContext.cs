@@ -456,6 +456,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         CallArgumentTrimmer.Run(this);
         PinnedArrayRecovery.Run(this);
         ArrayRecovery.RecoverSplitAccesses(this);
+        // Recovered elements expose managed field chains; do not rerun call inference.
+        while (MetadataResolver.ResolveFieldOffsets(this))
+            LocalVariables.PropagateKnownTypes(this);
         LocalVariables.PropagateKnownTypes(this);
         BooleanFlagSimplifier.SimplifyLiteralOperations(this);
 
