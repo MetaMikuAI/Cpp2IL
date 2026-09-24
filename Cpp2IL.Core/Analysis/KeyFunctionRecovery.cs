@@ -157,15 +157,22 @@ public static class KeyFunctionRecovery
             // Codegen may use a sibling of the exported boxing thunk. Follow only
             // an entry-point B: calls or argument-adjusting wrappers are not equivalent.
             if (target is not Immediate address || method.AppContext.InstructionSet is not InstructionSets.NewArmV8InstructionSet
-                || !boxedType.IsValueType
-                || value is not AddressOf { Target: LocalVariable valueLocal }
-                || valueLocal.Type != null && valueLocal.Type != boxedType)
+                || !boxedType.IsValueType)
                 return false;
             var implementation = NewArm64KeyFunctionAddresses.GetBranchThunkTarget(method.AppContext, address.UnsignedValue);
             if (implementation == 0)
                 return false;
             var known = method.AppContext.GetOrCreateKeyFunctionAddresses();
             if (implementation != known.il2cpp_value_box && implementation != known.il2cpp_vm_object_box)
+                return false;
+        }
+
+        // A value type is boxed from the address of a local holding it, which is what IL boxes by value.
+        // Any other pointer (e.g. one merged from several addresses) cannot be loaded as the value.
+        if (boxedType.IsValueType)
+        {
+            if (value is not AddressOf { Target: LocalVariable valueLocal }
+                || valueLocal.Type != null && valueLocal.Type != boxedType)
                 return false;
             // The proven boxing helper and its class argument establish the pointee type.
             // Do this only after verifying the target, and never overwrite a conflicting type.

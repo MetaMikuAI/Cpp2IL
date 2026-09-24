@@ -135,6 +135,8 @@ public class NewArm64KeyFunctionAddresses : BaseKeyFunctionAddresses
         return 0;
     }
 
+    protected override ulong GetBranchThunkTarget(ulong address) => GetBranchThunkTarget(_appContext, address);
+
     // An entry consisting of B alone preserves all arguments and the return value.
     internal static ulong GetBranchThunkTarget(Model.Contexts.ApplicationAnalysisContext context, ulong thunkAddress)
     {

@@ -19,6 +19,13 @@ public class FieldReference(FieldAnalysisContext field, LocalVariable local, int
 
     public bool IsNested => ContainingFields.Count != 0;
 
+    /// <summary>
+    /// Whether the access is rooted at static storage, e.g. <c>Vector3.oneVector.y</c>, where the
+    /// accessed member itself is an instance field of the static value type. Such an access does not
+    /// read <see cref="Local"/>, which only locates the static storage it was resolved from.
+    /// </summary>
+    public bool IsStatic => (IsNested ? ContainingFields[0] : Field).IsStatic;
+
     public override string ToString() => IsNested
         ? $"{Local.Name}.{string.Join('.', ContainingFields.Select(f => f.Name).Append(Field.Name))} ({Field.FieldType.FullName})"
         : $"{Local.Name}.{Field.Name} ({Field.FieldType.FullName})";

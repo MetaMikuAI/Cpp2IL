@@ -6,9 +6,12 @@ using System.Reflection;
 using Cpp2IL.Core.Extensions;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.Il2CppApiFunctions;
+using Cpp2IL.Core.InstructionSets;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
+using Disarm;
+using Disarm.InternalDisassembly;
 using LibCpp2IL;
 using LibCpp2IL.BinaryStructures;
 
@@ -377,31 +380,27 @@ public static class MetadataResolver
                         && f.BackingData?.FieldOffset == fieldOffset);
                 }
 
+                // Value-type fields that enclose the accessed member, outermost first.
+                IReadOnlyList<FieldAnalysisContext> containingFields = [];
                 if (field == null)
                 {
                     // A pair load/store can address a member inside an embedded value type, e.g.
-                    // Vector2.y at outerFieldOffset + 4. Resolve the innermost field so IL generation
-                    // can use ldflda/stfld instead of leaving an untyped raw memory write behind.
+                    // Vector2.y at outerFieldOffset + 4, or Bounds.m_Extents.z two levels down.
+                    // Resolve the innermost field so IL generation can use ldflda/stfld instead of
+                    // leaving an untyped raw memory access behind.
+                    // Static storage holds only its own type's statics, so a static containing field
+                    // (Vector3.oneVector.y) is searched on the owner alone, never on its base types.
                     for (var candidateOwner = genericOwner?.GenericType ?? owner;
                          candidateOwner != null && field == null;
-                         candidateOwner = candidateOwner.BaseType)
+                         candidateOwner = staticOwner == null ? candidateOwner.BaseType : null)
                     {
                         // Generic definition offsets are placeholders, not evidence for an
                         // embedded member when the instantiated layout could not be proven.
                         if (candidateOwner is GenericInstanceTypeAnalysisContext || candidateOwner.GenericParameters.Count > 0)
                             continue;
-                        var containing = candidateOwner.Fields.FirstOrDefault(f => !f.IsStatic
-                            && f.FieldType.IsValueType
-                            && f.Offset >= 0
-                            && f.FieldType.Fields.Any(n => !n.IsStatic
-                                && n.Offset == fieldOffset - f.Offset));
-
-                        if (containing?.FieldType.Fields.FirstOrDefault(f => !f.IsStatic
-                                && f.Offset == fieldOffset - containing.Offset) is { } nested)
-                        {
-                            field = nested;
-                            instruction.SetOperand(i, new FieldReference(field, fieldLocal, (int)fieldOffset, containing));
-                        }
+                        if (FindEmbeddedMember(candidateOwner, fieldOffset, staticOwner != null, memory.AccessSize,
+                                method.AppContext.Binary.PointerSizeBytes) is var (chain, nested))
+                            (containingFields, field) = (chain, nested);
                     }
 
                     if (field == null)
@@ -415,9 +414,9 @@ public static class MetadataResolver
                         || i == 0 && (instruction.Operands[1] is Immediate
                             || OperandType(instruction.Operands[1], method, definitions) is { } sourceType && !IsAggregate(sourceType))
                             && !(instruction.Operands[1] is LocalVariable source && aggregateCopies.Contains(source)))
-                    && instruction.Operands[i] is MemoryOperand { AccessSize: > 0 } sized
-                    && ResolvePartialStructAccess(field, fieldLocal, (int)fieldOffset, sized.AccessSize,
-                        method.AppContext.Binary.PointerSizeBytes) is { } scalar)
+                    && memory.AccessSize > 0
+                    && ResolvePartialStructAccess(field, fieldLocal, (int)fieldOffset, memory.AccessSize,
+                        method.AppContext.Binary.PointerSizeBytes, containingFields) is { } scalar)
                 {
                     instruction.SetOperand(i, scalar);
                     changed = true;
@@ -426,25 +425,27 @@ public static class MetadataResolver
 
                 // Bind the containing field before inspecting its members, so nested stores
                 // preserve both the substituted field type and the concrete declaring owner.
-                if (fieldGenericOwner != null && instruction.Operands[i] is not FieldReference { IsNested: true })
+                if (fieldGenericOwner != null && containingFields.Count == 0)
                     field = new ConcreteGenericFieldAnalysisContext(field, fieldGenericOwner);
+
+                var resolved = new FieldReference(field, fieldLocal, (int)fieldOffset) { ContainingFields = containingFields };
 
                 // A scalar store at the start of an embedded value type is a store to its first
                 // member, not an assignment of the whole aggregate (e.g. Vector2.x). The native
                 // compiler commonly emits this shape when initializing one component separately.
                 if (instruction.OpCode == OpCode.Move
-                    && instruction.Operands[0] is MemoryOperand
+                    && i == 0
                     && field.FieldType.IsValueType
                     && OperandType(instruction.Operands[1], method, definitions) is { } storedType
                     && field.FieldType.FullName != storedType.FullName
                     && field.FieldType.Fields.FirstOrDefault(n => !n.IsStatic && n.Offset == 0
                         && n.FieldType.FullName == storedType.FullName) is { } firstMember)
                 {
-                    instruction.SetOperand(i, new FieldReference(firstMember, fieldLocal, (int)fieldOffset, field));
+                    resolved = new FieldReference(firstMember, fieldLocal, (int)fieldOffset)
+                        { ContainingFields = [.. containingFields, field] };
                 }
 
-                if (instruction.Operands[i] is not FieldReference { IsNested: true })
-                    instruction.SetOperand(i, new FieldReference(field, fieldLocal, (int)fieldOffset));
+                instruction.SetOperand(i, resolved);
                 changed = true;
             }
         }
@@ -452,11 +453,59 @@ public static class MetadataResolver
         return changed;
     }
 
-    internal static FieldReference? ResolvePartialStructAccess(FieldAnalysisContext field, LocalVariable receiver,
-        int offset, int width, int pointerSize)
+    /// <summary>
+    /// Finds the member at <paramref name="offset"/> inside one of <paramref name="owner"/>'s value-type
+    /// fields. A member directly inside a field (Vector2.y) resolves as it always has; otherwise the
+    /// search descends through nested value types (Bounds.m_Extents.z), where each level must be the
+    /// unique non-generic struct field whose unboxed size covers the offset and the member must not
+    /// be narrower than a known <paramref name="accessSize"/>, so an 8-byte pair is never read as
+    /// its first 4-byte member.
+    /// </summary>
+    private static (IReadOnlyList<FieldAnalysisContext> Chain, FieldAnalysisContext Member)? FindEmbeddedMember(
+        TypeAnalysisContext owner, long offset, bool isStatic, int accessSize, int pointerSize)
     {
-        if (width <= 0 || field.IsStatic) return null;
-        var parents = new List<FieldAnalysisContext>();
+        var fields = owner.Fields.Where(f => f.IsStatic == isStatic
+            && (f.Attributes & FieldAttributes.Literal) == 0).ToList();
+
+        var direct = fields.FirstOrDefault(f => f.FieldType.IsValueType
+            && f.Offset >= 0
+            && f.FieldType.Fields.Any(n => !n.IsStatic && n.Offset == offset - f.Offset));
+        if (direct?.FieldType.Fields.FirstOrDefault(n => !n.IsStatic && n.Offset == offset - direct.Offset) is { } directMember)
+            return ([direct], directMember);
+
+        var chain = new List<FieldAnalysisContext>();
+        var candidates = fields;
+        var relative = offset;
+        while (true)
+        {
+            // Only plain structs are containers: primitives wrap themselves (Single.m_value) and
+            // enums only wrap their underlying value.
+            var containing = candidates.Where(f => f.FieldType is { Type: Il2CppTypeEnum.IL2CPP_TYPE_VALUETYPE, IsEnumType: false }
+                && f.Offset >= 0 && f.Offset < relative
+                && relative - f.Offset < TypeSizes.UnboxedSize(f.FieldType, pointerSize)).ToList();
+            if (containing is not [{ } parent] || parent.FieldType.GenericParameters.Count > 0)
+                return null;
+
+            chain.Add(parent);
+            relative -= parent.Offset;
+            candidates = parent.FieldType.Fields.Where(f => !f.IsStatic).ToList();
+            if (chain.Count > 1 && candidates.Where(f => f.Offset == relative).ToList() is [{ } member])
+            {
+                var size = TypeSizes.UnboxedSize(member.FieldType, pointerSize);
+                return accessSize > 0 && member.FieldType.IsValueType && size > 0 && size < accessSize
+                    ? null
+                    : (chain, member);
+            }
+        }
+    }
+
+    internal static FieldReference? ResolvePartialStructAccess(FieldAnalysisContext field, LocalVariable receiver,
+        int offset, int width, int pointerSize, IReadOnlyList<FieldAnalysisContext>? containingFields = null)
+    {
+        // A static field may be the outermost parent (Vector3.oneVector.x); FieldReference.IsStatic
+        // then roots the access at the static storage instead of the receiver.
+        if (width <= 0) return null;
+        var parents = new List<FieldAnalysisContext>(containingFields ?? []);
         var seen = new HashSet<TypeAnalysisContext>();
         while (field.FieldType is { IsValueType: true } type && seen.Add(type)
             && type is not GenericInstanceTypeAnalysisContext && type.GenericParameters.Count == 0
@@ -629,6 +678,8 @@ public static class MetadataResolver
 
             if (keyFunctionAddresses.IsKeyFunctionAddress(target))
             {
+                // A codegen thunk that only branches to a key function is handled as that function.
+                target = keyFunctionAddresses.ResolveKeyFunctionAddress(target);
                 HandleKeyFunction(method.AppContext, callInstruction, target, keyFunctionAddresses);
 
                 if (target == keyFunctionAddresses.il2cpp_codegen_initialize_runtime_metadata_inline
@@ -1041,11 +1092,14 @@ public static class MetadataResolver
             if (!method.AppContext.MethodsByAddress.TryGetValue(target.UnsignedValue, out var candidates))
             {
                 // A concrete generic implementation can be present in the binary metadata without
-                // having a normal method candidate (for example an adjustor/thunk-only entry).
+                // having a normal method candidate (for example an adjustor/thunk-only entry), and a
+                // generic instantiation the metadata never registered still has a real managed body.
                 // Restrict this fallback to addresses explicitly listed as concrete generic
-                // implementations; arbitrary native/runtime calls may reuse an X1 value that looks
-                // like a MethodInfo* after register allocation.
-                if (!method.AppContext.Binary.ConcreteGenericImplementationsByAddress.ContainsKey(target.UnsignedValue))
+                // implementations, or to unregistered bodies of the generic method in the MethodInfo;
+                // arbitrary native/runtime calls may reuse an X1 value that looks like a MethodInfo*
+                // after register allocation.
+                var registered = method.AppContext.Binary.ConcreteGenericImplementationsByAddress.ContainsKey(target.UnsignedValue);
+                if (!registered && !MayBeUnregisteredGenericBody(method.AppContext, target.UnsignedValue, representedMethod))
                     continue;
 
                 // Il2CPP still passes the concrete MethodInfo as the hidden final parameter, so use
@@ -1059,8 +1113,12 @@ public static class MetadataResolver
                     + (representedMethod.AppContext.InstructionSet.CallingConventionResolver?.ReturnsViaHiddenBuffer(representedMethod) == true ? 1 : 0)
                     + (representedMethod.IsStatic ? 0 : 1) + representedMethod.Parameters.Count;
 
+                // Nothing but the MethodInfo identifies an unregistered body, so it must be the one
+                // in the hidden parameter slot of the method it represents, and set for this call.
                 if (hiddenParamIndex >= instruction.Operands.Count
-                    || AsMethodInfo(instruction.Operands[hiddenParamIndex]) == null)
+                    || AsMethodInfo(instruction.Operands[hiddenParamIndex]) is not { } hiddenMethodInfo
+                    || !registered && (!ReferenceEquals(hiddenMethodInfo.RepresentedMethod, representedMethod)
+                        || !SetsArgumentRegisterAfterLastCall(method, instruction, hiddenParamIndex - firstArg)))
                     continue;
 
                 instruction.SetOperand(0, representedMethod);
@@ -1087,6 +1145,73 @@ public static class MetadataResolver
         }
 
         return changed;
+    }
+
+    // A call target outside MethodsByAddress may still be the shared or value-type body of a generic
+    // method: those bodies serve several instantiations, so metadata need not list the address. Accept
+    // only managed code that no runtime helper, export or import stub accounts for, and leave the
+    // address out of MethodsByAddress; the caller's MethodInfo, not the address, identifies the method.
+    private static bool MayBeUnregisteredGenericBody(ApplicationAnalysisContext app, ulong target, MethodAnalysisContext represented)
+    {
+        if (target < app.ManagedCodeStart || target > app.ManagedCodeEnd)
+            return false;
+
+        if (represented is not ConcreteGenericMethodAnalysisContext { MethodGenericParameters.Count: > 0 }
+            && represented.DeclaringType is not GenericInstanceTypeAnalysisContext { GenericArguments.Count: > 0 })
+            return false;
+
+        return !app.GetOrCreateKeyFunctionAddresses().IsKeyFunctionAddress(target)
+               && !app.Binary.IsExportedFunction(target)
+               && !Arm64ImportResolver.IsImportStub(app.Binary, target);
+    }
+
+    // Lifting keeps argument registers live across calls, so the MethodInfo* loaded for an earlier call
+    // can still occupy this call's hidden parameter register, even when this callee takes no MethodInfo
+    // at all. Require the native code to set that register after the last call before this one, within
+    // the call's block. Only ARM64 is checked; elsewhere nothing is proven.
+    private static bool SetsArgumentRegisterAfterLastCall(MethodAnalysisContext method, Instruction call, int integerArgument)
+    {
+        if (method.AppContext.InstructionSet is not NewArmV8InstructionSet || integerArgument is < 0 or > 7
+            || call.NativeAddress == 0 || method.ControlFlowGraph!.Blocks.FirstOrDefault(b => b.Instructions.Contains(call)) is not { } block)
+            return false;
+
+        var start = Math.Max(method.UnderlyingPointer,
+            block.Instructions.Where(i => i.NativeAddress != 0).Min(i => i.NativeAddress));
+        var bytes = method.RawBytes.AsSpan();
+        var wide = Arm64Register.X0 + integerArgument;
+        var narrow = Arm64Register.W0 + integerArgument;
+
+        try
+        {
+            for (var pc = call.NativeAddress; pc >= start + 4;)
+            {
+                pc -= 4;
+                var offset = pc - method.UnderlyingPointer;
+                if (offset + 4 > (ulong)bytes.Length)
+                    return false;
+
+                if (Disassembler.Disassemble(bytes.Slice((int)offset, 4), pc, new Disassembler.Options(true, true, false)).ToList() is not [var previous])
+                    return false;
+
+                switch (previous.Mnemonic)
+                {
+                    case Arm64Mnemonic.BL or Arm64Mnemonic.BLR or Arm64Mnemonic.BR
+                        or Arm64Mnemonic.RET or Arm64Mnemonic.RETAA or Arm64Mnemonic.RETAB or Arm64Mnemonic.INVALID:
+                    case Arm64Mnemonic.B when previous.MnemonicConditionCode is Arm64ConditionCode.NONE or Arm64ConditionCode.AL:
+                        return false;
+                    case Arm64Mnemonic.LDR or Arm64Mnemonic.LDUR or Arm64Mnemonic.MOV or Arm64Mnemonic.ADD
+                        or Arm64Mnemonic.ADRP or Arm64Mnemonic.ORR when previous.Op0Reg == wide || previous.Op0Reg == narrow:
+                    case Arm64Mnemonic.LDP when previous.Op0Reg == wide || previous.Op1Reg == wide:
+                        return true;
+                }
+            }
+        }
+        catch (Exception)
+        {
+            return false; // undecodable code proves nothing
+        }
+
+        return false;
     }
 
     private static bool CanSpecializeSharedGeneric(MethodAnalysisContext current, MethodAnalysisContext represented)

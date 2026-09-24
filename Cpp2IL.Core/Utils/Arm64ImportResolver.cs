@@ -10,13 +10,19 @@ namespace Cpp2IL.Core.Utils;
 internal static class Arm64ImportResolver
 {
     internal static string? Resolve(Il2CppBinary binary, ulong address)
+        => binary is ElfStyleRelocationsBinary elf && ImportSlot(binary, address) is { } slot
+            ? elf.GetImportNameAtSlot(slot) : null;
+
+    // Whether address is a standard ELF PLT entry, named import or not.
+    internal static bool IsImportStub(Il2CppBinary binary, ulong address) => ImportSlot(binary, address) != null;
+
+    private static ulong? ImportSlot(Il2CppBinary binary, ulong address)
     {
-        if (binary is not ElfStyleRelocationsBinary elf || binary.is32Bit
+        if (binary is not ElfStyleRelocationsBinary || binary.is32Bit
             || !binary.TryMapVirtualAddressToRaw(address, out var raw)
             || raw < 0 || raw > binary.RawLength - 16)
             return null;
-        return ImportSlot(binary.GetRawBinaryContent().Slice((int)raw, 16), address) is { } slot
-            ? elf.GetImportNameAtSlot(slot) : null;
+        return ImportSlot(binary.GetRawBinaryContent().Slice((int)raw, 16), address);
     }
 
     // Match the standard ELF PLT entry using only ABI scratch registers. Argument-

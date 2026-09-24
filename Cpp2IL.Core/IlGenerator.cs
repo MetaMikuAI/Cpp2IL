@@ -668,14 +668,7 @@ public static class IlGenerator
 
                 if (instruction.Operands[0] is FieldReference field) // stfld takes instance before value so LoadOperand StoreToOperand doesn't work
                 {
-                    if (!field.Field.IsStatic)
-                    {
-                        LoadFieldReceiver(field.Local, method, locals);
-
-                        foreach (var containing in field.ContainingFields)
-                            instructions.Add(CilOpCodes.Ldflda, containing.ToFieldDescriptor());
-                    }
-
+                    LoadFieldOwner(field, method, locals);
                     LoadOperand(instruction.Operands[1], method, locals, writeLine, field.Field.FieldType);
                     instructions.Add(field.Field.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld, field.Field.ToFieldDescriptor());
                     break;
@@ -1226,10 +1219,8 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Ldloca, locals[addressed]);
                 break;
             case AddressOf { Target: FieldReference fieldAddress }:
-                LoadFieldReceiver(fieldAddress.Local, method, locals);
-                foreach (var containing in fieldAddress.ContainingFields)
-                    instructions.Add(CilOpCodes.Ldflda, containing.ToFieldDescriptor());
-                instructions.Add(CilOpCodes.Ldflda, fieldAddress.Field.ToFieldDescriptor());
+                LoadFieldOwner(fieldAddress, method, locals);
+                instructions.Add(fieldAddress.Field.IsStatic ? CilOpCodes.Ldsflda : CilOpCodes.Ldflda, fieldAddress.Field.ToFieldDescriptor());
                 break;
             case AddressOf { Target: ArrayAccess elementAddress }:
                 LoadLocal(elementAddress.Array, method, locals);
@@ -1244,16 +1235,8 @@ public static class IlGenerator
                     ((SzArrayTypeAnalysisContext)arrayAccess.Array.Type!).ElementType.ToTypeSignature().ToTypeDefOrRef());
                 break;
             case FieldReference field:
-                if (field.Field.IsStatic)
-                {
-                    instructions.Add(CilOpCodes.Ldsfld, field.Field.ToFieldDescriptor());
-                    break;
-                }
-
-                LoadFieldReceiver(field.Local, method, locals);
-                foreach (var containing in field.ContainingFields)
-                    instructions.Add(CilOpCodes.Ldflda, containing.ToFieldDescriptor());
-                instructions.Add(CilOpCodes.Ldfld, field.Field.ToFieldDescriptor());
+                LoadFieldOwner(field, method, locals);
+                instructions.Add(field.Field.IsStatic ? CilOpCodes.Ldsfld : CilOpCodes.Ldfld, field.Field.ToFieldDescriptor());
                 break;
             case MemoryOperand memory:
                 if (memory.Index == null && memory.Addend == 0 && memory.Scale == 0
@@ -1456,6 +1439,30 @@ public static class IlGenerator
             method.CilMethodBody!.Instructions.Add(CilOpCodes.Ldloca, locals[local]);
     }
 
+    /// <summary>
+    /// Pushes what ldfld/stfld/ldflda of <paramref name="field"/>'s member expects beneath it: the
+    /// receiver followed by the address of each containing value-type field. Static storage has no
+    /// receiver, so a nested static access starts from the outermost field's address instead, and a
+    /// plain static field (ldsfld/stsfld/ldsflda) needs nothing at all.
+    /// </summary>
+    private static void LoadFieldOwner(FieldReference field, MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals)
+    {
+        var instructions = method.CilMethodBody!.Instructions;
+        IEnumerable<FieldAnalysisContext> containing = field.ContainingFields;
+        if (field.IsStatic)
+        {
+            if (!field.IsNested)
+                return;
+            instructions.Add(CilOpCodes.Ldsflda, field.ContainingFields[0].ToFieldDescriptor());
+            containing = containing.Skip(1);
+        }
+        else
+            LoadFieldReceiver(field.Local, method, locals);
+
+        foreach (var member in containing)
+            instructions.Add(CilOpCodes.Ldflda, member.ToFieldDescriptor());
+    }
+
     private static void LoadLocal(LocalVariable local, MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals)
     {
         var instructions = method.CilMethodBody!.Instructions;
@@ -1507,9 +1514,7 @@ public static class IlGenerator
                 method.CilMethodBody!.LocalVariables.Add(scratch);
 
                 instructions.Add(CilOpCodes.Stloc, scratch);
-                LoadFieldReceiver(field.Local, method, locals);
-                foreach (var containing in field.ContainingFields)
-                    instructions.Add(CilOpCodes.Ldflda, containing.ToFieldDescriptor());
+                LoadFieldOwner(field, method, locals);
                 instructions.Add(CilOpCodes.Ldloc, scratch);
                 instructions.Add(CilOpCodes.Stfld, fieldDescriptor);
                 break;
@@ -1548,6 +1553,9 @@ public static class IlGenerator
                     instructions.Add(CilOpCodes.Stloc, locals[local2]);
                     break;
                 }
+                // The store cannot be expressed; report it like an unmanaged load instead of dropping it silently.
+                instructions.Add(CilOpCodes.Ldstr, Diagnostic("Unmanaged memory store: " + operand));
+                instructions.Add(CilOpCodes.Call, writeLine);
                 instructions.Add(CilOpCodes.Pop);
                 break;
 
