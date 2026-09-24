@@ -1509,8 +1509,9 @@ public static class IlGenerator
                 }
 
                 // stfld wants the object underneath the value, but the value is already on the stack, so
-                // park it in a temporary while we load the object.
-                var scratch = new CilLocalVariable(fieldDescriptor.Signature!.FieldType);
+                // park it in a temporary while we load the object. A field of a generic instance is
+                // declared with its parameters (!0), so the temporary takes the substituted type.
+                var scratch = new CilLocalVariable(field.Field.FieldType.ToTypeSignature());
                 method.CilMethodBody!.LocalVariables.Add(scratch);
 
                 instructions.Add(CilOpCodes.Stloc, scratch);

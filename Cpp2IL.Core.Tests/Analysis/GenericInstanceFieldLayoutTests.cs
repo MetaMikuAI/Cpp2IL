@@ -79,12 +79,14 @@ public class GenericInstanceFieldLayoutTests
     }
 
     [Test]
-    public void DoesNotExtendReferenceLayoutRulesToGenericValueTypeReceivers()
+    public void LaysOutGenericValueTypeReceiversWithoutAnObjectHeader()
     {
+        // A value-type receiver addresses unboxed storage, so the reference-type header does not apply.
         var owner = Create(_app.AllTypes.Single(t => t.FullName == "UnityEngine.Vector2"), array: false);
         owner.GenericType.BaseType = _app.AllTypes.Single(t => t.FullName == "System.ValueType");
         Assert.That(owner.IsValueType, Is.True);
-        Assert.That(GenericInstanceFieldLayout.FindFieldAtOffset(owner, 0), Is.Null);
+        Assert.That(GenericInstanceFieldLayout.FindFieldAtOffset(owner, 0)?.Name, Is.EqualTo("data"));
+        Assert.That(GenericInstanceFieldLayout.FindFieldAtOffset(owner, 8)?.Name, Is.EqualTo("count"));
         Assert.That(GenericInstanceFieldLayout.FindFieldAtOffset(owner, 2 * _app.Binary.PointerSizeBytes), Is.Null);
     }
 
