@@ -377,11 +377,14 @@ public static class MetadataResolver
                         && f.BackingData?.FieldOffset == fieldOffset);
                 }
 
+                // Value-type fields that enclose the accessed member, outermost first.
+                IReadOnlyList<FieldAnalysisContext> containingFields = [];
                 if (field == null)
                 {
                     // A pair load/store can address a member inside an embedded value type, e.g.
-                    // Vector2.y at outerFieldOffset + 4. Resolve the innermost field so IL generation
-                    // can use ldflda/stfld instead of leaving an untyped raw memory write behind.
+                    // Vector2.y at outerFieldOffset + 4, or Bounds.m_Extents.z two levels down.
+                    // Resolve the innermost field so IL generation can use ldflda/stfld instead of
+                    // leaving an untyped raw memory access behind.
                     // Static storage holds only its own type's statics, so a static containing field
                     // (Vector3.oneVector.y) is searched on the owner alone, never on its base types.
                     for (var candidateOwner = genericOwner?.GenericType ?? owner;
@@ -392,19 +395,9 @@ public static class MetadataResolver
                         // embedded member when the instantiated layout could not be proven.
                         if (candidateOwner is GenericInstanceTypeAnalysisContext || candidateOwner.GenericParameters.Count > 0)
                             continue;
-                        var containing = candidateOwner.Fields.FirstOrDefault(f => f.IsStatic == (staticOwner != null)
-                            && (f.Attributes & FieldAttributes.Literal) == 0
-                            && f.FieldType.IsValueType
-                            && f.Offset >= 0
-                            && f.FieldType.Fields.Any(n => !n.IsStatic
-                                && n.Offset == fieldOffset - f.Offset));
-
-                        if (containing?.FieldType.Fields.FirstOrDefault(f => !f.IsStatic
-                                && f.Offset == fieldOffset - containing.Offset) is { } nested)
-                        {
-                            field = nested;
-                            instruction.SetOperand(i, new FieldReference(field, fieldLocal, (int)fieldOffset, containing));
-                        }
+                        if (FindEmbeddedMember(candidateOwner, fieldOffset, staticOwner != null, memory.AccessSize,
+                                method.AppContext.Binary.PointerSizeBytes) is var (chain, nested))
+                            (containingFields, field) = (chain, nested);
                     }
 
                     if (field == null)
@@ -418,9 +411,9 @@ public static class MetadataResolver
                         || i == 0 && (instruction.Operands[1] is Immediate
                             || OperandType(instruction.Operands[1], method, definitions) is { } sourceType && !IsAggregate(sourceType))
                             && !(instruction.Operands[1] is LocalVariable source && aggregateCopies.Contains(source)))
-                    && instruction.Operands[i] is MemoryOperand { AccessSize: > 0 } sized
-                    && ResolvePartialStructAccess(field, fieldLocal, (int)fieldOffset, sized.AccessSize,
-                        method.AppContext.Binary.PointerSizeBytes) is { } scalar)
+                    && memory.AccessSize > 0
+                    && ResolvePartialStructAccess(field, fieldLocal, (int)fieldOffset, memory.AccessSize,
+                        method.AppContext.Binary.PointerSizeBytes, containingFields) is { } scalar)
                 {
                     instruction.SetOperand(i, scalar);
                     changed = true;
@@ -429,25 +422,27 @@ public static class MetadataResolver
 
                 // Bind the containing field before inspecting its members, so nested stores
                 // preserve both the substituted field type and the concrete declaring owner.
-                if (fieldGenericOwner != null && instruction.Operands[i] is not FieldReference { IsNested: true })
+                if (fieldGenericOwner != null && containingFields.Count == 0)
                     field = new ConcreteGenericFieldAnalysisContext(field, fieldGenericOwner);
+
+                var resolved = new FieldReference(field, fieldLocal, (int)fieldOffset) { ContainingFields = containingFields };
 
                 // A scalar store at the start of an embedded value type is a store to its first
                 // member, not an assignment of the whole aggregate (e.g. Vector2.x). The native
                 // compiler commonly emits this shape when initializing one component separately.
                 if (instruction.OpCode == OpCode.Move
-                    && instruction.Operands[0] is MemoryOperand
+                    && i == 0
                     && field.FieldType.IsValueType
                     && OperandType(instruction.Operands[1], method, definitions) is { } storedType
                     && field.FieldType.FullName != storedType.FullName
                     && field.FieldType.Fields.FirstOrDefault(n => !n.IsStatic && n.Offset == 0
                         && n.FieldType.FullName == storedType.FullName) is { } firstMember)
                 {
-                    instruction.SetOperand(i, new FieldReference(firstMember, fieldLocal, (int)fieldOffset, field));
+                    resolved = new FieldReference(firstMember, fieldLocal, (int)fieldOffset)
+                        { ContainingFields = [.. containingFields, field] };
                 }
 
-                if (instruction.Operands[i] is not FieldReference { IsNested: true })
-                    instruction.SetOperand(i, new FieldReference(field, fieldLocal, (int)fieldOffset));
+                instruction.SetOperand(i, resolved);
                 changed = true;
             }
         }
@@ -455,13 +450,59 @@ public static class MetadataResolver
         return changed;
     }
 
+    /// <summary>
+    /// Finds the member at <paramref name="offset"/> inside one of <paramref name="owner"/>'s value-type
+    /// fields. A member directly inside a field (Vector2.y) resolves as it always has; otherwise the
+    /// search descends through nested value types (Bounds.m_Extents.z), where each level must be the
+    /// unique non-generic struct field whose unboxed size covers the offset and the member must not
+    /// be narrower than a known <paramref name="accessSize"/>, so an 8-byte pair is never read as
+    /// its first 4-byte member.
+    /// </summary>
+    private static (IReadOnlyList<FieldAnalysisContext> Chain, FieldAnalysisContext Member)? FindEmbeddedMember(
+        TypeAnalysisContext owner, long offset, bool isStatic, int accessSize, int pointerSize)
+    {
+        var fields = owner.Fields.Where(f => f.IsStatic == isStatic
+            && (f.Attributes & FieldAttributes.Literal) == 0).ToList();
+
+        var direct = fields.FirstOrDefault(f => f.FieldType.IsValueType
+            && f.Offset >= 0
+            && f.FieldType.Fields.Any(n => !n.IsStatic && n.Offset == offset - f.Offset));
+        if (direct?.FieldType.Fields.FirstOrDefault(n => !n.IsStatic && n.Offset == offset - direct.Offset) is { } directMember)
+            return ([direct], directMember);
+
+        var chain = new List<FieldAnalysisContext>();
+        var candidates = fields;
+        var relative = offset;
+        while (true)
+        {
+            // Only plain structs are containers: primitives wrap themselves (Single.m_value) and
+            // enums only wrap their underlying value.
+            var containing = candidates.Where(f => f.FieldType is { Type: Il2CppTypeEnum.IL2CPP_TYPE_VALUETYPE, IsEnumType: false }
+                && f.Offset >= 0 && f.Offset < relative
+                && relative - f.Offset < TypeSizes.UnboxedSize(f.FieldType, pointerSize)).ToList();
+            if (containing is not [{ } parent] || parent.FieldType.GenericParameters.Count > 0)
+                return null;
+
+            chain.Add(parent);
+            relative -= parent.Offset;
+            candidates = parent.FieldType.Fields.Where(f => !f.IsStatic).ToList();
+            if (chain.Count > 1 && candidates.Where(f => f.Offset == relative).ToList() is [{ } member])
+            {
+                var size = TypeSizes.UnboxedSize(member.FieldType, pointerSize);
+                return accessSize > 0 && member.FieldType.IsValueType && size > 0 && size < accessSize
+                    ? null
+                    : (chain, member);
+            }
+        }
+    }
+
     internal static FieldReference? ResolvePartialStructAccess(FieldAnalysisContext field, LocalVariable receiver,
-        int offset, int width, int pointerSize)
+        int offset, int width, int pointerSize, IReadOnlyList<FieldAnalysisContext>? containingFields = null)
     {
         // A static field may be the outermost parent (Vector3.oneVector.x); FieldReference.IsStatic
         // then roots the access at the static storage instead of the receiver.
         if (width <= 0) return null;
-        var parents = new List<FieldAnalysisContext>();
+        var parents = new List<FieldAnalysisContext>(containingFields ?? []);
         var seen = new HashSet<TypeAnalysisContext>();
         while (field.FieldType is { IsValueType: true } type && seen.Add(type)
             && type is not GenericInstanceTypeAnalysisContext && type.GenericParameters.Count == 0
