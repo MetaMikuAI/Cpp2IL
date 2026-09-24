@@ -6,9 +6,12 @@ using System.Reflection;
 using Cpp2IL.Core.Extensions;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.Il2CppApiFunctions;
+using Cpp2IL.Core.InstructionSets;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
+using Disarm;
+using Disarm.InternalDisassembly;
 using LibCpp2IL;
 using LibCpp2IL.BinaryStructures;
 
@@ -1087,11 +1090,14 @@ public static class MetadataResolver
             if (!method.AppContext.MethodsByAddress.TryGetValue(target.UnsignedValue, out var candidates))
             {
                 // A concrete generic implementation can be present in the binary metadata without
-                // having a normal method candidate (for example an adjustor/thunk-only entry).
+                // having a normal method candidate (for example an adjustor/thunk-only entry), and a
+                // generic instantiation the metadata never registered still has a real managed body.
                 // Restrict this fallback to addresses explicitly listed as concrete generic
-                // implementations; arbitrary native/runtime calls may reuse an X1 value that looks
-                // like a MethodInfo* after register allocation.
-                if (!method.AppContext.Binary.ConcreteGenericImplementationsByAddress.ContainsKey(target.UnsignedValue))
+                // implementations, or to unregistered bodies of the generic method in the MethodInfo;
+                // arbitrary native/runtime calls may reuse an X1 value that looks like a MethodInfo*
+                // after register allocation.
+                var registered = method.AppContext.Binary.ConcreteGenericImplementationsByAddress.ContainsKey(target.UnsignedValue);
+                if (!registered && !MayBeUnregisteredGenericBody(method.AppContext, target.UnsignedValue, representedMethod))
                     continue;
 
                 // Il2CPP still passes the concrete MethodInfo as the hidden final parameter, so use
@@ -1105,8 +1111,12 @@ public static class MetadataResolver
                     + (representedMethod.AppContext.InstructionSet.CallingConventionResolver?.ReturnsViaHiddenBuffer(representedMethod) == true ? 1 : 0)
                     + (representedMethod.IsStatic ? 0 : 1) + representedMethod.Parameters.Count;
 
+                // Nothing but the MethodInfo identifies an unregistered body, so it must be the one
+                // in the hidden parameter slot of the method it represents, and set for this call.
                 if (hiddenParamIndex >= instruction.Operands.Count
-                    || AsMethodInfo(instruction.Operands[hiddenParamIndex]) == null)
+                    || AsMethodInfo(instruction.Operands[hiddenParamIndex]) is not { } hiddenMethodInfo
+                    || !registered && (!ReferenceEquals(hiddenMethodInfo.RepresentedMethod, representedMethod)
+                        || !SetsArgumentRegisterAfterLastCall(method, instruction, hiddenParamIndex - firstArg)))
                     continue;
 
                 instruction.SetOperand(0, representedMethod);
@@ -1133,6 +1143,73 @@ public static class MetadataResolver
         }
 
         return changed;
+    }
+
+    // A call target outside MethodsByAddress may still be the shared or value-type body of a generic
+    // method: those bodies serve several instantiations, so metadata need not list the address. Accept
+    // only managed code that no runtime helper, export or import stub accounts for, and leave the
+    // address out of MethodsByAddress; the caller's MethodInfo, not the address, identifies the method.
+    private static bool MayBeUnregisteredGenericBody(ApplicationAnalysisContext app, ulong target, MethodAnalysisContext represented)
+    {
+        if (target < app.ManagedCodeStart || target > app.ManagedCodeEnd)
+            return false;
+
+        if (represented is not ConcreteGenericMethodAnalysisContext { MethodGenericParameters.Count: > 0 }
+            && represented.DeclaringType is not GenericInstanceTypeAnalysisContext { GenericArguments.Count: > 0 })
+            return false;
+
+        return !app.GetOrCreateKeyFunctionAddresses().IsKeyFunctionAddress(target)
+               && !app.Binary.IsExportedFunction(target)
+               && !Arm64ImportResolver.IsImportStub(app.Binary, target);
+    }
+
+    // Lifting keeps argument registers live across calls, so the MethodInfo* loaded for an earlier call
+    // can still occupy this call's hidden parameter register, even when this callee takes no MethodInfo
+    // at all. Require the native code to set that register after the last call before this one, within
+    // the call's block. Only ARM64 is checked; elsewhere nothing is proven.
+    private static bool SetsArgumentRegisterAfterLastCall(MethodAnalysisContext method, Instruction call, int integerArgument)
+    {
+        if (method.AppContext.InstructionSet is not NewArmV8InstructionSet || integerArgument is < 0 or > 7
+            || call.NativeAddress == 0 || method.ControlFlowGraph!.Blocks.FirstOrDefault(b => b.Instructions.Contains(call)) is not { } block)
+            return false;
+
+        var start = Math.Max(method.UnderlyingPointer,
+            block.Instructions.Where(i => i.NativeAddress != 0).Min(i => i.NativeAddress));
+        var bytes = method.RawBytes.AsSpan();
+        var wide = Arm64Register.X0 + integerArgument;
+        var narrow = Arm64Register.W0 + integerArgument;
+
+        try
+        {
+            for (var pc = call.NativeAddress; pc >= start + 4;)
+            {
+                pc -= 4;
+                var offset = pc - method.UnderlyingPointer;
+                if (offset + 4 > (ulong)bytes.Length)
+                    return false;
+
+                if (Disassembler.Disassemble(bytes.Slice((int)offset, 4), pc, new Disassembler.Options(true, true, false)).ToList() is not [var previous])
+                    return false;
+
+                switch (previous.Mnemonic)
+                {
+                    case Arm64Mnemonic.BL or Arm64Mnemonic.BLR or Arm64Mnemonic.BR
+                        or Arm64Mnemonic.RET or Arm64Mnemonic.RETAA or Arm64Mnemonic.RETAB or Arm64Mnemonic.INVALID:
+                    case Arm64Mnemonic.B when previous.MnemonicConditionCode is Arm64ConditionCode.NONE or Arm64ConditionCode.AL:
+                        return false;
+                    case Arm64Mnemonic.LDR or Arm64Mnemonic.LDUR or Arm64Mnemonic.MOV or Arm64Mnemonic.ADD
+                        or Arm64Mnemonic.ADRP or Arm64Mnemonic.ORR when previous.Op0Reg == wide || previous.Op0Reg == narrow:
+                    case Arm64Mnemonic.LDP when previous.Op0Reg == wide || previous.Op1Reg == wide:
+                        return true;
+                }
+            }
+        }
+        catch (Exception)
+        {
+            return false; // undecodable code proves nothing
+        }
+
+        return false;
     }
 
     private static bool CanSpecializeSharedGeneric(MethodAnalysisContext current, MethodAnalysisContext represented)

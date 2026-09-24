@@ -73,6 +73,16 @@ public class ApplicationAnalysisContext : ContextWithDataStorage
     public readonly Dictionary<ulong, List<MethodAnalysisContext>> MethodsByAddress = new();
 
     /// <summary>
+    /// The lowest and highest entry point of a managed method body (a method definition or a concrete generic
+    /// method) in <see cref="MethodsByAddress"/>. The runtime addresses internal calls are registered under are
+    /// not managed code and are excluded. Both are zero if there are no managed bodies.
+    /// </summary>
+    public ulong ManagedCodeStart { get; private set; }
+
+    /// <inheritdoc cref="ManagedCodeStart"/>
+    public ulong ManagedCodeEnd { get; private set; }
+
+    /// <summary>
     /// Exception type name thrown by the runtime helper at each address, or null where the address turned
     /// out not to be a throw helper. Populated on demand by <see cref="Analysis.ThrowHelperRecovery"/>.
     /// </summary>
@@ -154,6 +164,7 @@ public class ApplicationAnalysisContext : ContextWithDataStorage
                 MethodsByAddress.Add(ptr, []);
 
             MethodsByAddress[ptr].Add(m);
+            IncludeInManagedCode(ptr);
         });
 
         Logger.VerboseNewline("\tProcessing internal calls...");
@@ -174,6 +185,7 @@ public class ApplicationAnalysisContext : ContextWithDataStorage
                 MethodsByAddress[ptr] = [];
 
             MethodsByAddress[ptr].Add(gm);
+            IncludeInManagedCode(ptr);
             ConcreteGenericMethodsByRef[methodRef] = gm;
 
             if (methodRef.AdjustorThunkPtr != 0
@@ -193,6 +205,18 @@ public class ApplicationAnalysisContext : ContextWithDataStorage
             }
 #endif
         }
+    }
+
+    private void IncludeInManagedCode(ulong ptr)
+    {
+        if (ptr == 0)
+            return; // abstract, or no body
+
+        if (ManagedCodeStart == 0 || ptr < ManagedCodeStart)
+            ManagedCodeStart = ptr;
+
+        if (ptr > ManagedCodeEnd)
+            ManagedCodeEnd = ptr;
     }
 
     // ICalls are implemented as a stub that tail-jumps into the runtime (e.g. Math.Ceiling => the c runtime's
