@@ -435,6 +435,17 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         var convention = new Arm64CallingConventionResolver();
         var arguments = convention.ResolveForManaged(context);
         var prologue = new List<Instruction>();
+        // Generic composite size/alignment is not yet reliable enough to change
+        // return storage (e.g. ValueTuple<bool, Vector3> fits in two X registers).
+        if (context.ReturnType is not GenericInstanceTypeAnalysisContext
+            && convention.HiddenReturnBufferRegister(context) is { } buffer)
+        {
+            // X8 is caller-saved: preserve the incoming buffer, not its value at RET.
+            var incomingBuffer = new Register(null, "hidden_return_buffer");
+            prologue.Add(new Instruction(-1, OpCode.Move, incomingBuffer, buffer));
+            foreach (var ret in instructions.Where(i => i.OpCode == OpCode.Return))
+                ret.SetOperands(incomingBuffer);
+        }
         for (var i = 0; i < context.Parameters.Count; i++)
         {
             var position = i + (context.IsStatic ? 0 : 1);

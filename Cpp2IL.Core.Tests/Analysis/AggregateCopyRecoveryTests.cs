@@ -147,4 +147,63 @@ public class AggregateCopyRecoveryTests
         Assert.That(stores.All(i => i.OpCode == OpCode.Move), Is.True);
         Assert.That(loads.All(i => i.OpCode == OpCode.Move), Is.True);
     }
+    [TestCase("ok", true)]
+    [TestCase("missing", false)]
+    [TestCase("overlap", false)]
+    [TestCase("extraUse", false)]
+    [TestCase("call", false)]
+    [TestCase("wrongBuffer", false)]
+    [TestCase("wrongType", false)]
+    public void RecoversOnlyCompleteUnobservedFieldToReturnBufferCopy(string problem, bool expected)
+    {
+        var (method, loads, stores) = Copy(generic: false);
+        _app.InstructionSet = new InstructionSets.NewArmV8InstructionSet();
+        var owner = method.ParameterLocals[0];
+        var type = method.ParameterLocals[1].Type!;
+        var field = owner.Type!.Fields.Single(f => f.Name == "m_CachedPtr");
+        var buffer = new LocalVariable("returnBuffer", new Register(null, "X8", -1), type);
+        var targetMethod = new InjectedMethodAnalysisContext(owner.Type, "Get", type, MethodAttributes.Public, [])
+        {
+            Locals = [owner, buffer, .. loads.Select(l => (LocalVariable)l.Operands[0])],
+            ParameterLocals = [owner]
+        };
+        foreach (var load in loads)
+        {
+            var memory = (MemoryOperand)load.Operands[1];
+            memory.Base = owner;
+            memory.Addend += field.Offset;
+            load.SetOperand(1, memory);
+        }
+        foreach (var store in stores)
+        {
+            var memory = (MemoryOperand)store.Operands[0];
+            memory.Base = problem == "wrongBuffer" ? owner : buffer;
+            memory.Addend -= field.Offset;
+            store.SetOperand(0, memory);
+        }
+        List<Instruction> instructions = [.. loads, .. stores, new(200, OpCode.Return, buffer)];
+        switch (problem)
+        {
+            case "missing": instructions.Remove(stores[0]); break;
+            case "overlap":
+                var read = (MemoryOperand)loads[1].Operands[1]; read.Addend--;
+                var write = (MemoryOperand)stores[0].Operands[0]; write.Addend--;
+                loads[1].SetOperand(1, read); stores[0].SetOperand(0, write);
+                break;
+            case "extraUse": instructions.Insert(0, new(80, OpCode.Move, owner, loads[0].Operands[0])); break;
+            case "call": instructions.Insert(loads.Count, new(80, OpCode.CallVoid, new Immediate(123))); break;
+            case "wrongType": field.FieldType = _app.SystemTypes.SystemInt32Type; break;
+        }
+        targetMethod.ControlFlowGraph = new ISILControlFlowGraph(instructions);
+        Assert.That(AggregateCopyRecovery.Run(targetMethod), Is.EqualTo(expected));
+        if (expected)
+        {
+            Assert.That(stores[0].Operands[0], Is.SameAs(buffer));
+            var source = (FieldReference)stores[0].Operands[1];
+            Assert.That(source.Local, Is.SameAs(owner));
+            Assert.That(source.Field, Is.SameAs(field));
+            Assert.That(loads.All(l => l.OpCode == OpCode.Nop), Is.True);
+            Assert.That(AggregateCopyRecovery.Run(targetMethod), Is.False);
+        }
+    }
 }

@@ -126,4 +126,43 @@ public class Arm64ArgumentSlotTests
         Assert.That(instructions[^1].OpCode, Is.EqualTo(OpCode.Return));
         Assert.That(method.StackAggregates, Has.Count.EqualTo(1));
     }
+    [Test]
+    public void HiddenReturnUsesIncomingBufferEvenWhenX8IsClobbered()
+    {
+        var type = app.AllTypes.Single(t => t.FullName == "UnityEngine.Bounds");
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Get", type,
+            MethodAttributes.Public, []);
+        var ret = new Instruction(2, OpCode.Return, new Register(null, "X0"));
+        var instructions = new System.Collections.Generic.List<Instruction>
+        {
+            new(0, OpCode.Move, new Register(null, "X19"), new Register(null, "X8")),
+            new(1, OpCode.Move, new Register(null, "X8"), new Immediate(123)), ret
+        };
+        InstructionSets.NewArmV8InstructionSet.RecoverFloatingAggregateBoundary(method, instructions);
+        Assert.That(instructions[0].OpCode, Is.EqualTo(OpCode.Move));
+        Assert.That(((Register)instructions[0].Operands[1]).Name, Is.EqualTo("X8"));
+        Assert.That(ret.Operands[0], Is.EqualTo(instructions[0].Operands[0]));
+        Assert.That(((Register)ret.Operands[0]).Name, Is.Not.EqualTo("X8"));
+    }
+    [Test]
+    public void DoesNotRedirectGenericCompositeReturnFromUnprovenSize()
+    {
+        // The stripped fixture has no ValueTuple; model a generic composite whose
+        // metadata size would otherwise trigger the hidden-buffer convention.
+        var definition = app.AllTypes.Single(t => t.FullName == "UnityEngine.Bounds");
+        var parameter = new GenericParameterTypeAnalysisContext("T", 0,
+            LibCpp2IL.BinaryStructures.Il2CppTypeEnum.IL2CPP_TYPE_VAR,
+            GenericParameterAttributes.None, definition);
+        definition.GenericParameters.Add(parameter);
+        var type = definition.MakeGenericInstanceType([app.SystemTypes.SystemInt32Type]);
+        Assert.That(convention.ReturnsViaHiddenBuffer(new InjectedMethodAnalysisContext(
+            app.SystemTypes.SystemObjectType, "Probe", type, MethodAttributes.Public, [])), Is.True);
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Get", type,
+            MethodAttributes.Public, []);
+        var ret = new Instruction(0, OpCode.Return, new Register(null, "X0"));
+        var instructions = new System.Collections.Generic.List<Instruction> { ret };
+        InstructionSets.NewArmV8InstructionSet.RecoverFloatingAggregateBoundary(method, instructions);
+        Assert.That(instructions, Has.Count.EqualTo(1));
+        Assert.That(((Register)ret.Operands[0]).Name, Is.EqualTo("X0"));
+    }
 }
