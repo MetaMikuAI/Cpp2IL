@@ -27,6 +27,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
     // GetIsilFromMethod runs in parallel, so cache resolved intrinsics concurrently.
     private readonly ConcurrentDictionary<(string Name, bool IsDouble, int ParameterCount), MethodAnalysisContext?> _mathMethods = new();
+    private readonly ConcurrentDictionary<Arm64ImportResolver.NativeMathFunction, MethodAnalysisContext?> _nativeMathMethods = new();
 
     private readonly ConcurrentDictionary<(ApplicationAnalysisContext App, ulong Target), TypeAnalysisContext?> _nullCheckHelpers = new();
 
@@ -131,6 +132,20 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             }
 
             return null;
+        });
+
+    // The managed method with exactly the C function's signature: no conversion may be implied.
+    internal MethodAnalysisContext? ResolveNativeMathMethod(ApplicationAnalysisContext app, Arm64ImportResolver.NativeMathFunction math)
+        => _nativeMathMethods.GetOrAdd(math, key =>
+        {
+            var type = key.IsDouble ? app.SystemTypes.SystemDoubleType : app.SystemTypes.SystemSingleType;
+            var mathType = app.GetAssemblyByName("mscorlib")?.GetTypeByFullName(key.TypeName);
+            var parameterCount = key.Arity + (key.Kind == Arm64ImportResolver.NativeMathKind.ModF ? 1 : 0);
+            return mathType?.Methods.SingleOrDefault(m => m.IsStatic && m.Name == key.MethodName
+                && m.ReturnType == type && m.Parameters.Count == parameterCount
+                && m.Parameters.Take(key.Arity).All(p => p.ParameterType == type)
+                && (key.Kind != Arm64ImportResolver.NativeMathKind.ModF
+                    || m.Parameters[^1].ParameterType is PointerTypeAnalysisContext { ElementType: var element } && element == type));
         });
 
     public override BinarySlice GetRawBytesForMethod(MethodAnalysisContext context, bool isAttributeGenerator)
@@ -744,12 +759,67 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                                 accessSize: field.FieldType.FullName == "System.Single" ? 4 : 8));
                     }
             }
-            else
+            else if (!TryAddNativeMath(target))
             {
                 // Not a managed method, so we don't know its signature, preserve all argument registers
                 var call = Add(address, OpCode.Call, Imm(target), new Register(null, "X0"));
                 call.AddOperands(CallingConventions.ResolveForUnmanaged(context.AppContext, target));
             }
+        }
+
+        // A call to a C math import whose definition is that of a managed operation. The C signature
+        // places every argument and the result in floating-point registers (ModF's pointer excepted).
+        bool TryAddNativeMath(ulong target)
+        {
+            if (Arm64ImportResolver.MathFunction(Arm64ImportResolver.Resolve(context.AppContext.Binary, target)) is not { } math)
+                return false;
+
+            // Scalar operations do not agree on whether S<n> of a register also used as V<n>.2S is named as
+            // lane 0 or as the whole register, so the value passed in such a register cannot be identified.
+            if (!math.IsDouble && Enumerable.Range(0, math.Arity)
+                    .Any(number => twoSLaneRegisters.Contains(NormalizeRegister(Arm64Register.S0 + number))))
+                return false;
+
+            IOperand Argument(int number) => Reg((math.IsDouble ? Arm64Register.D0 : Arm64Register.S0) + number);
+
+            if (math.Kind == Arm64ImportResolver.NativeMathKind.Remainder)
+            {
+                Add(address, OpCode.Modulo, Argument(0), Argument(0), Argument(1));
+                return true;
+            }
+
+            if (ResolveNativeMathMethod(context.AppContext, math) is { } method)
+            {
+                var operands = new List<IOperand>(math.Arity + 3) { method, Argument(0) };
+                for (var i = 0; i < math.Arity; i++)
+                    operands.Add(Argument(i));
+                if (math.Kind == Arm64ImportResolver.NativeMathKind.ModF)
+                    operands.Add(Reg(Arm64Register.X0));
+
+                Add(address, OpCode.Call, operands);
+                return true;
+            }
+
+            // Without the single-precision method in the metadata no managed call to it was compiled here.
+            // The float function is then the compiler's narrowing of the double-precision method applied to
+            // the widened arguments, (float)Math.Sin((double)x), which is what the IL evaluates.
+            if (math.Kind != Arm64ImportResolver.NativeMathKind.Method || math.IsDouble
+                || ResolveNativeMathMethod(context.AppContext, math with { TypeName = "System.Math", IsDouble = true }) is not { } wide)
+                return false;
+
+            var types = context.AppContext.SystemTypes;
+            var widened = new List<IOperand>(math.Arity + 2) { wide, Reg(Arm64Register.D0) };
+            for (var i = 0; i < math.Arity; i++)
+            {
+                Add(address, OpCode.ConvertNumeric, Reg(Arm64Register.D0 + i), Argument(i),
+                    new NumericConversion(types.SystemSingleType, types.SystemDoubleType));
+                widened.Add(Reg(Arm64Register.D0 + i));
+            }
+
+            Add(address, OpCode.Call, widened);
+            Add(address, OpCode.ConvertNumeric, Argument(0), Reg(Arm64Register.D0),
+                new NumericConversion(types.SystemDoubleType, types.SystemSingleType));
+            return true;
         }
 
         // AAPCS64 returns aggregates larger than 16 bytes through X8, which points at a caller

@@ -390,6 +390,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         FlagConditionRecovery.Run(this);
         DeadCodeEliminator.Run(this);
 
+        // Stack-protector epilogues compare a guard the method's IL cannot overwrite; drop their failure paths.
+        StackProtectorRecovery.Run(this);
+
         // Resolve call targets, strings and getters, then run the combined type-propagation and
         // field-resolution fixpoint - all while still in SSA form, so every local is
         // single-assignment and a type, once known, is stable for that value.

@@ -146,6 +146,28 @@ public class NewArm64KeyFunctionAddresses : BaseKeyFunctionAddresses
         return DecodeBranchThunk(System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(bytes.Slice((int)raw, 4)), thunkAddress);
     }
 
+    protected override ulong GetGuardedTailCallTarget(ulong address)
+    {
+        var raw = _appContext.Binary.MapVirtualAddressToRaw(address, false);
+        var bytes = _appContext.Binary.GetRawBinaryContent();
+        if (address == 0 || raw < 0 || raw > bytes.Length - 16 || _appContext.Binary.IsBigEndian) return 0;
+        var words = new uint[4];
+        for (var i = 0; i < 4; i++)
+            words[i] = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(bytes.Slice((int)raw + 4 * i, 4));
+        return DecodeGuardedTailCall(words, address);
+    }
+
+    // ldr wN, [x0, #imm]; cbz wN, +8; ret; b target
+    internal static ulong DecodeGuardedTailCall(IReadOnlyList<uint> words, ulong address)
+    {
+        if (words.Count < 4 || (words[0] & 0xFFC003E0) != 0xB9400000)
+            return 0;
+        var flag = words[0] & 0x1F;
+        if (words[1] != (0x34000040u | flag) || words[2] != 0xD65F03C0)
+            return 0;
+        return DecodeBranchThunk(words[3], address + 12);
+    }
+
     internal static ulong DecodeBranchThunk(uint word, ulong thunkAddress)
     {
         if ((word & 0xfc000000) != 0x14000000) return 0;

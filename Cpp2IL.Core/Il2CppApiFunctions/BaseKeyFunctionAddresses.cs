@@ -76,6 +76,22 @@ public abstract class BaseKeyFunctionAddresses
     /// </summary>
     public ulong ResolveKeyFunctionAddress(ulong address)
     {
+        if (FollowBranchThunks(address) is var resolved and not 0)
+            return resolved;
+
+        // A function that tests a flag of the class passed to it and then either returns or tail-calls a class
+        // initializer with that class is a class-initialization call too: class initialization is not part of
+        // the IL, and running an initializer for a class that needs none has no effect.
+        var initializer = FollowBranchThunks(GetGuardedTailCallTarget(address));
+        return initializer != 0 && (initializer == il2cpp_codegen_runtime_class_init
+                                    || initializer == il2cpp_runtime_class_init_actual
+                                    || initializer == il2cpp_runtime_class_init_export)
+            ? initializer
+            : 0;
+    }
+
+    private ulong FollowBranchThunks(ulong address)
+    {
         for (var hops = 0; address != 0 && hops <= MaxThunkHops; hops++)
         {
             if (resolvedAddressSet.Contains(address))
@@ -92,6 +108,13 @@ public abstract class BaseKeyFunctionAddresses
     /// Calling such a function is calling its target: the branch leaves every argument and the return address as they are.
     /// </summary>
     protected virtual ulong GetBranchThunkTarget(ulong address) => 0;
+
+    /// <summary>
+    /// If the function at <paramref name="address"/> only loads a field of the object passed as its first argument
+    /// and, depending on it, either returns or tail-calls another function with its arguments unchanged, returns
+    /// that function, else 0.
+    /// </summary>
+    protected virtual ulong GetGuardedTailCallTarget(ulong address) => 0;
 
     private void FindExport(string name, out ulong ptr)
     {
