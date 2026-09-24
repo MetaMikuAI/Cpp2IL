@@ -280,11 +280,36 @@ public static class LocalVariables
             changed |= PropagateFromCallParameters(method);
             changed |= AggregateCopyRecovery.Run(method);
             changed |= MetadataResolver.ResolveFieldOffsets(method);
+            changed |= RefineObjectFieldLoads(method);
             changed |= RgctxResolver.Run(method);
             changed |= PropagateStaticFieldStorage(method);
             changed |= TypeAddressedLocals(method);
             changed |= PropagateTypesOnce(method);
         }
+    }
+
+    // A call taking object constrains assignability, not the actual type of a field load.
+    // Refine only single-definition loads while still in SSA; never narrow phi/merged values.
+    private static bool RefineObjectFieldLoads(MethodAnalysisContext method)
+    {
+        var instructions = method.ControlFlowGraph!.Instructions;
+        var definitions = instructions.Where(i => i.Destination is LocalVariable)
+            .GroupBy(i => (LocalVariable)i.Destination!).ToDictionary(g => g.Key, g => g.Count());
+        var changed = false;
+        foreach (var instruction in instructions)
+        {
+            if (instruction is not { OpCode: OpCode.Move,
+                Operands: [LocalVariable destination, FieldReference field] }
+                || destination.Type != method.AppContext.SystemTypes.SystemObjectType
+                || definitions[destination] != 1
+                || field.Field.FieldType is not { IsValueType: false } type
+                || type == destination.Type
+                || type is PointerTypeAnalysisContext or ByRefTypeAnalysisContext or GenericParameterTypeAnalysisContext)
+                continue;
+            destination.Type = type;
+            changed = true;
+        }
+        return changed;
     }
 
     // A type-metadata global load (Move local, typeof(T)) puts the runtime class pointer for T into
