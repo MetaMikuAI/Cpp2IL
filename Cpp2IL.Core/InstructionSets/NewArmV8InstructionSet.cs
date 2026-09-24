@@ -168,7 +168,15 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
     public override List<IOperand> GetParameterOperandsFromMethod(MethodAnalysisContext context)
     {
-        return CallingConventions.ResolveForManaged(context).ToList();
+        var operands = CallingConventions.ResolveForManaged(context).ToList();
+        for (var i = 0; i < context.Parameters.Count; i++)
+        {
+            var position = i + (context.IsStatic ? 0 : 1);
+            if (operands[position] is Register { Name: var name } && name.StartsWith("V")
+                && Arm64CallingConventionResolver.FloatingAggregateFields(context.Parameters[i].ParameterType) != null)
+                operands[position] = new Register(null, $"hfa_parameter_{i}");
+        }
+        return operands;
     }
 
     public override ulong GetInternalCallTarget(MethodAnalysisContext method)
@@ -416,9 +424,49 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             instruction.SetOperand(0, targetInstruction);
         }
 
+        RecoverFloatingAggregateBoundary(context, instructions);
         adrpOffsets.Clear();
         integerConstants.Clear();
         return instructions;
+    }
+
+    internal static void RecoverFloatingAggregateBoundary(MethodAnalysisContext context, List<Instruction> instructions)
+    {
+        var convention = new Arm64CallingConventionResolver();
+        var arguments = convention.ResolveForManaged(context);
+        var prologue = new List<Instruction>();
+        for (var i = 0; i < context.Parameters.Count; i++)
+        {
+            var position = i + (context.IsStatic ? 0 : 1);
+            if (arguments[position] is not Register first || !first.Name.StartsWith("V")
+                || Arm64CallingConventionResolver.FloatingAggregateFields(context.Parameters[i].ParameterType) is not { } fields)
+                continue;
+            var number = int.Parse(first.Name[1..]);
+            foreach (var field in fields)
+                prologue.Add(new Instruction(-1, OpCode.Move, new Register(null, $"V{number++}"),
+                    new MemoryOperand(new Register(null, $"hfa_parameter_{i}"), addend: field.Offset,
+                        accessSize: field.FieldType.FullName == "System.Single" ? 4 : 8)));
+        }
+        instructions.InsertRange(0, prologue);
+        if (Arm64CallingConventionResolver.FloatingAggregateFields(context.ReturnType) is { } returnFields)
+        {
+            foreach (var ret in instructions.Where(i => i.OpCode == OpCode.Return).ToArray())
+            {
+                var aggregate = new Register(null, $"hfa_return_{instructions.IndexOf(ret)}");
+                context.StackAggregates[aggregate.Number] = context.ReturnType;
+                var stores = returnFields.Select((field, i) => new Instruction(-1, OpCode.Move,
+                    new MemoryOperand(aggregate, addend: field.Offset,
+                        accessSize: field.FieldType.FullName == "System.Single" ? 4 : 8),
+                    new Register(null, $"V{i}"))).ToList();
+                // Keep the original instruction object: branches to RET must execute the packing too.
+                ret.OpCode = OpCode.Move;
+                ret.SetOperands(stores[0].Operands[0], stores[0].Operands[1]);
+                stores.RemoveAt(0);
+                stores.Add(new Instruction(-1, OpCode.Return, aggregate));
+                instructions.InsertRange(instructions.IndexOf(ret) + 1, stores);
+            }
+        }
+        for (var i = 0; i < instructions.Count; i++) instructions[i].Index = i;
     }
 
     /// <summary>
@@ -644,14 +692,46 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     }
                 }
 
+                var managedArguments = CallingConventions.ResolveForManaged(ctx);
+                // Materialize managed aggregates at the ABI boundary; SIMD components remain
+                // independent SSA values so a caller can replace x while preserving y.
+                for (var parameter = 0; parameter < ctx.Parameters.Count; parameter++)
+                {
+                    var position = parameter + (ctx.IsStatic ? 0 : 1);
+                    var type = ctx.Parameters[parameter].ParameterType;
+                    if (managedArguments[position] is not Register first || !first.Name.StartsWith("V")
+                        || Arm64CallingConventionResolver.FloatingAggregateFields(type) is not { } fields)
+                        continue;
+                    var aggregate = new Register(null, $"hfa_arg_{address:X}_{parameter}");
+                    context.StackAggregates[aggregate.Number] = type;
+                    var number = int.Parse(first.Name[1..]);
+                    foreach (var field in fields)
+                    {
+                        var size = field.FieldType.FullName == "System.Single" ? 4 : 8;
+                        Add(address, OpCode.Move, new MemoryOperand(aggregate, addend: field.Offset, accessSize: size),
+                            new Register(null, $"V{number++}"));
+                    }
+                    managedArguments[position] = aggregate;
+                }
+                var returnFields = Arm64CallingConventionResolver.FloatingAggregateFields(ctx.ReturnType);
+                Register? aggregateResult = returnFields == null ? null : new Register(null, $"hfa_ret_{address:X}");
+                if (aggregateResult != null) context.StackAggregates[aggregateResult.Value.Number] = ctx.ReturnType;
                 var returnDestination = ctx.IsVoid
                     ? null
-                    : HiddenReturnBufferDestination(ctx) ?? CallingConventions.ReturnRegister(ctx);
+                    : aggregateResult ?? HiddenReturnBufferDestination(ctx) ?? CallingConventions.ReturnRegister(ctx);
                 var call = ctx.IsVoid
                     ? Add(address, OpCode.CallVoid, Imm(target))
                     : Add(address, OpCode.Call, Imm(target), returnDestination!);
 
-                call.AddOperands(CallingConventions.ResolveForManaged(ctx));
+                call.AddOperands(managedArguments);
+                if (returnFields != null)
+                    for (var component = 0; component < returnFields.Length; component++)
+                    {
+                        var field = returnFields[component];
+                        Add(address, OpCode.Move, new Register(null, $"V{component}"),
+                            new MemoryOperand(aggregateResult!.Value, addend: field.Offset,
+                                accessSize: field.FieldType.FullName == "System.Single" ? 4 : 8));
+                    }
             }
             else
             {

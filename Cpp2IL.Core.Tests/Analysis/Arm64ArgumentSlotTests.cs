@@ -88,4 +88,42 @@ public class Arm64ArgumentSlotTests
         Assert.That(((StackOffset)args[preceding + 1]).Offset, Is.EqualTo(spills ? 16 : 0));
         Assert.That(((StackOffset)args[preceding + 2]).Offset, Is.EqualTo(spills ? 24 : 8));
     }
+    [TestCase(2)]
+    [TestCase(3)]
+    [TestCase(4)]
+    public void FloatingAggregateReservesAllComponents(int count)
+    {
+        // Use the matching real metadata size rather than Decimal's fixed 16 bytes.
+        pair = app.AllTypes.Single(t => t.FullName == $"UnityEngine.Vector{count}");
+        pair.Fields.Clear();
+        for (var i = 0; i < count; i++)
+            pair.Fields.Add(new InjectedFieldAnalysisContext($"f{i}", app.SystemTypes.SystemSingleType, FieldAttributes.Public, pair, i * 4));
+        Assert.That(Arm64CallingConventionResolver.FloatingAggregateFields(pair), Has.Length.EqualTo(count));
+        var target = Method(true, pair, app.SystemTypes.SystemSingleType, app.SystemTypes.SystemInt32Type);
+        Assert.That(convention.ResolveForManaged(target).Cast<Register>().Select(r => r.Name),
+            Is.EqualTo(new[] { "X0", "V0", $"V{count}", "X1", "X2" }));
+        Assert.That(Arm64CallingConventionResolver.FloatingAggregateFields(app.SystemTypes.SystemSingleType), Is.Null);
+        pair.Fields[1].Offset++;
+        Assert.That(Arm64CallingConventionResolver.FloatingAggregateFields(pair), Is.Null);
+    }
+
+    [Test]
+    public void FloatingAggregateBoundaryUnpacksParametersAndPacksBranchTargetReturns()
+    {
+        pair.Fields.Clear();
+        for (var i = 0; i < 4; i++)
+            pair.Fields.Add(new InjectedFieldAnalysisContext($"f{i}", app.SystemTypes.SystemSingleType, FieldAttributes.Public, pair, i * 4));
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Identity", pair,
+            MethodAttributes.Public | MethodAttributes.Static, [pair]);
+        var ret = new Instruction(1, OpCode.Return, new Register(null, "X0"));
+        var jump = new Instruction(0, OpCode.Jump, ret);
+        var instructions = new System.Collections.Generic.List<Instruction> { jump, ret };
+        InstructionSets.NewArmV8InstructionSet.RecoverFloatingAggregateBoundary(method, instructions);
+        Assert.That(instructions, Has.Count.EqualTo(10));
+        Assert.That(instructions.Take(4).All(i => i.Operands[1] is MemoryOperand), Is.True);
+        Assert.That(jump.Operands[0], Is.SameAs(ret));
+        Assert.That(ret.OpCode, Is.EqualTo(OpCode.Move));
+        Assert.That(instructions[^1].OpCode, Is.EqualTo(OpCode.Return));
+        Assert.That(method.StackAggregates, Has.Count.EqualTo(1));
+    }
 }

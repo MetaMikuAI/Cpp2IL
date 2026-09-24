@@ -27,7 +27,7 @@ public class Arm64CallingConventionResolver : BaseCallingConventionResolver
             return false;
 
         var returnType = ctx.ReturnType;
-        if (!returnType.IsValueType || IsFloatingPoint(returnType))
+        if (!returnType.IsValueType || IsFloatingPoint(returnType) || FloatingAggregateFields(returnType) != null)
             return false;
 
         var size = TypeSizes.UnboxedSize(returnType, PtrSize);
@@ -76,6 +76,22 @@ public class Arm64CallingConventionResolver : BaseCallingConventionResolver
         return ((offset + alignment - 1) & -alignment) == TypeSizes.UnboxedSize(type, PtrSize) ? 2 : 1;
     }
 
+    // Flat homogeneous floating aggregates use consecutive SIMD registers, not X registers.
+    internal static FieldAnalysisContext[]? FloatingAggregateFields(TypeAnalysisContext type)
+    {
+        if (!type.IsValueType || IsFloatingPoint(type) || type.IsEnumType || type is GenericInstanceTypeAnalysisContext
+            || type.GenericParameters.Count != 0 || type.Definition is not { PackingSize: 0 }
+            || (type.Attributes & TypeAttributes.LayoutMask) == TypeAttributes.ExplicitLayout)
+            return null;
+        var fields = type.Fields.Where(f => !f.IsStatic).OrderBy(f => f.Offset).ToArray();
+        if (fields.Length is < 1 or > 4) return null;
+        var scalar = fields[0].FieldType;
+        var size = scalar.FullName == "System.Single" ? 4 : scalar.FullName == "System.Double" ? 8 : 0;
+        if (size == 0 || fields.Where((f, i) => f.FieldType != scalar || f.Offset != i * size).Any()
+            || TypeSizes.UnboxedSize(type, PtrSize) != fields.Length * size) return null;
+        return fields;
+    }
+
     public override IOperand[] ResolveForManaged(MethodAnalysisContext ctx)
     {
         var args = new List<IOperand>();
@@ -87,6 +103,19 @@ public class Arm64CallingConventionResolver : BaseCallingConventionResolver
         void AddParameter(ParameterAnalysisContext? par)
         {
             var slots = par == null ? 1 : IntegerArgumentSlots(par);
+            if (par != null && FloatingAggregateFields(par.ParameterType) is { } fields)
+            {
+                if (floating + fields.Length <= FloatRegisters.Length)
+                {
+                    args.Add(new Register(null, FloatRegisters[floating]));
+                    floating += fields.Length;
+                    return;
+                }
+                floating = FloatRegisters.Length;
+                args.Add(new StackOffset(stack));
+                stack += (int)((TypeSizes.UnboxedSize(par.ParameterType, PtrSize) + 7) & ~7L);
+                return;
+            }
             if (par != null && IsFloatingPoint(par))
             {
                 if (floating < FloatRegisters.Length)

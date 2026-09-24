@@ -46,6 +46,7 @@ public class StackAnalyzer
 
         analyzer.ResolveFrameAliases(graph);
         analyzer.CorrectOffsets(graph);
+        StackReceiverRecovery.Run(method);
         StackBoxingRecovery.Run(method);
         StackAggregateRecovery.Run(method);
         ReplaceStackWithRegisters(method);
