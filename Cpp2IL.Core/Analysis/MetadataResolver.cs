@@ -382,15 +382,18 @@ public static class MetadataResolver
                     // A pair load/store can address a member inside an embedded value type, e.g.
                     // Vector2.y at outerFieldOffset + 4. Resolve the innermost field so IL generation
                     // can use ldflda/stfld instead of leaving an untyped raw memory write behind.
+                    // Static storage holds only its own type's statics, so a static containing field
+                    // (Vector3.oneVector.y) is searched on the owner alone, never on its base types.
                     for (var candidateOwner = genericOwner?.GenericType ?? owner;
                          candidateOwner != null && field == null;
-                         candidateOwner = candidateOwner.BaseType)
+                         candidateOwner = staticOwner == null ? candidateOwner.BaseType : null)
                     {
                         // Generic definition offsets are placeholders, not evidence for an
                         // embedded member when the instantiated layout could not be proven.
                         if (candidateOwner is GenericInstanceTypeAnalysisContext || candidateOwner.GenericParameters.Count > 0)
                             continue;
-                        var containing = candidateOwner.Fields.FirstOrDefault(f => !f.IsStatic
+                        var containing = candidateOwner.Fields.FirstOrDefault(f => f.IsStatic == (staticOwner != null)
+                            && (f.Attributes & FieldAttributes.Literal) == 0
                             && f.FieldType.IsValueType
                             && f.Offset >= 0
                             && f.FieldType.Fields.Any(n => !n.IsStatic
@@ -455,7 +458,9 @@ public static class MetadataResolver
     internal static FieldReference? ResolvePartialStructAccess(FieldAnalysisContext field, LocalVariable receiver,
         int offset, int width, int pointerSize)
     {
-        if (width <= 0 || field.IsStatic) return null;
+        // A static field may be the outermost parent (Vector3.oneVector.x); FieldReference.IsStatic
+        // then roots the access at the static storage instead of the receiver.
+        if (width <= 0) return null;
         var parents = new List<FieldAnalysisContext>();
         var seen = new HashSet<TypeAnalysisContext>();
         while (field.FieldType is { IsValueType: true } type && seen.Add(type)
