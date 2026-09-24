@@ -127,6 +127,7 @@ public class Instruction : IOperand
             case OpCode.Box:
             case OpCode.IsInstance:
             case OpCode.TryCast:
+            case OpCode.Unbox:
             case OpCode.ZeroExtend:
             case OpCode.SignExtend:
                 if (newDestination != null)
@@ -172,7 +173,7 @@ public class Instruction : IOperand
 
             OpCode.Switch => [_operands[0]],
 
-            OpCode.Box or OpCode.IsInstance or OpCode.TryCast => [_operands[2]],
+            OpCode.Box or OpCode.IsInstance or OpCode.TryCast or OpCode.Unbox => [_operands[2]],
 
             OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.MultiplyHighSigned
                 or OpCode.Divide or OpCode.Modulo or OpCode.ShiftLeft or OpCode.ShiftRight

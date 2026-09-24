@@ -786,7 +786,10 @@ public static class IlGenerator
 
             case OpCode.TryCast:
             case OpCode.IsInstance:
-                LoadOperand(instruction.Operands[2], method, locals, writeLine, (TypeAnalysisContext)instruction.Operands[1]);
+                // The operand is an object reference even when the tested type is a value type or type parameter.
+                var testedType = (TypeAnalysisContext)instruction.Operands[1];
+                LoadOperand(instruction.Operands[2], method, locals, writeLine,
+                    testedType.IsValueType || testedType is GenericParameterTypeAnalysisContext ? context.AppContext.SystemTypes.SystemObjectType : testedType);
                 instructions.Add(CilOpCodes.Isinst, ((TypeAnalysisContext)instruction.Operands[1]).ToTypeSignature().ToTypeDefOrRef());
                 if (instruction.OpCode == OpCode.IsInstance)
                 {
@@ -802,6 +805,18 @@ public static class IlGenerator
                     // il2cpp_value_box takes the value by address, but IL boxes it by value
                     LoadOperand(boxedValue is AddressOf { Target: LocalVariable byRef } ? byRef : boxedValue, method, locals, writeLine, boxedType);
                     instructions.Add(CilOpCodes.Box, boxedType.ToTypeSignature().ToTypeDefOrRef());
+                }
+                else
+                    instructions.Add(CilOpCodes.Ldnull);
+
+                StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+                break;
+
+            case OpCode.Unbox:
+                if (instruction.Operands is [_, TypeAnalysisContext { IsValueType: true } unboxedType, var boxedObject])
+                {
+                    LoadOperand(boxedObject, method, locals, writeLine, context.AppContext.SystemTypes.SystemObjectType);
+                    instructions.Add(CilOpCodes.Unbox_Any, unboxedType.ToTypeSignature().ToTypeDefOrRef());
                 }
                 else
                     instructions.Add(CilOpCodes.Ldnull);

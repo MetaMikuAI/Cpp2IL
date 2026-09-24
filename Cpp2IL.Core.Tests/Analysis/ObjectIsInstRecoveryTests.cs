@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using Cpp2IL.Core.Analysis;
@@ -126,5 +127,48 @@ public class ObjectIsInstRecoveryTests
         };
         KeyFunctionRecovery.Run(method);
         Assert.That(call.OpCode, Is.EqualTo(OpCode.Call));
+    }
+
+    [TestCase("valueType", "nullTest", OpCode.IsInstance)]
+    [TestCase("openGeneric", "nullTest", OpCode.IsInstance)]
+    [TestCase("valueType", "returned", OpCode.Call)]
+    [TestCase("openGeneric", "comparedWithOther", OpCode.Call)]
+    [TestCase("reference", "nullTest", OpCode.TryCast)]
+    public void TestsAnyTypeWhenTheResultIsOnlyComparedWithNull(string target, string use, OpCode expected)
+    {
+        Cpp2IlApi.ResetInternalState();
+        var app = TestGameLoader.LoadSimple2019Game();
+        var owner = app.SystemTypes.SystemObjectType;
+        TypeAnalysisContext type = target switch
+        {
+            "valueType" => app.SystemTypes.SystemInt32Type,
+            "openGeneric" => new GenericParameterTypeAnalysisContext("T", 0, LibCpp2IL.BinaryStructures.Il2CppTypeEnum.IL2CPP_TYPE_MVAR,
+                GenericParameterAttributes.None, owner),
+            _ => app.SystemTypes.SystemStringType
+        };
+        var value = new LocalVariable("value", new Register(null, "value"), owner);
+        var other = new LocalVariable("other", new Register(null, "other"), owner);
+        var result = new LocalVariable("result", new Register(null, "result"));
+        var test = new LocalVariable("test", new Register(null, "test"), app.SystemTypes.SystemBooleanType);
+        var call = new Instruction(0, OpCode.Call, new StringLiteral("il2cpp_vm_object_is_inst"), result, value,
+            new RuntimeClassTypeAnalysisContext(type, type.DeclaringAssembly));
+        var consumer = use switch
+        {
+            "returned" => new Instruction(1, OpCode.Return, result),
+            "comparedWithOther" => new Instruction(1, OpCode.CheckEqual, test, result, other),
+            _ => new Instruction(1, OpCode.CheckEqual, test, new Immediate(0), result)
+        };
+        var instructions = new List<Instruction> { call, consumer };
+        if (use != "returned") instructions.Add(new(2, OpCode.Return, test));
+        var method = new InjectedMethodAnalysisContext(owner, "Test", owner, MethodAttributes.Public | MethodAttributes.Static, [])
+        {
+            ControlFlowGraph = new ISILControlFlowGraph(instructions),
+            Locals = [value, other, result, test], ParameterLocals = []
+        };
+        KeyFunctionRecovery.Run(method);
+        Assert.That(call.OpCode, Is.EqualTo(expected));
+        if (expected == OpCode.Call) return;
+        Assert.That(call.Operands, Is.EqualTo(new IOperand[] { result, type, value }));
+        Assert.That(result.Type, Is.SameAs(expected == OpCode.IsInstance ? app.SystemTypes.SystemBooleanType : type));
     }
 }

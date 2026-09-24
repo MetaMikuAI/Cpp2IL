@@ -134,6 +134,9 @@ public enum OpCode
     /// <summary>Returns op 3 as the reference type in op 2, or null, into op 1.</summary>
     TryCast,
 
+    /// <summary>Unboxes the object in op 3 as the value type in op 2 (IL unbox.any) into op 1.</summary>
+    Unbox,
+
     /// <summary>Zero-extends the low op 3 bits of op 2 to UInt64 in op 1.</summary>
     ZeroExtend,
 
