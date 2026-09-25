@@ -415,6 +415,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         var retryInterfaceCleanup = InterfaceDispatchRecovery.Run(this);
 
         LocalVariables.ResolveTypesAndFields(this);
+        // The receiver is typed, and unresolved calls still carry their raw argument registers.
+        InterlockedHelperRecovery.Run(this);
         MetadataInitGuardRemover.RunSsaClassGuards(this);
         KeyFunctionRecovery.Run(this);
 
