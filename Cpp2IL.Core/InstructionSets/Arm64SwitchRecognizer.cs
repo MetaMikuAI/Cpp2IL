@@ -73,20 +73,32 @@ internal static class Arm64SwitchRecognizer
             || ((words[loadIndex + 2] >> 5) & 31) != targetReg
             || new[] { selector, table, offsetReg, targetReg }.Any(r => r == 31)
             || table == targetReg || offsetReg == targetReg || selector == table || selector == targetReg) return null;
-        var copy = words[loadIndex - 3];
+        var label = words[loadIndex - 1];
+        if ((label & 0x9F000000) != 0x10000000 || (label & 31) != targetReg) return null;
+        var tableAdd = words[loadIndex - 2];
+        // The table address is either computed right here (ADRP; [MOV;] ADD; ADR) or, in loops, hoisted
+        // into a callee-saved register earlier in the method (just [MOV;] ADR).
+        var local = (tableAdd & 0xFFC00000) == 0x91000000 && (tableAdd & 31) == table && ((tableAdd >> 5) & 31) == table;
+        var copy = words[loadIndex - (local ? 3 : 2)];
         var copiedSelector = (copy & 0xFFE0FFE0) == 0x2A0003E0 && (copy & 31) == selector; // MOV Wd,Wm
         var comparedRegister = copiedSelector ? (int)((copy >> 16) & 31) : selector;
         // ADRP executes before the copy, so it must not overwrite the compared value.
         if (copiedSelector && (comparedRegister == table || comparedRegister == 31)) return null;
-        var pageIndex = loadIndex - (copiedSelector ? 4 : 3);
-        var page = words[pageIndex];
-        var tableAdd = words[loadIndex - 2];
-        var label = words[loadIndex - 1];
-        if ((page & 0x9F000000) != 0x90000000 || (page & 31) != table
-            || (tableAdd & 0xFFC00000) != 0x91000000 || (tableAdd & 31) != table || ((tableAdd >> 5) & 31) != table
-            || (label & 0x9F000000) != 0x10000000 || (label & 31) != targetReg) return null;
-        var tableAddress = unchecked((ulong)((long)((start + (ulong)pageIndex * 4) & ~0xFFFUL)
-            + (AdrImmediate(page) << 12) + ((tableAdd >> 10) & 0xFFF)));
+        int pageIndex;
+        ulong tableAddress;
+        if (local)
+        {
+            pageIndex = loadIndex - (copiedSelector ? 4 : 3);
+            var page = words[pageIndex];
+            if ((page & 0x9F000000) != 0x90000000 || (page & 31) != table) return null;
+            tableAddress = PageAddress(start, pageIndex, page, tableAdd);
+        }
+        else
+        {
+            if (HoistedTableAddress(words, start, table, loadIndex) is not { } hoisted) return null;
+            pageIndex = loadIndex - (copiedSelector ? 2 : 1);
+            tableAddress = hoisted;
+        }
         var targetBase = unchecked((ulong)((long)start + (loadIndex - 1) * 4 + AdrImmediate(label)));
 
         // Permit only independent plain loads between the guard and table setup.
@@ -136,6 +148,50 @@ internal static class Arm64SwitchRecognizer
             if (DirectTarget(words[i], start + (ulong)i * 4) is { } target && InsideGuard(target, candidate, start)) return null;
         }
         return candidate;
+    }
+
+    private static ulong PageAddress(ulong start, int pageIndex, uint page, uint add)
+        => unchecked((ulong)((long)((start + (ulong)pageIndex * 4) & ~0xFFFUL) + (AdrImmediate(page) << 12) + ((add >> 10) & 0xFFF)));
+
+    // A callee-saved table register that the whole method writes only with ADRP Xt then ADD Xt,Xt,#imm,
+    // both before the table load, holds that address wherever the load runs. Anything that might write
+    // the register counts as a write: every word except stores and branches naming it as Rd/Rt, the
+    // second register of a load pair, and the base of any other load or store (writeback). Restoring it
+    // in an epilogue is not: nothing but the return follows.
+    internal static ulong? HoistedTableAddress(uint[] words, ulong start, int table, int loadIndex)
+    {
+        if (table is < 19 or > 28) return null;
+        int page = -1, add = -1;
+        for (var i = 0; i < words.Length; i++)
+        {
+            if (i == loadIndex) continue;
+            var word = words[i];
+            var loadStore = (word & 0x0A000000) == 0x08000000;
+            var branch = (word & 0x1C000000) == 0x14000000;
+            var writes = loadStore
+                ? ((word >> 5) & 31) == table
+                  || (word & (1u << 22)) != 0 && ((word & 31) == table || (word & 0x3A000000) == 0x28000000 && ((word >> 10) & 31) == table)
+                : !branch && (word & 31) == table;
+            if (!writes || IsEpilogueRestore(words, i)) continue;
+            if ((word & 0x9F000000) == 0x90000000 && page < 0) page = i;
+            else if ((word & 0xFFC00000) == 0x91000000 && ((word >> 5) & 31) == table && add < 0) add = i;
+            else return null;
+        }
+        return page >= 0 && page < add && add < loadIndex ? PageAddress(start, page, words[page], words[add]) : null;
+    }
+
+    // A load from [SP] followed only by further stack loads/stores, ADD SP and hints up to a RET, B or BR.
+    private static bool IsEpilogueRestore(uint[] words, int index)
+    {
+        static bool FromStack(uint word) => (word & 0x0A000000) == 0x08000000 && ((word >> 5) & 31) == 31;
+        if (!FromStack(words[index]) || (words[index] & (1u << 22)) == 0) return false;
+        for (var i = index + 1; i < words.Length && i <= index + 6; i++)
+        {
+            var word = words[i];
+            if ((word & 0xFFFFFC1F) is 0xD65F0000 or 0xD61F0000 || (word & 0xFC000000) == 0x14000000) return true; // RET / BR / B
+            if (!FromStack(word) && (word & 0xFF8003FF) != 0x910003FF && (word & 0xFFFFF01F) != 0xD503201F) return false; // ADD SP / HINT
+        }
+        return false;
     }
 
     private static bool IsPlainLoad(uint word) => (word & 0xFFC00000) is 0xF9400000 or 0xB9400000;

@@ -231,4 +231,30 @@ public class Arm64SwitchRecognizerTests
             Assert.That(result.Targets, Is.EqualTo(new ulong[] { 0x525A3A0, 0x525A444, 0x525A4F8, 0x525A524 }));
         }
     }
+
+    private const uint HoistedPage = 0x90000035; // ADRP X21, +0x4000
+    private const uint HoistedAdd = 0x910042B5; // ADD X21, X21, #0x10
+    private const uint HoistedLoad = 0x38686AAA; // LDRB W10, [X21, X8]
+    private const uint Restore = 0xA94157F6; // LDP X22, X21, [SP, #0x10]
+    private const uint Nop = 0xD503201F;
+    private const uint Ret = 0xD65F03C0;
+
+    [Test]
+    public void HoistedTableRegisterSurvivesEpilogueRestore()
+        => Assert.That(Arm64SwitchRecognizer.HoistedTableAddress([HoistedPage, HoistedAdd, Nop, HoistedLoad, Restore, Ret], 0x1000, 21, 3),
+            Is.EqualTo(0x5010UL));
+
+    [Test]
+    public void HoistedTableRegisterRejectsOtherWrites()
+        => Assert.That(Arm64SwitchRecognizer.HoistedTableAddress([HoistedPage, HoistedAdd, 0xAA0003F5 /* MOV X21, X0 */, HoistedLoad, Ret], 0x1000, 21, 3),
+            Is.Null);
+
+    [Test]
+    public void HoistedTableRegisterRejectsRestoreBeforeMoreCode()
+        => Assert.That(Arm64SwitchRecognizer.HoistedTableAddress([HoistedPage, HoistedAdd, Restore, Nop, Nop, Nop, Nop, Nop, Nop, HoistedLoad, Ret], 0x1000, 21, 9),
+            Is.Null);
+
+    [Test]
+    public void HoistedTableNeedsCalleeSavedRegister()
+        => Assert.That(Arm64SwitchRecognizer.HoistedTableAddress([0x90000029 /* ADRP X9 */, 0x91004129, Nop, 0x38686A2A, Ret], 0x1000, 9, 3), Is.Null);
 }
