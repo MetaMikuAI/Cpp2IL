@@ -620,6 +620,9 @@ public static class IlGenerator
             LocalVariable local => IntegerType(local.Type) || result.Contains(local),
             _ => false
         };
+        // An object reference offset by an integer is emitted as native int arithmetic.
+        bool ArithmeticValue(Instruction definition, object operand)
+            => IntegerValue(operand) || IsPointerArithmetic(definition) && operand is IOperand value && IsObjectReference(value);
 
         for (var changed = true; changed;)
         {
@@ -630,7 +633,7 @@ public static class IlGenerator
                         or OpCode.Divide or OpCode.Modulo or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.And or OpCode.Or
                         or OpCode.Xor or OpCode.Not or OpCode.Negate
                     && (d.OpCode != OpCode.Move || d.Operands[1] is Immediate or LocalVariable || IsUnmanagedLoad(d.Operands[1]))
-                    && d.Operands.Skip(1).All(o => IntegerValue(o) || d.OpCode == OpCode.Move && IsUnmanagedLoad(o))))
+                    && d.Operands.Skip(1).All(o => ArithmeticValue(d, o) || d.OpCode == OpCode.Move && IsUnmanagedLoad(o))))
                     continue;
                 result.Remove(local);
                 changed = true;
@@ -675,6 +678,17 @@ public static class IlGenerator
             }
         }
     }
+
+    // Adding an integer to (or subtracting it from) an object reference, i.e. an interior address. IL has
+    // no such operation on references, so the reference is converted to native int first.
+    private static bool IsPointerArithmetic(Instruction instruction)
+        => instruction is { OpCode: OpCode.Add or OpCode.Subtract, Operands: [_, var left, var right] }
+           && (IsObjectReference(left) && !IsObjectReference(right) || IsObjectReference(right) && !IsObjectReference(left) && instruction.OpCode == OpCode.Add);
+
+    private static bool IsObjectReference(IOperand operand)
+        => operand is LocalVariable { Type: { IsValueType: false } type }
+           && type is not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext or GenericParameterTypeAnalysisContext)
+           && type != type.AppContext.SystemTypes.SystemVoidType;
 
     // A memory operand LoadOperand cannot express in IL, only as a diagnostic and a native int zero.
     private static bool IsUnmanagedLoad(IOperand operand)
@@ -1063,7 +1077,9 @@ public static class IlGenerator
                     ? ReferenceEqualityType(instruction) : null;
                 var integerLiteralType = nativeComparisonType ?? referenceEqualityType ?? BinaryIntegerLiteralType(instruction);
 
+                var pointerArithmetic = IsPointerArithmetic(instruction);
                 LoadOperand(instruction.Operands[1], method, locals, writeLine, integerLiteralType);
+                if (pointerArithmetic && IsObjectReference(instruction.Operands[1])) instructions.Add(CilOpCodes.Conv_I);
                 if (comparisonConversion is { } compareConv1) instructions.Add(compareConv1);
                 if (floatConversion is { } conv1)
                     instructions.Add(conv1);
@@ -1077,6 +1093,7 @@ public static class IlGenerator
                         _ => throw new InvalidOperationException($"Invalid native shift type: {shiftType}")
                     });
                 LoadOperand(instruction.Operands[2], method, locals, writeLine, integerLiteralType);
+                if (pointerArithmetic && IsObjectReference(instruction.Operands[2])) instructions.Add(CilOpCodes.Conv_I);
                 if (comparisonConversion is { } compareConv2) instructions.Add(compareConv2);
                 if (floatConversion is { } conv2)
                     instructions.Add(conv2);
