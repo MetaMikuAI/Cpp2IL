@@ -56,6 +56,16 @@ public static class DelegateInvokeRecovery
         if (call.Operands.Count == 0)
             return null;
 
+        // Paths passing different arguments can share the tail jump: a merge of the invoke_impl of one delegate.
+        if (call.Operands[0] is LocalVariable merged
+            && instructions.FirstOrDefault(i => ReferenceEquals(i.Destination, merged)) is { OpCode: OpCode.Phi } phi)
+        {
+            var receivers = phi.Operands.Skip(1)
+                .Select(input => GetInvokeImplReceiver(new Instruction(-1, OpCode.IndirectCall, input), instructions, invokeImplOffset))
+                .Distinct().ToList();
+            return receivers is [{ } shared] ? shared : null;
+        }
+
         var source = call.Operands[0];
         if (source is LocalVariable target)
         {
