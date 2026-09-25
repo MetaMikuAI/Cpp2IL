@@ -45,4 +45,13 @@ public class Arm64ImportResolverTests
     [TestCase(null, null)]
     public void RequiresExactKnownSignature(string? name, int? expected)
         => Assert.That(Arm64ImportResolver.IntegerArgumentCount(name), Is.EqualTo(expected));
+
+    [TestCase("memcpy", "MemCpy")]
+    [TestCase("memmove", "MemMove")]
+    [TestCase("memset", "MemSet")]
+    [TestCase("memcmp", "MemCmp")]
+    [TestCase("__memcpy_chk", null)]
+    [TestCase(null, null)]
+    public void MapsMemoryFunctionsToUnsafeUtility(string? name, string? expected)
+        => Assert.That(Arm64ImportResolver.MemoryMethodName(name), Is.EqualTo(expected));
 }

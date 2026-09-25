@@ -28,6 +28,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
     // GetIsilFromMethod runs in parallel, so cache resolved intrinsics concurrently.
     private readonly ConcurrentDictionary<(string Name, bool IsDouble, int ParameterCount), MethodAnalysisContext?> _mathMethods = new();
     private readonly ConcurrentDictionary<Arm64ImportResolver.NativeMathFunction, MethodAnalysisContext?> _nativeMathMethods = new();
+    private readonly ConcurrentDictionary<string, MethodAnalysisContext?> _nativeMemoryMethods = new();
 
     private readonly ConcurrentDictionary<(ApplicationAnalysisContext App, ulong Target), TypeAnalysisContext?> _nullCheckHelpers = new();
 
@@ -146,6 +147,17 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 && m.Parameters.Take(key.Arity).All(p => p.ParameterType == type)
                 && (key.Kind != Arm64ImportResolver.NativeMathKind.ModF
                     || m.Parameters[^1].ParameterType is PointerTypeAnalysisContext { ElementType: var element } && element == type));
+        });
+
+    // UnsafeUtility.<name>(void*, void*|byte, long), the managed twin of a C memory function.
+    internal MethodAnalysisContext? ResolveNativeMemoryMethod(ApplicationAnalysisContext app, string methodName)
+        => _nativeMemoryMethods.GetOrAdd(methodName, name =>
+        {
+            var type = app.Assemblies.FirstOrDefault(a => a.CleanAssemblyName == "UnityEngine.CoreModule")
+                ?.GetTypeByFullName("Unity.Collections.LowLevel.Unsafe.UnsafeUtility");
+            return type?.Methods.SingleOrDefault(m => m.IsStatic && m.Name == name && m.Parameters.Count == 3
+                && m.Parameters[0].ParameterType is PointerTypeAnalysisContext
+                && m.Parameters[2].ParameterType == app.SystemTypes.SystemInt64Type);
         });
 
     public override BinarySlice GetRawBytesForMethod(MethodAnalysisContext context, bool isAttributeGenerator)
@@ -810,7 +822,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                                 accessSize: field.FieldType.FullName == "System.Single" ? 4 : 8));
                     }
             }
-            else if (!TryAddNativeMath(target))
+            else if (!TryAddNativeMath(target) && !TryAddNativeMemory(target))
             {
                 // Not a managed method, so we don't know its signature, preserve all argument registers
                 var call = Add(address, OpCode.Call, Imm(target), new Register(null, "X0"));
@@ -871,6 +883,23 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             ClobberCallerSaved(Add(address, OpCode.Call, widened));
             Add(address, OpCode.ConvertNumeric, Argument(0), Reg(Arm64Register.D0),
                 new NumericConversion(types.SystemDoubleType, types.SystemSingleType));
+            return true;
+        }
+
+        // A call to a C memory import, made to its UnsafeUtility twin. The arguments are X0..X2 in order.
+        bool TryAddNativeMemory(ulong target)
+        {
+            if (Arm64ImportResolver.MemoryMethodName(Arm64ImportResolver.Resolve(context.AppContext.Binary, target)) is not { } name
+                || ResolveNativeMemoryMethod(context.AppContext, name) is not { } method)
+                return false;
+
+            var operands = new List<IOperand>(5) { method };
+            if (!method.IsVoid)
+                operands.Add(Reg(Arm64Register.X0));
+            for (var i = 0; i < 3; i++)
+                operands.Add(Reg(Arm64Register.X0 + i));
+
+            ClobberCallerSaved(Add(address, method.IsVoid ? OpCode.CallVoid : OpCode.Call, operands));
             return true;
         }
 

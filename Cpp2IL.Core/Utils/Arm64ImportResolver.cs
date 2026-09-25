@@ -76,6 +76,17 @@ internal static class Arm64ImportResolver
 
     private static string MathMethodName(string name) => char.ToUpperInvariant(name[0]) + name[1..];
 
+    // C memory functions and the UnsafeUtility method taking the same arguments in the same order
+    // (size_t size => long size, int c => byte value), so the call maps over without any reordering.
+    internal static string? MemoryMethodName(string? name) => name switch
+    {
+        "memcpy" => "MemCpy",
+        "memmove" => "MemMove",
+        "memset" => "MemSet",
+        "memcmp" => "MemCmp",
+        _ => null
+    };
+
     internal static int? IntegerArgumentCount(string? name) => name switch
     {
         "memcpy" or "memmove" or "memset" or "memcmp" => 3,
