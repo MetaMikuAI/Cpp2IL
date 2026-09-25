@@ -280,6 +280,9 @@ public static class LocalVariables
             // The allocation type may only become known during this fixpoint.
             changed |= MetadataResolver.ResolveConstructorCalls(method);
             changed |= MetadataResolver.ResolveVirtualCalls(method);
+            // Copies and phis carry a definition's type before a call's receiver is typed from the callee,
+            // whose declaring type may be only a base class of the copied local (e.g. of 'this').
+            changed |= PropagateCopiesOnce(method);
             changed |= PropagateFromCallParameters(method);
             changed |= AggregateCopyRecovery.Run(method);
             changed |= MetadataResolver.ResolveFieldOffsets(method);
@@ -685,6 +688,18 @@ public static class LocalVariables
         } while (changed);
     }
 
+    // Only copies of class-typed locals: a value type or interface may be just what a register holds of
+    // a larger value (the first member of a struct passed in two registers), which the callee knows better.
+    private static bool PropagateCopiesOnce(MethodAnalysisContext method)
+    {
+        var changed = false;
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+            if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable { Type: null } copy, LocalVariable { Type: { IsValueType: false, IsInterface: false } type }] }
+                && type is not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext or GenericParameterTypeAnalysisContext))
+                changed |= SetTypeIfUnknown(copy, type);
+        return changed;
+    }
+
     // A single propagation sweep over every move and phi. Returns whether it filled in any type.
     private static bool PropagateTypesOnce(MethodAnalysisContext method)
     {
@@ -1018,6 +1033,21 @@ public static class LocalVariables
                 addressesOf[pointer] = pointee;
         }
 
+        // A copy of a typed local gets its type from that local; the callee's declaring type may be a base
+        // class of it (e.g. Component for a copy of 'this' passed to get_gameObject).
+        var copySources = new Dictionary<LocalVariable, LocalVariable?>();
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+            if (instruction.Destination is LocalVariable destination)
+                copySources[destination] = !copySources.ContainsKey(destination)
+                    && instruction is { OpCode: OpCode.Move, Operands: [_, LocalVariable source] } ? source : null;
+        bool CopiesTypedLocal(LocalVariable local)
+        {
+            for (var hops = 0; hops < 8 && copySources.TryGetValue(local, out var source) && source != null; hops++, local = source)
+                if (source.Type != null)
+                    return true;
+            return false;
+        }
+
         LocalVariable? Addressed(IOperand operand) => operand switch
         {
             AddressOf { Target: LocalVariable direct } => direct,
@@ -1057,7 +1087,7 @@ public static class LocalVariables
 
             // 'this' param
             if (!calledMethod.IsStatic
-                && instruction.Operands[thisParamIndex] is LocalVariable thisParam)
+                && instruction.Operands[thisParamIndex] is LocalVariable thisParam && !CopiesTypedLocal(thisParam))
             {
                 changed |= SetTypeIfUnknown(thisParam, calledMethod.DeclaringType);
             }
