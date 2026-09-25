@@ -184,7 +184,7 @@ public static class DeadCodeEliminator
                 or OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.MultiplyHighSigned or OpCode.Divide or OpCode.Modulo
                 or OpCode.ShiftLeft or OpCode.ShiftRight
                 or OpCode.And or OpCode.Or or OpCode.Xor
-                or OpCode.Not or OpCode.Negate=> true,
+                or OpCode.Not or OpCode.Negate or OpCode.LocalAllocate => true,
             >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual => true,
             _ => false
         };

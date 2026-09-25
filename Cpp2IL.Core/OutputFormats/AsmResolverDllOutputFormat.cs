@@ -94,6 +94,8 @@ public abstract class AsmResolverDllOutputFormat : Cpp2IlOutputFormat
         var eventCount = context.AllTypes.SelectMany(t => t.Events).Count();
 #endif
 
+        StrippedFrameworkTypeRestorer.Restore(context);
+
         //Build the stub assemblies
         var start = DateTime.Now;
 #if VERBOSE_LOGGING

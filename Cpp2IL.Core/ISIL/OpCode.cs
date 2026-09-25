@@ -149,5 +149,8 @@ public enum OpCode
     /// <summary>
     /// Throws a new instance of the exception type described by op 1.
     /// </summary>
-    Throw
+    Throw,
+
+    /// <summary>Allocates op 2 bytes on the stack (IL localloc) and moves their address into op 1.</summary>
+    LocalAllocate
 }

@@ -804,6 +804,10 @@ public static class IlGenerator
                 {
                     // il2cpp_value_box takes the value by address, but IL boxes it by value
                     LoadOperand(boxedValue is AddressOf { Target: LocalVariable byRef } ? byRef : boxedValue, method, locals, writeLine, boxedType);
+                    // An address held in a local (a stack allocation, for one) is read through first.
+                    if (boxedValue is LocalVariable { Type: PointerTypeAnalysisContext or ByRefTypeAnalysisContext }
+                        && boxedType is not (PointerTypeAnalysisContext or ByRefTypeAnalysisContext))
+                        instructions.Add(CilOpCodes.Ldobj, boxedType.ToTypeSignature().ToTypeDefOrRef());
                     instructions.Add(CilOpCodes.Box, boxedType.ToTypeSignature().ToTypeDefOrRef());
                 }
                 else
@@ -935,6 +939,14 @@ public static class IlGenerator
                 LoadSwitchSelector(instruction, context, method, locals, writeLine);
                 instructions.Add(CilOpCodes.Switch, Array.Empty<ICilLabel>());
                 instructions.Add(CilOpCodes.Br, new CilInstructionLabel());
+                break;
+
+            case OpCode.LocalAllocate:
+                // localloc takes an unsigned native size; the address it leaves is typed by LocalVariables.
+                LoadOperand(instruction.Operands[1], method, locals, writeLine, context.AppContext.SystemTypes.SystemUInt64Type);
+                instructions.Add(CilOpCodes.Conv_U);
+                instructions.Add(CilOpCodes.Localloc);
+                StoreToOperand(instruction.Operands[0], method, locals, writeLine);
                 break;
 
             case OpCode.ShiftStack:

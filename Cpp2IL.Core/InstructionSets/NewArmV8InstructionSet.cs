@@ -351,6 +351,44 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                && (instruction.Op0Reg == Arm64Register.X30 || instruction.Op1Reg == Arm64Register.X30);
     }
 
+    /// <summary>
+    /// clang lowers <c>alloca(size)</c>, which IL2CPP emits for a value of a fully shared generic type,
+    /// to <c>mov xA, sp; sub xB, xA, size; mov sp, xB</c> with the size already rounded to the stack
+    /// alignment. Called at the final <c>mov sp, xB</c>, this rewrites the lifted subtraction into an
+    /// allocation of that size. Only a straight-line sequence qualifies: any branch, call or fixed stack
+    /// adjustment between the copy of sp and the subtraction leaves the lifted instructions as they are.
+    /// </summary>
+    internal static bool RecoverStackAllocation(List<Instruction> instructions, Register allocated)
+    {
+        Instruction? subtraction = null;
+        var stackCopy = default(Register);
+        for (var i = instructions.Count - 1; i >= 0; i--)
+        {
+            var instruction = instructions[i];
+            if (instruction.OpCode is OpCode.ShiftStack or OpCode.Jump or OpCode.ConditionalJump or OpCode.IndirectJump
+                or OpCode.Switch or OpCode.Return or OpCode.Call or OpCode.CallVoid or OpCode.IndirectCall or OpCode.Throw)
+                return false;
+            if (instruction.Destination is not Register defined) continue;
+            if (subtraction == null)
+            {
+                if (defined.Name != allocated.Name) continue;
+                if (instruction is not { OpCode: OpCode.Subtract, Operands: [_, Register copy, var size] }
+                    || size is Register { Name: var sizeName } && sizeName == copy.Name)
+                    return false;
+                subtraction = instruction;
+                stackCopy = copy;
+                continue;
+            }
+            if (defined.Name != stackCopy.Name) continue;
+            if (instruction is not { OpCode: OpCode.Move, Operands: [_, AddressOf { Target: StackOffset { Offset: 0 } }] })
+                return false;
+            subtraction.OpCode = OpCode.LocalAllocate;
+            subtraction.SetOperands(subtraction.Operands[0], subtraction.Operands[2]);
+            return true;
+        }
+        return false;
+    }
+
     public override List<Instruction> GetIsilFromMethod(MethodAnalysisContext context)
     {
         var insns = NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(context.AppContext.Binary, context.UnderlyingPointer);
@@ -1316,6 +1354,15 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     if (IsReg31(instruction.Op0Reg) && IsReg31(instruction.Op1Reg) && instruction.Op2Kind == Arm64OperandKind.Immediate && !setsFlags)
                     {
                         Add(address, OpCode.ShiftStack, Imm(isSubtract ? -instruction.Op2Imm : instruction.Op2Imm));
+                        break;
+                    }
+
+                    // mov sp, xB completing a dynamic stack allocation (see RecoverStackAllocation)
+                    if (!isSubtract && !setsFlags && IsReg31(instruction.Op0Reg) && !IsReg31(instruction.Op1Reg)
+                        && instruction.Op2Kind == Arm64OperandKind.Immediate && instruction.Op2Imm == 0
+                        && RecoverStackAllocation(instructions, Reg(instruction.Op1Reg)))
+                    {
+                        Add(address, OpCode.Nop);
                         break;
                     }
 
