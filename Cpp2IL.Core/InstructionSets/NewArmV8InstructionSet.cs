@@ -63,6 +63,13 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         return BinaryPrimitives.ReadUInt32LittleEndian(context.RawBytes.AsSpan().Slice((int)offset, 4));
     }
 
+    // REV64 Vd.2S, Vn.2S, which Disarm does not decode: the two 32-bit lanes of Vn, swapped.
+    private static (int Destination, int Source)? ReverseTwoSLanes(MethodAnalysisContext context, Arm64Instruction instruction)
+        => instruction.Mnemonic == Arm64Mnemonic.UNIMPLEMENTED && ReadWord(context, instruction) is { } word
+           && (word & 0xFFFFFC00) == 0x0EA00800
+            ? ((int)(word & 31), (int)((word >> 5) & 31))
+            : null;
+
     // integer register 31 is SP or ZR depending on context, callers must decide which
     private static bool IsReg31(Arm64Register reg) => reg is Arm64Register.X31 or Arm64Register.W31;
 
@@ -420,6 +427,11 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             if (instruction.Op2Kind == Arm64OperandKind.Register
                 && instruction.Op2Arrangement.ToString() == "TwoS")
                 twoSLaneRegisters.Add(NormalizeRegister(instruction.Op2Reg));
+            if (ReverseTwoSLanes(context, instruction) is var (reversed, source))
+            {
+                twoSLaneRegisters.Add("V" + reversed);
+                twoSLaneRegisters.Add("V" + source);
+            }
         }
 
         for (var nativeIndex = 0; nativeIndex < insns.Count; nativeIndex++)
@@ -1925,6 +1937,15 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.UDF:
                 Add(address, OpCode.Interrupt);
                 break;
+            case Arm64Mnemonic.UNIMPLEMENTED when ReverseTwoSLanes(context, instruction) is var (reversed, source):
+                {
+                    // The source lanes are both read before either destination lane is written.
+                    var low = new Register(null, "TEMP_REV64");
+                    Add(address, OpCode.Move, low, VectorLane(Arm64Register.V0 + source, 0));
+                    Add(address, OpCode.Move, VectorLane(Arm64Register.V0 + reversed, 0), VectorLane(Arm64Register.V0 + source, 1));
+                    Add(address, OpCode.Move, VectorLane(Arm64Register.V0 + reversed, 1), low);
+                    break;
+                }
             case Arm64Mnemonic.MRS:
                 // system register read (thread pointer etc), value is opaque to analysis
                 Add(address, OpCode.Move, ConvertOperand(instruction, 0), new Register(null, "SYSREG"));

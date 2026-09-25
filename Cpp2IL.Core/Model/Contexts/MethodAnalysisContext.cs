@@ -371,6 +371,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         NativeMethodCloneRecovery.BeforeSsa(this);
         ControlFlowGraph = new ISILControlFlowGraph(ConvertedIsil);
+        SharedTailCallSplitter.Run(ControlFlowGraph);
 
         // Indirect jumps/calls should probably be resolved here before stack analysis
 

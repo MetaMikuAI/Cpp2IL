@@ -278,8 +278,10 @@ internal static class Arm64SwitchRecognizer
     private static bool IsPlainLoad(uint word) => (word & 0xFFC00000) is 0xF9400000 or 0xB9400000;
 
     // Writes at most its first register operand: a plain load, a register move (ORR with the zero
-    // register), or an unsigned-offset store, which writes no register at all.
+    // register), an address computation (ADRP, or ADD/SUB immediate without flags), or an
+    // unsigned-offset store, which writes no register at all.
     private static bool IsIndependent(uint word) => IsPlainLoad(word) || (word & 0x7FE0FFE0) == 0x2A0003E0
+        || (word & 0x9F000000) == 0x90000000 || (word & 0x7F800000) is 0x11000000 or 0x51000000
         || (word & 0xFFC00000) is 0xF9000000 or 0xB9000000 or 0x79000000 or 0x39000000;
     private static int ConditionalOffset(uint word) => (int)((word & 0x00FFFFE0) << 8) >> 11;
     private static long AdrImmediate(uint word) => (int)((((word >> 5) & 0x7FFFF) << 2 | (word >> 29) & 3) << 11) >> 11;

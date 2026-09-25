@@ -154,6 +154,9 @@ public class Arm64SwitchRecognizerTests
     [TestCase(0x94000001u)] // BL
     [TestCase(0x14000001u)] // B
     [TestCase(0xF8408674u)] // Post-indexed load changes its base too.
+    [TestCase(0x90000008u)] // ADRP X8 repoints the selector.
+    [TestCase(0x91000508u)] // ADD X8,X8,#1 leaves the upper bits unproven.
+    [TestCase(0xB1000529u)] // ADDS X9,X9,#1 sets the flags.
     public void DefinitionSearchStopsAtUnprovenInstructions(uint instruction)
     {
         var words = ScheduledLoadFixture(2);
@@ -163,6 +166,8 @@ public class Arm64SwitchRecognizerTests
 
     [TestCase(0xAA0003F3u)] // MOV X19,X0
     [TestCase(0xB9001400u)] // STR W0,[X0,#20]
+    [TestCase(0x90000019u)] // ADRP X25 materializes an unrelated address.
+    [TestCase(0x91004339u)] // ADD X25,X25,#16
     public void SelectorDefinitionMayBeFollowedByIndependentMovesAndStores(uint instruction)
     {
         var words = ScheduledLoadFixture(2);
