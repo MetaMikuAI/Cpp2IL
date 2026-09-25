@@ -17,8 +17,9 @@ public static class FieldAddressRecovery
 
         foreach (var call in method.ControlFlowGraph.Instructions)
         {
-            if (!call.IsCall || call.Operands[0] is not MethodAnalysisContext target)
+            if (!call.IsCall || call.Operands[0] is not MethodAnalysisContext calledMethod)
                 continue;
+            var target = calledMethod;
             var first = call.OpCode == OpCode.CallVoid ? 1 : 2;
             for (var i = first; i < call.Operands.Count; i++)
             {
@@ -45,11 +46,32 @@ public static class FieldAddressRecovery
                     || owner is GenericInstanceTypeAnalysisContext || owner.GenericParameters.Count != 0)
                     continue;
                 var fields = owner.Fields.Where(f => !f.IsStatic && f.Offset == offset.Value).ToList();
-                if (fields is not [{ } field] || field.FieldType.FullName != expected.FullName
-                    || field.FieldType.DeclaringAssembly != expected.DeclaringAssembly)
+                if (fields is not [{ } field])
                     continue;
+                if (field.FieldType.FullName != expected.FullName || field.FieldType.DeclaringAssembly != expected.DeclaringAssembly)
+                {
+                    if (i != first || expected != method.AppContext.SystemTypes.SystemObjectType
+                        || GenericOverloadFor(target, field.FieldType) is not { } specialized)
+                        continue;
+                    call.SetOperand(0, target = specialized);
+                }
                 call.SetOperand(i, new AddressOf(new FieldReference(field, receiver, (int)offset.Value)));
             }
         }
+    }
+
+    // M<T>(ref T, T...) where T : class, instantiated for a reference-type field whose address is passed
+    // to the object overload M(ref object, object...). The runtime implements both with one function.
+    private static MethodAnalysisContext? GenericOverloadFor(MethodAnalysisContext objectOverload, TypeAnalysisContext fieldType)
+    {
+        if (!objectOverload.IsStatic || fieldType.IsValueType || fieldType is GenericParameterTypeAnalysisContext
+            || objectOverload.DeclaringType?.Methods.Where(m => m.IsStatic && m.Name == objectOverload.Name
+                    && m.GenericParameters.Count == 1 && m.Parameters.Count == objectOverload.Parameters.Count).ToList()
+                is not [{ } generic]
+            || generic.Parameters[0].ParameterType is not ByRefTypeAnalysisContext { ElementType: GenericParameterTypeAnalysisContext { Index: 0 } }
+            || generic.ReturnType is not GenericParameterTypeAnalysisContext { Index: 0 }
+            || generic.Parameters.Skip(1).Any(p => p.ParameterType is not GenericParameterTypeAnalysisContext { Index: 0 }))
+            return null;
+        return new ConcreteGenericMethodAnalysisContext(generic, [], [fieldType]);
     }
 }

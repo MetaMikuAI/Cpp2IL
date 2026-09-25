@@ -29,6 +29,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
     private readonly ConcurrentDictionary<(string Name, bool IsDouble, int ParameterCount), MethodAnalysisContext?> _mathMethods = new();
     private readonly ConcurrentDictionary<Arm64ImportResolver.NativeMathFunction, MethodAnalysisContext?> _nativeMathMethods = new();
     private readonly ConcurrentDictionary<string, MethodAnalysisContext?> _nativeMemoryMethods = new();
+    private readonly ConcurrentDictionary<(ApplicationAnalysisContext App, ulong Target), MethodAnalysisContext?> _compareExchanges = new();
 
     private readonly ConcurrentDictionary<(ApplicationAnalysisContext App, ulong Target), TypeAnalysisContext?> _nullCheckHelpers = new();
 
@@ -595,6 +596,55 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         return unchecked((ulong)((long)address + 12 + ((int)(call << 6) >> 4)));
     }
 
+    // Interlocked.CompareExchange(ref object, object, object) if target is the runtime's object
+    // compare-exchange, which callers reach directly rather than through the managed icall stub.
+    private MethodAnalysisContext? GetObjectCompareExchange(ApplicationAnalysisContext app, ulong target)
+        => _compareExchanges.GetOrAdd((app, target), key =>
+        {
+            var binary = key.App.Binary;
+            // Runtime code, not a managed body.
+            if (binary.IsBigEndian || key.Target >= key.App.ManagedCodeStart && key.Target <= key.App.ManagedCodeEnd
+                || key.App.MethodsByAddress.ContainsKey(key.Target)
+                || !binary.TryMapVirtualAddressToRaw(key.Target, out var raw)
+                || raw < 0 || raw > binary.RawLength - CompareExchangeScanBytes
+                || !IsObjectCompareExchange(binary.GetRawBinaryContent().Slice((int)raw, CompareExchangeScanBytes), key.Target))
+                return null;
+            var objectType = key.App.SystemTypes.SystemObjectType;
+            return key.App.GetAssemblyByName("mscorlib").GetTypeByFullName("System.Threading.Interlocked")?.Methods
+                .SingleOrDefault(m => m.IsStatic && m.Name == "CompareExchange" && m.GenericParameters.Count == 0
+                    && m.ReturnType == objectType && m.Parameters.Count == 3
+                    && m.Parameters[0].ParameterType is ByRefTypeAnalysisContext { ElementType: var element } && element == objectType
+                    && m.Parameters[1].ParameterType == objectType && m.Parameters[2].ParameterType == objectType);
+        });
+
+    private const int CompareExchangeScanBytes = 20 * 4;
+
+    // The body of il2cpp's CompareExchange for object references, up to its first return: an exclusive
+    // load of [X0] compared with X2 (the comparand), an exclusive store of X1 (the value) to [X0], then a
+    // call telling the GC about the stored reference. Integer compare-exchanges are inlined, not called.
+    internal static bool IsObjectCompareExchange(ReadOnlySpan<byte> bytes, ulong address)
+    {
+        List<Arm64Instruction> code;
+        try
+        {
+            code = Disassembler.Disassemble(bytes, address, new Disassembler.Options(true, true, false))
+                .ToList().TakeWhile(i => i.Mnemonic != Arm64Mnemonic.RET).ToList();
+        }
+        catch
+        {
+            return false;
+        }
+
+        var load = code.FindIndex(i => i.Mnemonic == Arm64Mnemonic.LDAXR && i.MemBase == Arm64Register.X0
+            && i.Op0Reg is >= Arm64Register.X0 and <= Arm64Register.X28);
+        var store = code.FindIndex(i => i is { Mnemonic: Arm64Mnemonic.STLXR, Op1Reg: Arm64Register.X1, MemBase: Arm64Register.X0 });
+        return load >= 0 && store > load
+            && code[load + 1] is { Mnemonic: Arm64Mnemonic.CMP, Op1Reg: Arm64Register.X2 } compare
+            && compare.Op0Reg == code[load].Op0Reg
+            && code.Skip(store).Any(i => i.Mnemonic == Arm64Mnemonic.BL)
+            && code.Take(load).All(i => i.Mnemonic is Arm64Mnemonic.STP or Arm64Mnemonic.STR);
+    }
+
     private TypeAnalysisContext? GetNullCheckException(ApplicationAnalysisContext app, ulong target)
         => _nullCheckHelpers.GetOrAdd((app, target), key =>
         {
@@ -822,7 +872,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                                 accessSize: field.FieldType.FullName == "System.Single" ? 4 : 8));
                     }
             }
-            else if (!TryAddNativeMath(target) && !TryAddNativeMemory(target))
+            else if (!TryAddNativeMath(target) && !TryAddNativeMemory(target) && !TryAddCompareExchange(target))
             {
                 // Not a managed method, so we don't know its signature, preserve all argument registers
                 var call = Add(address, OpCode.Call, Imm(target), new Register(null, "X0"));
@@ -900,6 +950,17 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 operands.Add(Reg(Arm64Register.X0 + i));
 
             ClobberCallerSaved(Add(address, method.IsVoid ? OpCode.CallVoid : OpCode.Call, operands));
+            return true;
+        }
+
+        // A direct call to the runtime's object compare-exchange: CompareExchange(ref X0, X1, X2) => X0.
+        bool TryAddCompareExchange(ulong target)
+        {
+            if (GetObjectCompareExchange(context.AppContext, target) is not { } method)
+                return false;
+
+            ClobberCallerSaved(Add(address, OpCode.Call, method, Reg(Arm64Register.X0),
+                Reg(Arm64Register.X0), Reg(Arm64Register.X1), Reg(Arm64Register.X2)));
             return true;
         }
 

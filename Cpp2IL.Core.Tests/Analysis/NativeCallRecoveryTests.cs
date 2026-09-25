@@ -196,4 +196,16 @@ public class NativeCallRecoveryTests
         from.Successors.Add(to);
         to.Predecessors.Add(from);
     }
+
+    // il2cpp's object CompareExchange from an ARM64 build, up to its ret.
+    private const string ObjectCompareExchange = "fe4fbfa908fc5fc81f0102eba100005401fc09c889ffff3529008052030000145f3f03d5"
+        + "e9031f2abf3b03d53f0100715310889a9b93fe97e00313aafe4fc1a8c0035fd6";
+
+    [TestCase(ObjectCompareExchange, true)]
+    [TestCase("fe4fbfa908fc5fc81f0101eba100005401fc09c889ffff3529008052030000145f3f03d5" // cmp x8, x1
+        + "e9031f2abf3b03d53f0100715310889a9b93fe97e00313aafe4fc1a8c0035fd6", false)]
+    [TestCase("fe4fbfa908fc5fc81f0102eba100005401fc09c889ffff3529008052030000145f3f03d5" // no call after the store
+        + "e9031f2abf3b03d53f0100715310889a1f2003d5e00313aafe4fc1a8c0035fd6", false)]
+    public void RecognizesRuntimeObjectCompareExchange(string hex, bool expected)
+        => Assert.That(NewArmV8InstructionSet.IsObjectCompareExchange(Convert.FromHexString(hex), 0x49654E4), Is.EqualTo(expected));
 }
