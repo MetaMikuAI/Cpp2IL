@@ -932,6 +932,14 @@ public static class MetadataResolver
                 continue;
             }
 
+            if (MatchStaticByArgumentType(instruction, candidates) is { } byArgument)
+            {
+                instruction.SetOperand(0, byArgument);
+                byArgument.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, byArgument);
+                changed = true;
+                continue;
+            }
+
             if (candidates.Count < 2)
                 continue;
 
@@ -992,6 +1000,40 @@ public static class MetadataResolver
 
         return changed;
     }
+
+    // Static methods of a generic type's instantiations share one body when the type arguments share a
+    // representation, so there is no receiver to tell them apart. An argument declared as the type
+    // itself (e.g. ScriptPlayable<T>.op_Implicit(ScriptPlayable<T>)) carries the instantiation.
+    private static MethodAnalysisContext? MatchStaticByArgumentType(Instruction call, List<MethodAnalysisContext> candidates)
+    {
+        var definition = BaseMethodOf(candidates[0]);
+        if (definition.DeclaringType is not { GenericParameters.Count: > 0 } genericType
+            || definition.GenericParameters.Count != 0
+            || candidates.Any(c => !c.IsStatic || !ReferenceEquals(BaseMethodOf(c), definition)))
+            return null;
+
+        var firstArg = call.OpCode == OpCode.CallVoid ? 1 : 2;
+        for (var i = 0; i < definition.Parameters.Count && firstArg + i < call.Operands.Count; i++)
+        {
+            if (!IsOwnInstantiation(definition.Parameters[i].ParameterType, genericType)
+                || call.Operands[firstArg + i] is not LocalVariable { Type: GenericInstanceTypeAnalysisContext argument }
+                || !ReferenceEquals(argument.GenericType, genericType)
+                || argument.GenericArguments.Any(a => a is GenericParameterTypeAnalysisContext))
+                continue;
+
+            return candidates.FirstOrDefault(c => IsSameType(c.DeclaringType, argument))
+                   ?? new ConcreteGenericMethodAnalysisContext(definition, argument.GenericArguments, []);
+        }
+
+        return null;
+    }
+
+    // Whether type is genericType<T1..Tn> instantiated with its own type parameters, in order.
+    private static bool IsOwnInstantiation(TypeAnalysisContext type, TypeAnalysisContext genericType)
+        => type is GenericInstanceTypeAnalysisContext instance
+           && ReferenceEquals(instance.GenericType, genericType)
+           && instance.GenericArguments.Count == genericType.GenericParameters.Count
+           && instance.GenericArguments.Select((a, i) => a is GenericParameterTypeAnalysisContext { Index: var index } && index == i).All(same => same);
 
     private static MethodAnalysisContext? FindConcreteGenericConstructor(TypeAnalysisContext receiverType, List<MethodAnalysisContext> candidates)
     {
