@@ -120,13 +120,17 @@ public static class IlGenerator
 
         // Map ISIL locals to IL
         Dictionary<LocalVariable, CilLocalVariable> locals = [];
+        var integerLocals = UntypedIntegerLocals(context);
         foreach (var local in context.Locals)
         {
             TypeSignature ilType;
 
-            // Use object if type couldn't be determined, or if it's void, which no locals sig can hold
+            // Use object if type couldn't be determined, or if it's void, which no locals sig can hold,
+            // except native int for an untyped register that only ever holds integer arithmetic
             if (local.Type != null && local.Type != context.AppContext.SystemTypes.SystemVoidType)
                 ilType = local.Type.ToTypeSignature();
+            else if (integerLocals.Contains(local))
+                ilType = module.CorLibTypeFactory.IntPtr;
             else
                 ilType = module.CorLibTypeFactory.Object;
 
@@ -590,6 +594,55 @@ public static class IlGenerator
     }
 
     // Limit so we don't run into the 16mb limit (see AsmResolver issue #775)
+    // Untyped locals every definition of which is an integer: an immediate, an unmanaged memory load
+    // (emitted as a native int placeholder), or integer arithmetic over immediates, integer-typed locals
+    // and other such locals. Starts from all candidates and drops any
+    // with another kind of definition until nothing changes, so values carried around loops qualify.
+    private static HashSet<LocalVariable> UntypedIntegerLocals(MethodAnalysisContext context)
+    {
+        var types = context.AppContext.SystemTypes;
+        bool Untyped(LocalVariable local) => local.Type == null || local.Type == types.SystemVoidType;
+        bool IntegerType(TypeAnalysisContext? type) => type != null && (type == types.SystemInt32Type || type == types.SystemInt64Type
+            || type == types.SystemUInt32Type || type == types.SystemUInt64Type || type == types.SystemIntPtrType
+            || type == types.SystemUIntPtrType || type == types.SystemInt16Type || type == types.SystemUInt16Type
+            || type == types.SystemByteType || type == types.SystemSByteType);
+
+        var definitions = new Dictionary<LocalVariable, List<Instruction>>();
+        foreach (var instruction in context.ControlFlowGraph!.Instructions)
+            if (instruction.Destination is LocalVariable destination && Untyped(destination))
+                (definitions.TryGetValue(destination, out var list) ? list : definitions[destination] = []).Add(instruction);
+
+        var result = definitions.Keys.Where(l => !context.ParameterLocals.Contains(l)).ToHashSet();
+        bool IntegerValue(object operand) => operand switch
+        {
+            Immediate or TypeAnalysisContext => true,
+            LocalVariable local => IntegerType(local.Type) || result.Contains(local),
+            _ => false
+        };
+
+        for (var changed = true; changed;)
+        {
+            changed = false;
+            foreach (var local in result.ToList())
+            {
+                if (definitions[local].All(d => d.OpCode is OpCode.Move or OpCode.Add or OpCode.Subtract or OpCode.Multiply
+                        or OpCode.Divide or OpCode.Modulo or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.And or OpCode.Or
+                        or OpCode.Xor or OpCode.Not or OpCode.Negate
+                    && (d.OpCode != OpCode.Move || d.Operands[1] is Immediate or LocalVariable || IsUnmanagedLoad(d.Operands[1]))
+                    && d.Operands.Skip(1).All(o => IntegerValue(o) || d.OpCode == OpCode.Move && IsUnmanagedLoad(o))))
+                    continue;
+                result.Remove(local);
+                changed = true;
+            }
+        }
+
+        return result;
+    }
+
+    // A memory operand LoadOperand cannot express in IL, only as a diagnostic and a native int zero.
+    private static bool IsUnmanagedLoad(IOperand operand)
+        => operand is MemoryOperand memory && !(memory.Index == null && memory.Addend == 0 && memory.Scale == 0 && memory.Base is LocalVariable);
+
     private static string Diagnostic(string message) 
         => message.Length <= 250 ? message : message[..250] + "…";
     
