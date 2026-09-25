@@ -54,6 +54,15 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
     private static Register Reg(Arm64Register reg) => new(null, NormalizeRegister(reg));
 
+    // The instruction's own encoding, for fields Disarm misdecodes.
+    private static uint? ReadWord(MethodAnalysisContext context, Arm64Instruction instruction)
+    {
+        var offset = instruction.Address - context.UnderlyingPointer;
+        if (instruction.Address < context.UnderlyingPointer || context.RawBytes.Length < 4
+            || offset > (ulong)(context.RawBytes.Length - 4)) return null;
+        return BinaryPrimitives.ReadUInt32LittleEndian(context.RawBytes.AsSpan().Slice((int)offset, 4));
+    }
+
     // integer register 31 is SP or ZR depending on context, callers must decide which
     private static bool IsReg31(Arm64Register reg) => reg is Arm64Register.X31 or Arm64Register.W31;
 
@@ -639,38 +648,14 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             return shifted;
         }
 
+        // Lane 0 of V<n>.2S is the same 32 bits as scalar S<n>, so it keeps the register's own name.
         Register VectorLane(Arm64Register register, int lane) =>
-            new(null, $"{NormalizeRegister(register)}.S{lane}");
+            lane == 0 ? Reg(register) : new(null, $"{NormalizeRegister(register)}.S{lane}");
 
         bool IsTwoS(Arm64ArrangementSpecifier arrangement) => arrangement.ToString() == "TwoS";
 
-        IOperand ScalarOperand(int operand)
-        {
-            var register = operand switch
-            {
-                0 => instruction.Op0Reg,
-                1 => instruction.Op1Reg,
-                2 => instruction.Op2Reg,
-                3 => instruction.Op3Reg,
-                _ => throw new ArgumentOutOfRangeException(nameof(operand))
-            };
-            var kind = operand switch
-            {
-                0 => instruction.Op0Kind,
-                1 => instruction.Op1Kind,
-                2 => instruction.Op2Kind,
-                3 => instruction.Op3Kind,
-                _ => throw new ArgumentOutOfRangeException(nameof(operand))
-            };
-
-            // Scalar S<n> and the first lane of V<n>.2S share the same 32-bit register;
-            // preserve this alias when scalar instructions feed subsequent vector instructions.
-            return kind == Arm64OperandKind.Register
-                   && register is >= Arm64Register.S0 and <= Arm64Register.S31
-                   && twoSLaneRegisters.Contains(NormalizeRegister(register))
-                ? VectorLane(register, 0)
-                : ConvertOperand(instruction, operand);
-        }
+        // Scalar S<n> and the first lane of V<n>.2S share one name (see VectorLane).
+        IOperand ScalarOperand(int operand) => ConvertOperand(instruction, operand);
 
         IOperand VectorOperand(int operand, int lane)
         {
@@ -824,12 +809,6 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         bool TryAddNativeMath(ulong target)
         {
             if (Arm64ImportResolver.MathFunction(Arm64ImportResolver.Resolve(context.AppContext.Binary, target)) is not { } math)
-                return false;
-
-            // Scalar operations do not agree on whether S<n> of a register also used as V<n>.2S is named as
-            // lane 0 or as the whole register, so the value passed in such a register cannot be identified.
-            if (!math.IsDouble && Enumerable.Range(0, math.Arity)
-                    .Any(number => twoSLaneRegisters.Contains(NormalizeRegister(Arm64Register.S0 + number))))
                 return false;
 
             IOperand Argument(int number) => Reg((math.IsDouble ? Arm64Register.D0 : Arm64Register.S0) + number);
@@ -1139,6 +1118,14 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 }
 
                 Add(address, OpCode.Move, ScalarOperand(0), ScalarOperand(1));
+                // A whole-vector copy also carries the second .2S lane, which has a name of its own.
+                if (instruction.Mnemonic == Arm64Mnemonic.MOV
+                    && instruction is { Op0Kind: Arm64OperandKind.Register, Op1Kind: Arm64OperandKind.Register }
+                    && instruction.Op0Reg is >= Arm64Register.V0 and <= Arm64Register.V31
+                    && instruction.Op1Reg is >= Arm64Register.V0 and <= Arm64Register.V31
+                    && (twoSLaneRegisters.Contains(NormalizeRegister(instruction.Op0Reg))
+                        || twoSLaneRegisters.Contains(NormalizeRegister(instruction.Op1Reg))))
+                    Add(address, OpCode.Move, VectorLane(instruction.Op0Reg, 1), VectorLane(instruction.Op1Reg, 1));
                 break;
             case Arm64Mnemonic.FCVT:
             case Arm64Mnemonic.FCVTZS:
@@ -1710,7 +1697,11 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     }
 
                     var dest = ScalarOperand(0);
-                    Add(address, OpCode.Subtract, dest, ScalarOperand(1), ScalarOperand(2));
+                    var subtrahend = ScalarOperand(2);
+                    // Disarm decodes the scalar encoding's Rm field as Rn, so take it from the word itself.
+                    if (ReadWord(context, instruction) is { } word && (word & 0xFFA0FC00) == 0x7EA0D400)
+                        subtrahend = Reg((isDouble ? Arm64Register.D0 : Arm64Register.S0) + (int)((word >> 16) & 31));
+                    Add(address, OpCode.Subtract, dest, ScalarOperand(1), subtrahend);
                     Add(address, OpCode.Call, abs, dest, dest);
                     break;
                 }
@@ -2033,6 +2024,10 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 Arm64VectorElementWidth.D => "D",
                 _ => throw new ArgumentOutOfRangeException(nameof(vectorElement.Width), $"Unknown vector element width {vectorElement.Width}")
             };
+
+            // Element S[0] is scalar S<n>, the name VectorLane gives lane 0.
+            if (vectorElement.Width == Arm64VectorElementWidth.S && vectorElement.Index == 0)
+                return Reg(reg);
 
             var name = $"{NormalizeRegister(reg)}.{width}{vectorElement.Index}";
             return new Register(null, name);

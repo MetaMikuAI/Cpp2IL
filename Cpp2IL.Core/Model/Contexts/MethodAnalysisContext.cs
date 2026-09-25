@@ -500,6 +500,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         ThrowHelperRecovery.TypeThrowOperands(this);
         DeadCodeEliminator.Run(this);
 
+        // Removing runtime checks and their dead values can leave a type-metadata branch with nothing on either side.
+        if (RuntimeCheckBranchFolder.Run(this))
+            DeadCodeEliminator.Run(this);
+
         LocalVariables.RemoveUnused(this);
     }
 
