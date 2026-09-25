@@ -135,6 +135,73 @@ public class NewArm64KeyFunctionAddresses : BaseKeyFunctionAddresses
         return 0;
     }
 
+    protected override void FindVirtualDispatchHelpers()
+    {
+        Logger.Verbose("	Looking for the virtual dispatch helpers via il2cpp_object_get_virtual_method...");
+
+        var binary = _appContext.Binary;
+        var address = binary.GetVirtualAddressOfExportedFunctionByName("il2cpp_object_get_virtual_method");
+        for (var hops = 0; address != 0 && hops < 4 && GetBranchThunkTarget(address) is var next and not 0; hops++)
+            address = next;
+
+        var raw = address == 0 ? -1 : binary.MapVirtualAddressToRaw(address, false);
+        var bytes = binary.GetRawBinaryContent();
+        if (raw < 0 || raw > bytes.Length - 4)
+        {
+            Logger.VerboseNewline("Not found");
+            return;
+        }
+
+        // Object::GetVirtualMethod is short; a fixed window covers it and FindVirtualDispatchHelpers stops at its return.
+        var window = bytes.Slice((int)raw, (int)Math.Min(VirtualMethodWindowBytes, (bytes.Length - raw) & ~3L));
+        var body = Disassembler.Disassemble(window, address, new Disassembler.Options(true, true, false)).ToList();
+        (il2cpp_vm_class_get_interface_invoke_data_slow_path, il2cpp_vm_runtime_get_generic_virtual_method) = FindVirtualDispatchHelpers(body);
+
+        Logger.VerboseNewline($"Found slow path at 0x{il2cpp_vm_class_get_interface_invoke_data_slow_path:X}, generic virtual method at 0x{il2cpp_vm_runtime_get_generic_virtual_method:X}");
+    }
+
+    private const long VirtualMethodWindowBytes = 128 * 4;
+
+    // Object::GetVirtualMethod inlines ClassInlines::GetInterfaceInvokeDataFromVTable: its klass->interfaceOffsets
+    // scan loop falls through to the slow path call when no entry matches. For a generic method it then leaves
+    // with a tail call to Runtime::GetGenericVirtualMethod(vtableSlotMethod, method). Each must be unique.
+    internal static (ulong SlowPath, ulong GenericVirtualMethod) FindVirtualDispatchHelpers(IReadOnlyList<Arm64Instruction> body)
+    {
+        if (body.Count == 0)
+            return (0, 0);
+
+        var end = body.Count;
+        for (var i = 0; i < body.Count; i++)
+        {
+            if (body[i].Mnemonic is Arm64Mnemonic.RET or Arm64Mnemonic.RETAA or Arm64Mnemonic.RETAB)
+            {
+                end = i + 1;
+                break;
+            }
+        }
+
+        var start = body[0].Address;
+        var last = body[end - 1].Address;
+        var slowPaths = new HashSet<ulong>();
+        var tailCalls = new HashSet<ulong>();
+        for (var i = 0; i < end; i++)
+        {
+            var instruction = body[i];
+            if (instruction.Mnemonic != Arm64Mnemonic.B)
+                continue;
+
+            var conditional = instruction.MnemonicConditionCode is not (Arm64ConditionCode.NONE or Arm64ConditionCode.AL);
+            if (conditional && instruction.BranchTarget >= start && instruction.BranchTarget < instruction.Address
+                && i + 1 < end && body[i + 1].Mnemonic == Arm64Mnemonic.BL)
+                slowPaths.Add(body[i + 1].BranchTarget);
+            else if (!conditional && (instruction.BranchTarget < start || instruction.BranchTarget > last))
+                tailCalls.Add(instruction.BranchTarget);
+        }
+
+        tailCalls.ExceptWith(slowPaths);
+        return (slowPaths.Count == 1 ? slowPaths.Single() : 0, tailCalls.Count == 1 ? tailCalls.Single() : 0);
+    }
+
     protected override ulong GetBranchThunkTarget(ulong address) => GetBranchThunkTarget(_appContext, address);
 
     // An entry consisting of B alone preserves all arguments and the return value.
@@ -144,6 +211,28 @@ public class NewArm64KeyFunctionAddresses : BaseKeyFunctionAddresses
         var bytes = context.Binary.GetRawBinaryContent();
         if (raw < 0 || raw > bytes.Length - 4 || context.Binary.IsBigEndian) return 0;
         return DecodeBranchThunk(System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(bytes.Slice((int)raw, 4)), thunkAddress);
+    }
+
+    protected override ulong GetGuardedTailCallTarget(ulong address)
+    {
+        var raw = _appContext.Binary.MapVirtualAddressToRaw(address, false);
+        var bytes = _appContext.Binary.GetRawBinaryContent();
+        if (address == 0 || raw < 0 || raw > bytes.Length - 16 || _appContext.Binary.IsBigEndian) return 0;
+        var words = new uint[4];
+        for (var i = 0; i < 4; i++)
+            words[i] = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(bytes.Slice((int)raw + 4 * i, 4));
+        return DecodeGuardedTailCall(words, address);
+    }
+
+    // ldr wN, [x0, #imm]; cbz wN, +8; ret; b target
+    internal static ulong DecodeGuardedTailCall(IReadOnlyList<uint> words, ulong address)
+    {
+        if (words.Count < 4 || (words[0] & 0xFFC003E0) != 0xB9400000)
+            return 0;
+        var flag = words[0] & 0x1F;
+        if (words[1] != (0x34000040u | flag) || words[2] != 0xD65F03C0)
+            return 0;
+        return DecodeBranchThunk(words[3], address + 12);
     }
 
     internal static ulong DecodeBranchThunk(uint word, ulong thunkAddress)

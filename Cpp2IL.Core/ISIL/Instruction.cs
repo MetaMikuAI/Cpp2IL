@@ -33,6 +33,14 @@ public class Instruction : IOperand
     // Exists to clear the return register after a CallVoid, basically.
     public Register? ImplicitDefinition;
 
+    // The caller-saved registers a native call leaves undefined. SSA construction gives each a new
+    // version at the call, so no read after the call reaches a value from before it.
+    public Register[]? CallClobbers;
+
+    // For a call whose managed signature was known when it was lifted: the number of operands after
+    // the target (and result) that are declared arguments ('this' and parameters, not the MethodInfo).
+    public int DeclaredArguments;
+
     public bool IsFallThrough =>
         OpCode switch
         {

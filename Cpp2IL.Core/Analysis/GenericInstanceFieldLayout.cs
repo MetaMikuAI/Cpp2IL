@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using Cpp2IL.Core.Model.Contexts;
@@ -30,17 +31,42 @@ public static class GenericInstanceFieldLayout
     }
 
     public static FieldAnalysisContext? FindFieldAtOffset(TypeAnalysisContext definition, long targetOffset)
+        => ComputeLayout(definition)?.Slots.FirstOrDefault(s => s.Offset == targetOffset)?.Definition;
+
+    /// <summary>An instance field of a computed layout, at its offset from the receiver's storage.</summary>
+    public sealed record FieldSlot(FieldAnalysisContext Definition, FieldAnalysisContext Field, long Offset, long Size);
+
+    /// <summary>
+    /// Lays out the instance fields of a generic definition or instance as the IL2CPP runtime does:
+    /// in declaration order, each at its natural alignment after the base storage. A value type is
+    /// addressed unboxed, so its first field starts at 0 rather than after an object header. Fields
+    /// of an instance are bound to it so their types are substituted. The slots stop before the first
+    /// field whose size and alignment cannot be proven, since every later offset depends on it;
+    /// <c>Complete</c> reports whether all fields were laid out, and <c>End</c> where the last one ends.
+    /// </summary>
+    public static (List<FieldSlot> Slots, bool Complete, long End)? ComputeLayout(TypeAnalysisContext type)
     {
-        var instance = definition as GenericInstanceTypeAnalysisContext;
-        definition = instance?.GenericType ?? definition;
+        var instance = type as GenericInstanceTypeAnalysisContext;
+        var definition = instance?.GenericType ?? type;
         var pointerSize = definition.AppContext.Binary.PointerSizeBytes;
 
         if ((definition.Attributes & TypeAttributes.LayoutMask) == TypeAttributes.ExplicitLayout
             || definition.Definition is { PackingSize: > 0 })
             return null;
-        if (BaseStorageEnd(instance?.BaseType ?? definition.BaseType, pointerSize) is not { } offset)
+        long offset;
+        if (definition.IsValueType)
+        {
+            // An explicit class size may pad or truncate the natural extent.
+            if (definition.Definition is { ClassSizeIsDefault: false })
+                return null;
+            offset = 0;
+        }
+        else if (BaseStorageEnd(instance?.BaseType ?? definition.BaseType, pointerSize) is { } baseEnd)
+            offset = baseEnd;
+        else
             return null;
 
+        var slots = new List<FieldSlot>();
         foreach (var field in definition.Fields)
         {
             if (field.IsStatic)
@@ -50,19 +76,24 @@ public static class GenericInstanceFieldLayout
             // even when T is a value type with an otherwise unknown layout.
             var fieldType = instance == null ? field.FieldType
                 : GenericInstantiation.Instantiate(field.FieldType, instance.GenericArguments, []);
-            if (GetSizeAndAlignment(fieldType, pointerSize, allowMetadataStructs: !definition.IsValueType) is not var (size, alignment))
-                return null;
+            if (GetSizeAndAlignment(fieldType, pointerSize, allowMetadataStructs: true) is not var (size, alignment))
+                return (slots, false, offset);
 
             offset = (offset + alignment - 1) & ~(alignment - 1);
-
-            if (offset == targetOffset)
-                return field;
-
+            slots.Add(new(field, instance == null ? field : new ConcreteGenericFieldAnalysisContext(field, instance), offset, size));
             offset += size;
         }
 
-        return null;
+        return (slots, true, offset);
     }
+
+    /// <summary>
+    /// The unboxed size and alignment of a value type, or null if its layout is not proven. Scalars
+    /// and enums have fixed sizes, a non-generic struct must agree with its metadata, and a generic
+    /// instance is laid out from its substituted field types.
+    /// </summary>
+    public static (long Size, long Alignment)? ValueTypeSizeAndAlignment(TypeAnalysisContext type)
+        => type.IsValueType ? GetSizeAndAlignment(type, type.AppContext.Binary.PointerSizeBytes, allowMetadataStructs: true) : null;
 
     private static long? BaseStorageEnd(TypeAnalysisContext? type, int pointerSize)
     {
@@ -122,8 +153,34 @@ public static class GenericInstanceFieldLayout
             "System.Int32" or "System.UInt32" or "System.Single" => (4, 4),
             "System.Int64" or "System.UInt64" or "System.Double" => (8, 8),
             "System.IntPtr" or "System.UIntPtr" => (pointerSize, pointerSize),
-            _ => allowMetadataStructs ? MetadataValueTypeLayout(fieldType, pointerSize, depth + 1) : null
+            _ => !allowMetadataStructs ? null
+                : fieldType is GenericInstanceTypeAnalysisContext instance ? GenericValueTypeLayout(instance, pointerSize, depth + 1)
+                : MetadataValueTypeLayout(fieldType, pointerSize, depth + 1)
         };
+    }
+
+    private static (long Size, long Alignment)? GenericValueTypeLayout(GenericInstanceTypeAnalysisContext instance, int pointerSize, int depth)
+    {
+        // Instantiations carry no metadata size, so the natural layout is only inferred for the
+        // 64-bit rules above, where the runtime aligns each field to its own alignment.
+        var definition = instance.GenericType;
+        if (pointerSize != 8 || depth > 16 || definition.Definition is not { PackingSize: 0, ClassSizeIsDefault: true }
+            || (definition.Attributes & TypeAttributes.LayoutMask) == TypeAttributes.ExplicitLayout)
+            return null;
+        var end = 0L;
+        var alignment = 1L;
+        var any = false;
+        foreach (var field in definition.Fields.Where(f => !f.IsStatic))
+        {
+            var fieldType = GenericInstantiation.Instantiate(field.FieldType, instance.GenericArguments, []);
+            if (GetSizeAndAlignment(fieldType, pointerSize, true, depth) is not { } layout) return null;
+            end = (end + layout.Alignment - 1) & ~(layout.Alignment - 1);
+            end += layout.Size;
+            alignment = Math.Max(alignment, layout.Alignment);
+            any = true;
+        }
+        // An empty struct still occupies storage, but its size is not a field layout to infer.
+        return any ? ((end + alignment - 1) & ~(alignment - 1), alignment) : null;
     }
 
     private static (long Size, long Alignment)? MetadataValueTypeLayout(TypeAnalysisContext type, int pointerSize, int depth)

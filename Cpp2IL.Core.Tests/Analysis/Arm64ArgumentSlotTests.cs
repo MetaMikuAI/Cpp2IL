@@ -1,5 +1,8 @@
 using System.Linq;
 using System.Reflection;
+using Cpp2IL.Core.Analysis;
+using Cpp2IL.Core.Graphs;
+using Cpp2IL.Core.InstructionSets;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
@@ -27,7 +30,8 @@ public class Arm64ArgumentSlotTests
 
     [TestCase("pair", 2)]
     [TestCase("fourInts", 2)]
-    [TestCase("float", 1)]
+    [TestCase("mixedFloat", 2)]
+    [TestCase("hfa", 1)]
     [TestCase("offset", 1)]
     [TestCase("packed", 1)]
     [TestCase("explicit", 1)]
@@ -41,7 +45,12 @@ public class Arm64ArgumentSlotTests
                 pair.Fields.Clear();
                 for (var i = 0; i < 4; i++) pair.Fields.Add(new InjectedFieldAnalysisContext($"f{i}", app.SystemTypes.SystemInt32Type, FieldAttributes.Public, pair, i * 4));
                 break;
-            case "float": pair.Fields[0].FieldType = app.SystemTypes.SystemDoubleType; break;
+            // A composite that is not homogeneous floating point still travels in X registers.
+            case "mixedFloat": pair.Fields[0].FieldType = app.SystemTypes.SystemDoubleType; break;
+            case "hfa":
+                pair.Fields[0].FieldType = app.SystemTypes.SystemDoubleType;
+                pair.Fields[1].FieldType = app.SystemTypes.SystemDoubleType;
+                break;
             case "offset": pair.Fields[1].Offset = 10; break;
             case "packed": pair.Definition!.Bitfield |= 1u << 6; break;
             case "explicit": pair.Attributes = TypeAttributes.Public | TypeAttributes.ExplicitLayout; break;
@@ -164,5 +173,164 @@ public class Arm64ArgumentSlotTests
         InstructionSets.NewArmV8InstructionSet.RecoverFloatingAggregateBoundary(method, instructions);
         Assert.That(instructions, Has.Count.EqualTo(1));
         Assert.That(((Register)ret.Operands[0]).Name, Is.EqualTo("X0"));
+    }
+
+    [Test]
+    public void NestedCompositeCarriesOneMemberPerRegister()
+    {
+        var inner = app.AllTypes.Single(t => t.FullName == "UnityEngine.Vector4");
+        inner.Definition!.Bitfield = (inner.Definition.Bitfield & ~(0xFu << 6)) | (1u << 11);
+        inner.Fields.Clear();
+        inner.Fields.Add(new InjectedFieldAnalysisContext("handle", app.SystemTypes.SystemIntPtrType, FieldAttributes.Public, inner, 0));
+        inner.Fields.Add(new InjectedFieldAnalysisContext("version", app.SystemTypes.SystemUInt32Type, FieldAttributes.Public, inner, 8));
+        pair.Fields.Clear();
+        pair.Fields.Add(new InjectedFieldAnalysisContext("inner", inner, FieldAttributes.Public, pair, 0));
+        Assert.That(Arm64CallingConventionResolver.IntegerArgumentSlots(pair), Is.EqualTo(2));
+        Assert.That(Arm64CallingConventionResolver.IntegerCompositeMembers(pair), Is.EqualTo(new[] { (0L, 8), (8L, 4) }));
+        inner.Fields[1].Offset = 12;
+        Assert.That(Arm64CallingConventionResolver.IntegerArgumentSlots(pair), Is.EqualTo(1));
+    }
+
+    [Test]
+    public void CompositeBoundaryUnpacksParameters()
+    {
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Identity", pair,
+            MethodAttributes.Public, [pair]);
+        var operands = new NewArmV8InstructionSet().GetParameterOperandsFromMethod(method);
+        Assert.That(operands.Cast<Register>().Select(r => r.Name),
+            Is.EqualTo(new[] { "X0", "composite_parameter_0", "X3" }));
+        var ret = new Instruction(0, OpCode.Return, new Register(null, "X0"));
+        var instructions = new System.Collections.Generic.List<Instruction> { ret };
+        NewArmV8InstructionSet.RecoverFloatingAggregateBoundary(method, instructions);
+        Assert.That(instructions, Has.Count.EqualTo(3));
+        // X1 and X2 carry the parameter's members; its padding is not read.
+        Assert.That(instructions.Take(2).Select(i => (((Register)i.Operands[0]).Name, ((MemoryOperand)i.Operands[1]).Addend,
+            ((MemoryOperand)i.Operands[1]).AccessSize)), Is.EqualTo(new[] { ("X1", 0L, 8), ("X2", 8L, 2) }));
+        Assert.That(instructions[^1], Is.SameAs(ret));
+    }
+
+    [Test]
+    public void CallClobbersCallerSavedRegistersButKeepsItsResult()
+    {
+        Register Reg(string name) => new(null, name);
+        var argument = new Instruction(0, OpCode.Move, Reg("X1"), new Immediate(5));
+        var saved = new Instruction(1, OpCode.Move, Reg("X19"), new Immediate(6));
+        var call = new Instruction(2, OpCode.Call, new Immediate(0x1000), Reg("X0"), Reg("X1"));
+        NewArmV8InstructionSet.ClobberCallerSaved(call);
+        Assert.That(call.CallClobbers!.Select(r => r.Name), Does.Contain("X1").And.Contain("V31").And.Not.Contain("X0")
+            .And.Not.Contain("X19").And.Not.Contain("V8"));
+        var unknown = new Instruction(0, OpCode.Call, new Immediate(0x1000), Reg("X0"));
+        NewArmV8InstructionSet.ClobberCallerSaved(unknown, unknownSignature: true);
+        Assert.That(unknown.CallClobbers!.Select(r => r.Name), Does.Contain("X2").And.Contain("V4").And.Not.Contain("X1")
+            .And.Not.Contain("V0").And.Not.Contain("V3"));
+        var use = new Instruction(3, OpCode.Add, Reg("X2"), Reg("X1"), Reg("X19"));
+        var ret = new Instruction(4, OpCode.Return, Reg("X0"));
+        var graph = new ISILControlFlowGraph([argument, saved, call, use, ret]);
+        SsaForm.Build(graph, new DominatorInfo(graph));
+        Assert.That(call.Operands[2], Is.EqualTo(argument.Destination));
+        Assert.That(use.Operands[1], Is.Not.EqualTo(argument.Destination));
+        Assert.That(use.Operands[2], Is.EqualTo(saved.Destination));
+        Assert.That(ret.Operands[0], Is.EqualTo(call.Destination));
+        Assert.That(call.CallClobbers, Is.Null);
+    }
+
+    [Test]
+    public void UnsetDeclaredArgumentKeepsItsValueButUnsetMethodInfoDoesNot()
+    {
+        // The callee never reads an argument the caller left unset since a call, e.g. an unused 'this'.
+        Register Reg(string name) => new(null, name);
+        var receiver = new Instruction(0, OpCode.Move, Reg("X0"), new Immediate(5));
+        var methodInfo = new Instruction(1, OpCode.Move, Reg("X1"), new Immediate(6));
+        var first = new Instruction(2, OpCode.CallVoid, new Immediate(0x1000), Reg("X0"), Reg("X1"));
+        NewArmV8InstructionSet.ClobberCallerSaved(first);
+        var second = new Instruction(3, OpCode.CallVoid, new Immediate(0x2000), Reg("X0"), Reg("X1")) { DeclaredArguments = 1 };
+        var graph = new ISILControlFlowGraph([receiver, methodInfo, first, second, new(4, OpCode.Return)]);
+        SsaForm.Build(graph, new DominatorInfo(graph));
+        Assert.That(second.Operands[1], Is.EqualTo(receiver.Destination));
+        Assert.That(second.Operands[2], Is.Not.EqualTo(methodInfo.Destination));
+    }
+
+    [Test]
+    public void MergeThroughACallKeepsThePriorValue()
+    {
+        // A throw helper the graph still falls through must not leave a merge without a value.
+        Register Reg(string name) => new(null, name);
+        var value = new Instruction(0, OpCode.Move, Reg("X1"), new Immediate(5));
+        var merge = new Instruction(4, OpCode.Move, Reg("X1"), Reg("X1"));
+        var redefined = new Instruction(3, OpCode.Move, Reg("X1"), new Immediate(6));
+        var call = new Instruction(2, OpCode.CallVoid, new Immediate(0x1000));
+        NewArmV8InstructionSet.ClobberCallerSaved(call);
+        var branch = new Instruction(1, OpCode.ConditionalJump, redefined, Reg("condition"));
+        var join = new Instruction(5, OpCode.Return, Reg("X1"));
+        var graph = new ISILControlFlowGraph([value, branch, call, new(6, OpCode.Jump, merge), redefined, merge, join]);
+        SsaForm.Build(graph, new DominatorInfo(graph));
+        var phi = graph.Instructions.Single(i => i.OpCode == OpCode.Phi);
+        Assert.That(phi.Operands.Skip(1), Does.Contain(value.Destination).And.Contain(redefined.Destination));
+    }
+
+    private (MethodAnalysisContext Method, LocalVariable Receiver, long Offset) CompositeOwner(params LocalVariable[] locals)
+    {
+        var owner = app.AllTypes.Single(t => t.FullName == "UnityEngine.Object");
+        var field = owner.Fields.Single(f => f.Name == "m_CachedPtr");
+        field.FieldType = pair;
+        var receiver = new LocalVariable("this", new Register(null, "X0"), owner) { IsThis = true };
+        var method = new InjectedMethodAnalysisContext(owner, "Copy", app.SystemTypes.SystemVoidType, MethodAttributes.Public, [pair])
+        {
+            Locals = [receiver, .. locals]
+        };
+        return (method, receiver, field.Offset);
+    }
+
+    [Test]
+    public void StoringBothRegistersOfACompositeParameterAssignsTheValue()
+    {
+        var value = new LocalVariable("value", new Register(null, "composite_parameter_0"), pair);
+        var low = new LocalVariable("low", new Register(null, "X1"));
+        var high = new LocalVariable("high", new Register(null, "X2"));
+        var (method, receiver, offset) = CompositeOwner(value, low, high);
+        method.ParameterLocals = [receiver, value];
+        var lowStore = new Instruction(3, OpCode.Move, new MemoryOperand(receiver, addend: offset, accessSize: 8), low);
+        var highStore = new Instruction(4, OpCode.Move, new MemoryOperand(receiver, addend: offset + 8, accessSize: 8), high);
+        method.ControlFlowGraph = new ISILControlFlowGraph(
+        [
+            new(0, OpCode.Move, low, new MemoryOperand(value, addend: 0, accessSize: 8)),
+            new(1, OpCode.Move, high, new MemoryOperand(value, addend: 8, accessSize: 2)),
+            new(2, OpCode.Move, new LocalVariable("unrelated", new Register(null, "X9")), new Immediate(1)),
+            lowStore, highStore, new(5, OpCode.Return)
+        ]);
+        Assert.That(AggregateCopyRecovery.Run(method), Is.True);
+        Assert.That(lowStore.Operands[0], Is.TypeOf<FieldReference>());
+        Assert.That(((FieldReference)lowStore.Operands[0]).Field.FieldType, Is.EqualTo(pair));
+        Assert.That(lowStore.Operands[1], Is.SameAs(value));
+        Assert.That(highStore.OpCode, Is.EqualTo(OpCode.Nop));
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
+    public void PassingBothHalvesOfAFieldPassesTheField(bool callBetween)
+    {
+        var argument = new LocalVariable("argument", new Register(null, "composite_arg_10_0"), pair);
+        var low = new LocalVariable("low", new Register(null, "X1"));
+        var high = new LocalVariable("high", new Register(null, "X2"));
+        var (method, receiver, offset) = CompositeOwner(argument, low, high);
+        method.ParameterLocals = [receiver];
+        var lowStore = new Instruction(3, OpCode.Move, new MemoryOperand(argument, addend: 0, accessSize: 8), low);
+        var highStore = new Instruction(4, OpCode.Move, new MemoryOperand(argument, addend: 8, accessSize: 2), high);
+        method.ControlFlowGraph = new ISILControlFlowGraph(
+        [
+            new(0, OpCode.Move, low, new MemoryOperand(receiver, addend: offset, accessSize: 8)),
+            new(1, OpCode.Move, high, new MemoryOperand(receiver, addend: offset + 8, accessSize: 8)),
+            callBetween ? new(2, OpCode.CallVoid, new Immediate(0x2000), receiver) : new(2, OpCode.Nop),
+            lowStore, highStore, new(5, OpCode.CallVoid, new Immediate(0x1000), argument), new(6, OpCode.Return)
+        ]);
+        Assert.That(AggregateCopyRecovery.Run(method), Is.EqualTo(!callBetween));
+        if (callBetween)
+        {
+            Assert.That(highStore.OpCode, Is.EqualTo(OpCode.Move));
+            return;
+        }
+        Assert.That(lowStore.Operands[0], Is.SameAs(argument));
+        Assert.That(((FieldReference)lowStore.Operands[1]).Local, Is.SameAs(receiver));
+        Assert.That(highStore.OpCode, Is.EqualTo(OpCode.Nop));
     }
 }

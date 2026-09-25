@@ -3,6 +3,7 @@ using System.Linq;
 using System.Reflection;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
+using LibCpp2IL.BinaryStructures;
 
 namespace Cpp2IL.Core.Utils;
 
@@ -11,6 +12,15 @@ namespace Cpp2IL.Core.Utils;
 public class Arm64CallingConventionResolver : BaseCallingConventionResolver
 {
     private const int PtrSize = 8;
+
+    // AAPCS64 6.1.1: a call may overwrite X0-X17 and V0-V7, V16-V31 (only the low 64 bits of
+    // V8-V15 survive, and ISIL does not model the upper halves of those).
+    internal static readonly string[] CallerSavedRegisters =
+    [
+        .. Enumerable.Range(0, 18).Select(n => $"X{n}"),
+        .. Enumerable.Range(0, 8).Select(n => $"V{n}"),
+        .. Enumerable.Range(16, 16).Select(n => $"V{n}")
+    ];
 
     private static readonly string[] IntegerRegisters = ["X0", "X1", "X2", "X3", "X4", "X5", "X6", "X7"];
     private static readonly string[] FloatRegisters = ["V0", "V1", "V2", "V3", "V4", "V5", "V6", "V7"];
@@ -46,35 +56,88 @@ public class Arm64CallingConventionResolver : BaseCallingConventionResolver
         => IntegerArgumentSlots(parameter.ParameterType);
 
     internal static int IntegerArgumentSlots(TypeAnalysisContext type)
+        => IntegerCompositeRegisters(type) is { Length: 2 } ? 2 : 1;
+
+    // AAPCS64 C.10/C.12: a composite of 9 to 16 bytes that is not an HFA occupies two consecutive
+    // X registers, each holding the next 8 bytes of the value's memory image. Returns the members
+    // (flattened through nested value types) each register carries. Only an ordinary sequential
+    // layout is proven; packed, explicit, generic and unknown layouts yield null.
+    internal static (long Offset, int Size)[][]? IntegerCompositeRegisters(TypeAnalysisContext type)
     {
-        // AAPCS64 C.12: an integer composite occupies consecutive X registers.
-        // Prove an ordinary flat integral/reference layout; HFA, packed, explicit
-        // and unknown layouts must not be classified by size alone.
-        if (!type.IsValueType || type.IsEnumType || type is GenericInstanceTypeAnalysisContext
-            || type.GenericParameters.Count != 0 || type.AppContext.Binary.PointerSizeBytes != PtrSize
+        if (!type.IsValueType || type.IsEnumType || type.AppContext.Binary.PointerSizeBytes != PtrSize
+            || TypeSizes.UnboxedSize(type, PtrSize) is not (> 8 and <= 16))
+            return null;
+        var leaves = new List<(long Offset, int Size, bool Float)>();
+        if (FlattenMembers(type, 0, leaves, 0) == null || leaves.Count == 0)
+            return null;
+        // Members of one floating-point type form an HFA, which travels in SIMD registers.
+        if (leaves.All(l => l.Float && l.Size == leaves[0].Size))
+            return null;
+        return
+        [
+            leaves.Where(l => l.Offset < PtrSize).Select(l => (l.Offset, l.Size)).ToArray(),
+            leaves.Where(l => l.Offset >= PtrSize).Select(l => (l.Offset, l.Size)).ToArray()
+        ];
+    }
+
+    // The member each register of an integer composite carries, when each carries exactly one
+    // (starting at the register's first byte); the rest of that register is padding.
+    internal static (long Offset, int Size)[]? IntegerCompositeMembers(TypeAnalysisContext type)
+        => IntegerCompositeRegisters(type) is [[var low], [var high]] && low.Offset == 0 && high.Offset == PtrSize
+            ? [low, high]
+            : null;
+
+    // Appends the scalar members of type at start; returns the type's alignment, or null.
+    private static long? FlattenMembers(TypeAnalysisContext type, long start, List<(long Offset, int Size, bool Float)> leaves, int depth)
+    {
+        if (depth > 4 || type is GenericInstanceTypeAnalysisContext || type.GenericParameters.Count != 0
             || type.Definition is not { PackingSize: 0, ClassSizeIsDefault: true }
-            || (type.Attributes & TypeAttributes.LayoutMask) == TypeAttributes.ExplicitLayout
-            || TypeSizes.UnboxedSize(type, PtrSize) is not (> 8 and <= 16)) return 1;
-        var offset = 0;
-        var alignment = 1;
+            || (type.Attributes & TypeAttributes.LayoutMask) == TypeAttributes.ExplicitLayout)
+            return null;
+        var offset = 0L;
+        var alignment = 1L;
         foreach (var field in type.Fields.Where(f => !f.IsStatic).OrderBy(f => f.Offset))
         {
-            var size = !field.FieldType.IsValueType ? PtrSize : field.FieldType.FullName switch
+            var fieldType = field.FieldType;
+            long size, fieldAlignment;
+            if (!fieldType.IsValueType)
             {
-                "System.Boolean" or "System.Byte" or "System.SByte" => 1,
-                "System.Char" or "System.Int16" or "System.UInt16" => 2,
-                "System.Int32" or "System.UInt32" => 4,
-                "System.Int64" or "System.UInt64" or "System.IntPtr" or "System.UIntPtr" => 8,
-                _ => 0
-            };
-            if (size == 0) return 1;
-            alignment = System.Math.Max(alignment, size);
-            offset = (offset + size - 1) & -size;
-            if (field.Offset != offset) return 1;
+                size = fieldAlignment = PtrSize;
+                leaves.Add((start + field.Offset, PtrSize, false));
+            }
+            else if (fieldType.IsEnumType || ScalarSize(fieldType) != 0)
+            {
+                size = fieldAlignment = fieldType.IsEnumType ? TypeSizes.UnboxedSize(fieldType, PtrSize) : ScalarSize(fieldType);
+                if (size is not (1 or 2 or 4 or 8))
+                    return null;
+                leaves.Add((start + field.Offset, (int)size, !fieldType.IsEnumType && IsFloatingPoint(fieldType)));
+            }
+            else if (fieldType.Type == Il2CppTypeEnum.IL2CPP_TYPE_VALUETYPE)
+            {
+                size = TypeSizes.UnboxedSize(fieldType, PtrSize);
+                if (size <= 0 || FlattenMembers(fieldType, start + field.Offset, leaves, depth + 1) is not { } nested)
+                    return null;
+                fieldAlignment = nested;
+            }
+            else return null;
+
+            alignment = System.Math.Max(alignment, fieldAlignment);
+            offset = (offset + fieldAlignment - 1) & -fieldAlignment;
+            if (field.Offset != offset)
+                return null;
             offset += size;
         }
-        return ((offset + alignment - 1) & -alignment) == TypeSizes.UnboxedSize(type, PtrSize) ? 2 : 1;
+        return ((offset + alignment - 1) & -alignment) == TypeSizes.UnboxedSize(type, PtrSize) ? alignment : null;
     }
+
+    private static long ScalarSize(TypeAnalysisContext type) => type.FullName switch
+    {
+        "System.Boolean" or "System.Byte" or "System.SByte" => 1,
+        "System.Char" or "System.Int16" or "System.UInt16" => 2,
+        "System.Int32" or "System.UInt32" or "System.Single" => 4,
+        "System.Int64" or "System.UInt64" or "System.IntPtr" or "System.UIntPtr" or "System.Double" => 8,
+        _ => 0
+    };
 
     // Flat homogeneous floating aggregates use consecutive SIMD registers, not X registers.
     internal static FieldAnalysisContext[]? FloatingAggregateFields(TypeAnalysisContext type)

@@ -503,4 +503,91 @@ public class IlGeneratorTests
         IlGenerator.GenerateIl(caller, definition);
         return definition;
     }
+
+    [TestCase(false, 24, true)]
+    [TestCase(true, 24, true)]
+    [TestCase(false, 8, false)]
+    [TestCase(false, 0, false)]
+    public void ZeroStoreToEmbeddedValueTypeField_InitializesOnlyAWholeAggregate(bool isStatic, int accessSize, bool whole)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var aggregate = app.AllTypes.Single(t => t.FullName == "UnityEngine.Bounds");
+        var module = new ModuleDefinition("ZeroField.dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        var aggregateDefinition = new TypeDefinition("Tests", "Aggregate", TypeAttributes.Public | TypeAttributes.SequentialLayout,
+            module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", "ValueType"));
+        module.TopLevelTypes.Add(aggregateDefinition);
+        aggregate.PutExtraData("AsmResolverType", aggregateDefinition);
+        var owner = new TypeDefinition("Tests", "Owner", TypeAttributes.Public);
+        module.TopLevelTypes.Add(owner);
+        var fieldDefinition = new FieldDefinition("Bounds", FieldAttributes.Public | (isStatic ? FieldAttributes.Static : 0),
+            new FieldSignature(aggregateDefinition.ToTypeSignature(true)));
+        owner.Fields.Add(fieldDefinition);
+        var field = new InjectedFieldAnalysisContext("Bounds", aggregate,
+            System.Reflection.FieldAttributes.Public | (isStatic ? System.Reflection.FieldAttributes.Static : 0), app.SystemTypes.SystemObjectType);
+        field.PutExtraData("AsmResolverField", fieldDefinition);
+        var receiver = new LocalVariable("receiver", new Register(null, "receiver"));
+        var caller = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Caller", app.SystemTypes.SystemVoidType,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, [])
+        {
+            Locals = [receiver], ParameterLocals = [],
+            ControlFlowGraph = new ISILControlFlowGraph([
+                new Instruction(0, OpCode.Move, new FieldReference(field, receiver, 0) { AccessSize = accessSize }, Imm(0)),
+                new Instruction(1, OpCode.Return)]),
+        };
+        var generated = new MethodDefinition("Caller", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        owner.Methods.Add(generated);
+        IlGenerator.GenerateIl(caller, generated);
+        var il = generated.CilMethodBody!.Instructions;
+        // UnityEngine.Bounds is 24 bytes; a narrower store keeps its (mismatched) scalar form.
+        Assert.That(il.Count(i => i.OpCode == (isStatic ? CilOpCodes.Ldsflda : CilOpCodes.Ldflda)), Is.EqualTo(whole ? 1 : 0));
+        Assert.That(il.Count(i => i.OpCode == CilOpCodes.Initobj), Is.EqualTo(whole ? 1 : 0));
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Stfld || i.OpCode == CilOpCodes.Stsfld || i.OpCode == CilOpCodes.Ldc_I4), Is.EqualTo(!whole));
+        Assert.That(il.Count(i => i.OpCode == CilOpCodes.Ldloc), Is.EqualTo(isStatic ? 0 : 1));
+    }
+
+    [TestCase("packed", true)]
+    [TestCase("wide", false)]
+    [TestCase("enum", false)]
+    public void ZeroRegisterArgument_IsDefaultOnlyForSingleRegisterAggregates(string kind, bool expectDefault)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var parameterType = kind switch
+        {
+            "wide" => app.AllTypes.Single(t => t.FullName == "UnityEngine.Bounds"),
+            "enum" => app.AllTypes.First(t => t.IsEnumType && t.EnumUnderlyingType == app.SystemTypes.SystemInt32Type),
+            _ => app.AllTypes.First(t => t is { Type: LibCpp2IL.BinaryStructures.Il2CppTypeEnum.IL2CPP_TYPE_VALUETYPE, IsEnumType: false }
+                && t.GenericParameters.Count == 0 && Utils.TypeSizes.UnboxedSize(t, 8) == 8
+                && t.Fields.Count(f => !f.IsStatic) == 2),
+        };
+        var module = new ModuleDefinition("ZeroArgument.dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        var parameterDefinition = new TypeDefinition("Tests", "Parameter", TypeAttributes.Public | TypeAttributes.SequentialLayout,
+            module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", kind == "enum" ? "Enum" : "ValueType"));
+        module.TopLevelTypes.Add(parameterDefinition);
+        parameterType.PutExtraData("AsmResolverType", parameterDefinition);
+        var owner = new TypeDefinition("Tests", "Owner", TypeAttributes.Public);
+        module.TopLevelTypes.Add(owner);
+        var target = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Consume", app.SystemTypes.SystemVoidType,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, [parameterType]);
+        var targetDefinition = new MethodDefinition("Consume", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void, [parameterDefinition.ToTypeSignature(true)]));
+        owner.Methods.Add(targetDefinition);
+        target.PutExtraData("AsmResolverMethod", targetDefinition);
+        var caller = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Caller", app.SystemTypes.SystemVoidType,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, [])
+        {
+            Locals = [], ParameterLocals = [],
+            ControlFlowGraph = new ISILControlFlowGraph([
+                new Instruction(0, OpCode.CallVoid, target, Imm(0)),
+                new Instruction(1, OpCode.Return)]),
+        };
+        var generated = new MethodDefinition("Caller", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        owner.Methods.Add(generated);
+        IlGenerator.GenerateIl(caller, generated);
+        var il = generated.CilMethodBody!.Instructions;
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Initobj), Is.EqualTo(expectDefault));
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldc_I4), Is.EqualTo(!expectDefault));
+        Assert.That(il.Count(i => i.OpCode == CilOpCodes.Call), Is.EqualTo(1));
+    }
 }

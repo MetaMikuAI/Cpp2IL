@@ -657,8 +657,8 @@ public static class IlGenerator
                 // Native aggregate zeroing can collapse to a scalar Move after adjacent ARM64
                 // stack slots are reconnected into one value-type local. A scalar ldc.i4.0 cannot
                 // be stored into that local in managed IL; initialize the aggregate explicitly.
-                if (instruction.Operands is [LocalVariable { Type: { IsValueType: true } valueType } zeroed, var zero]
-                    && valueType.Type is Il2CppTypeEnum.IL2CPP_TYPE_VALUETYPE or Il2CppTypeEnum.IL2CPP_TYPE_GENERICINST
+                if (instruction.Operands is [LocalVariable { Type: { } valueType } zeroed, var zero]
+                    && IsAggregateValueType(valueType)
                     && IsZeroConstant(zero))
                 {
                     instructions.Add(CilOpCodes.Ldloca, locals[zeroed]);
@@ -668,6 +668,19 @@ public static class IlGenerator
 
                 if (instruction.Operands[0] is FieldReference field) // stfld takes instance before value so LoadOperand StoreToOperand doesn't work
                 {
+                    // A native zero store as wide as the embedded value type clears all of it:
+                    // default(T), not an integer. A narrower one (a single store spanning only some
+                    // of its members) is not a whole-value write and is left as it is.
+                    if (IsZeroConstant(instruction.Operands[1]) && IsAggregateValueType(field.Field.FieldType)
+                        && TypeSizes.UnboxedSize(field.Field.FieldType, context.AppContext.Binary.PointerSizeBytes) is > 0 and var fieldSize
+                        && field.AccessSize >= fieldSize)
+                    {
+                        LoadFieldOwner(field, method, locals);
+                        instructions.Add(field.Field.IsStatic ? CilOpCodes.Ldsflda : CilOpCodes.Ldflda, field.Field.ToFieldDescriptor());
+                        instructions.Add(CilOpCodes.Initobj, field.Field.FieldType.ToTypeSignature().ToTypeDefOrRef());
+                        break;
+                    }
+
                     LoadFieldOwner(field, method, locals);
                     LoadOperand(instruction.Operands[1], method, locals, writeLine, field.Field.FieldType);
                     instructions.Add(field.Field.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld, field.Field.ToFieldDescriptor());
@@ -712,7 +725,7 @@ public static class IlGenerator
                     // the constructor declares (i.e. drop methodInfo)
                     var constructorArgs = constructorCall.Operands.Skip(ConstructorReceiverIndex(constructorCall) + 1).Take(constructor.Parameters.Count).ToList();
                     for (var i = 0; i < constructorArgs.Count; i++)
-                        LoadOperand(ManagedValueArgument(constructorArgs[i], constructor.Parameters[i].ParameterType),
+                        LoadArgument(ManagedValueArgument(constructorArgs[i], constructor.Parameters[i].ParameterType),
                             method, locals, writeLine, constructor.Parameters[i].ParameterType);
 
                     instructions.Add(CilOpCodes.Newobj, constructor.ToMethodDescriptor());
@@ -853,7 +866,7 @@ public static class IlGenerator
                     var parameterType = targetMethod.Parameters[i].ParameterType;
 
                     if (i < availableArgs)
-                        LoadOperand(ManagedValueArgument(instruction.Operands[callParamIndex + i], parameterType),
+                        LoadArgument(ManagedValueArgument(instruction.Operands[callParamIndex + i], parameterType),
                             method, locals, writeLine, parameterType);
                     else
                         PushDefaultOf(parameterType, instructions);
@@ -882,7 +895,7 @@ public static class IlGenerator
                 if (!context.IsVoid)
                 {
                     if (instruction.Operands.Count == 1)
-                        LoadOperand(instruction.Operands[0], method, locals, writeLine, context.ReturnType);
+                        LoadArgument(instruction.Operands[0], method, locals, writeLine, context.ReturnType);
                     else
                         instructions.Add(CilOpCodes.Ldnull); // ret still pops a value even if we lost track of it
                 }
@@ -1304,6 +1317,36 @@ public static class IlGenerator
         }
     }
 
+    /// <summary>
+    /// Loads a value passed in registers - a call argument or a return value. A value type no wider
+    /// than one register travels packed in that register, so a zero there is the whole value zeroed,
+    /// which managed code spells default(T). Wider aggregates span several registers (or memory), so a
+    /// single zero register says nothing about the rest and is left to <see cref="LoadOperand"/>.
+    /// </summary>
+    private static void LoadArgument(IOperand operand, MethodDefinition method,
+        Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine, TypeAnalysisContext expectedType)
+    {
+        var pointerSize = expectedType.AppContext.Binary.PointerSizeBytes;
+        if (IsZeroConstant(operand) && IsAggregateValueType(expectedType)
+            && TypeSizes.UnboxedSize(expectedType, pointerSize) is > 0 and var size && size <= pointerSize)
+        {
+            var body = method.CilMethodBody!;
+            var zeroed = new CilLocalVariable(expectedType.ToTypeSignature());
+            body.LocalVariables.Add(zeroed);
+            body.Instructions.Add(CilOpCodes.Ldloca, zeroed);
+            body.Instructions.Add(CilOpCodes.Initobj, expectedType.ToTypeSignature().ToTypeDefOrRef());
+            body.Instructions.Add(CilOpCodes.Ldloc, zeroed);
+            return;
+        }
+
+        LoadOperand(operand, method, locals, writeLine, expectedType);
+    }
+
+    // A struct (not an enum or primitive): zero-initialized with initobj rather than an integer literal.
+    private static bool IsAggregateValueType(TypeAnalysisContext? type) =>
+        type is { IsValueType: true, IsEnumType: false }
+        && type.Type is Il2CppTypeEnum.IL2CPP_TYPE_VALUETYPE or Il2CppTypeEnum.IL2CPP_TYPE_GENERICINST;
+
     private static void LoadSwitchSelector(Instruction instruction, MethodAnalysisContext context, MethodDefinition method,
         Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
     {
@@ -1509,8 +1552,9 @@ public static class IlGenerator
                 }
 
                 // stfld wants the object underneath the value, but the value is already on the stack, so
-                // park it in a temporary while we load the object.
-                var scratch = new CilLocalVariable(fieldDescriptor.Signature!.FieldType);
+                // park it in a temporary while we load the object. A field of a generic instance is
+                // declared with its parameters (!0), so the temporary takes the substituted type.
+                var scratch = new CilLocalVariable(field.Field.FieldType.ToTypeSignature());
                 method.CilMethodBody!.LocalVariables.Add(scratch);
 
                 instructions.Add(CilOpCodes.Stloc, scratch);

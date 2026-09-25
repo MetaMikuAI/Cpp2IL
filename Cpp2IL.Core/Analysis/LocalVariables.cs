@@ -285,6 +285,8 @@ public static class LocalVariables
             changed |= MetadataResolver.ResolveFieldOffsets(method);
             changed |= RefineObjectFieldLoads(method);
             changed |= RgctxResolver.Run(method);
+            changed |= RecoverPackedMembers(method);
+            changed |= RecoverMemberAddresses(method);
             changed |= PropagateStaticFieldStorage(method);
             changed |= TypeAddressedLocals(method);
             changed |= PropagateTypesOnce(method);
@@ -314,6 +316,211 @@ public static class LocalVariables
         }
         return changed;
     }
+
+    /// <summary>
+    /// A value type no wider than a register travels packed in one general register, and native code
+    /// reads its 32-bit halves with integer operations: <c>lsr x, x, #32</c> for the member at offset 4,
+    /// <c>and x, x, #0xFFFFFFFF</c> for the member at offset 0. Each is a read of that member, so the
+    /// operation is rewritten to load it, keeping the extension the native operation applied. Only an
+    /// unambiguous 32-bit member qualifies (a sequential struct with exactly one member covering those
+    /// four bytes); anything else stays as is. Rewriting is one-way, so the fixpoint still converges.
+    /// </summary>
+    internal static bool RecoverPackedMembers(MethodAnalysisContext method)
+    {
+        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+        if (pointerSize != 8)
+            return false;
+
+        var types = method.AppContext.SystemTypes;
+        var changed = false;
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
+            // The explicit type, when present, says whether the native shift was logical or arithmetic.
+            var (destination, source, offset, extension) = instruction switch
+            {
+                { OpCode: OpCode.ShiftRight, Operands: [LocalVariable d, LocalVariable s, Immediate { Value: 32 }] }
+                    => (d, s, 4, (OpCode?)null),
+                { OpCode: OpCode.ShiftRight, Operands: [LocalVariable d, LocalVariable s, Immediate { Value: 32 }, TypeAnalysisContext t] }
+                    when t == types.SystemInt64Type || t == types.SystemUInt64Type
+                    => (d, s, 4, t == types.SystemInt64Type ? OpCode.SignExtend : OpCode.ZeroExtend),
+                { OpCode: OpCode.And, Operands: [LocalVariable d, LocalVariable s, Immediate { Value: 0xFFFFFFFF }] }
+                    => (d, s, 0, OpCode.ZeroExtend),
+                _ => (null, null, 0, null),
+            };
+
+            if (destination == null || source?.Type is not { } packed || PackedMember(packed, offset, pointerSize) is not { } member)
+                continue;
+
+            var memberType = member.FieldType.IsEnumType ? member.FieldType.EnumUnderlyingType : member.FieldType;
+            var integer = memberType?.FullName is "System.Int32" or "System.UInt32";
+            if (!integer && (extension != null || memberType?.FullName != "System.Single"))
+                continue;
+
+            var read = new FieldReference(member, source, offset);
+            if (extension is { } opCode)
+            {
+                instruction.OpCode = opCode;
+                instruction.SetOperands(destination, read, new Immediate(32));
+            }
+            else
+            {
+                instruction.OpCode = OpCode.Move;
+                instruction.SetOperands(destination, read);
+            }
+
+            changed = true;
+        }
+
+        return changed;
+    }
+
+    /// <summary>
+    /// <c>base + K</c>, where the base is the address of a typed struct's storage (a frame slot's
+    /// address or a managed pointer) or a typed object, and exactly one instance member starts at
+    /// offset K, computes that member's address: ldflda, not integer arithmetic on a pointer.
+    ///
+    /// Recovered only where every use consumes the value as an address that stays inside the member:
+    /// a call argument, or (for struct storage) a memory access within the member's extent. An object
+    /// base's accesses are left alone, since field resolution already follows <c>obj + K</c> into
+    /// accesses that may reach past the member.
+    ///
+    /// The receiver must be a value the method never assigns (a parameter, including <c>this</c>):
+    /// copy forwarding, coalescing and dead-copy removal track a field's receiver as a plain operand
+    /// but not inside an address-of, so a receiver defined in the method could lose its definition.
+    /// </summary>
+    internal static bool RecoverMemberAddresses(MethodAnalysisContext method)
+    {
+        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+        var instructions = method.ControlFlowGraph!.Instructions;
+        var assigned = instructions.Select(i => i.Destination).OfType<LocalVariable>().ToHashSet();
+        var changed = false;
+        foreach (var instruction in instructions)
+        {
+            if (instruction is not { OpCode: OpCode.Add, Operands: [LocalVariable destination, var left, var right] }
+                || destination.Type is not (null or ByRefTypeAnalysisContext))
+                continue;
+            if (left is Immediate)
+                (left, right) = (right, left);
+            if (right is not Immediate { Value: > 0 and <= int.MaxValue } offset)
+                continue;
+
+            LocalVariable? receiver = null;
+            TypeAnalysisContext? owner = null;
+            var isObject = false;
+            switch (left)
+            {
+                case AddressOf { Target: LocalVariable { Type: { IsValueType: true } storageType } storage }
+                    when storageType is not ByRefTypeAnalysisContext:
+                    (receiver, owner) = (storage, storageType);
+                    break;
+                case LocalVariable { Type: ByRefTypeAnalysisContext { ElementType: { IsValueType: true } referent } } pointer:
+                    (receiver, owner) = (pointer, referent);
+                    break;
+                case LocalVariable { Type: { IsValueType: false } instanceType } instance when IsPlainClass(instanceType, method):
+                    (receiver, owner, isObject) = (instance, instanceType, true);
+                    break;
+            }
+
+            if (receiver == null || owner == null || assigned.Contains(receiver)
+                || SoleMemberAt(owner, offset.Value, isObject) is not { } member)
+                continue;
+
+            // A managed pointer the call signatures already typed must agree with the member.
+            if (destination.Type is ByRefTypeAnalysisContext { ElementType: var typed }
+                && (typed.FullName != member.FieldType.FullName || typed.DeclaringAssembly != member.FieldType.DeclaringAssembly))
+                continue;
+
+            var extent = MemberSize(member.FieldType, pointerSize);
+            if (extent <= 0 || !UsedOnlyAsMemberAddress(destination, instructions, extent, allowAccesses: !isObject))
+                continue;
+
+            instruction.OpCode = OpCode.Move;
+            instruction.SetOperands(destination, new AddressOf(new FieldReference(member, receiver, (int)offset.Value)));
+            destination.Type = new ByRefTypeAnalysisContext(member.FieldType);
+            changed = true;
+        }
+
+        return changed;
+    }
+
+    // An ordinary class whose metadata offsets are real: not a generic (placeholder offsets), not a
+    // runtime-synthesized handle, and not string, whose trailing characters are not a single member.
+    private static bool IsPlainClass(TypeAnalysisContext type, MethodAnalysisContext method) =>
+        type is not (RuntimeClassTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext or RuntimeMethodInfoAnalysisContext
+            or RuntimeFieldInfoAnalysisContext or PointerTypeAnalysisContext or SzArrayTypeAnalysisContext
+            or GenericInstanceTypeAnalysisContext or GenericParameterTypeAnalysisContext)
+        && type != method.AppContext.SystemTypes.SystemStringType
+        && type.GenericParameters.Count == 0;
+
+    private static FieldAnalysisContext? SoleMemberAt(TypeAnalysisContext owner, long offset, bool searchBases)
+    {
+        for (var type = owner; type != null; type = searchBases ? type.BaseType : null)
+        {
+            if (type.GenericParameters.Count != 0 || type is GenericInstanceTypeAnalysisContext
+                || (type.Attributes & System.Reflection.TypeAttributes.ExplicitLayout) != 0)
+                return null;
+            var members = type.Fields.Where(f => !f.IsStatic && f.Offset == offset
+                && (f.Attributes & System.Reflection.FieldAttributes.Literal) == 0).ToList();
+            if (members.Count > 0)
+                return members is [{ } member] ? member : null;
+        }
+
+        return null;
+    }
+
+    private static bool UsedOnlyAsMemberAddress(LocalVariable address, List<Instruction> instructions, long extent, bool allowAccesses)
+    {
+        var used = false;
+        foreach (var instruction in instructions)
+        {
+            for (var i = 0; i < instruction.Operands.Count; i++)
+            {
+                var operand = instruction.Operands[i];
+                if (ReferenceEquals(operand, address))
+                {
+                    // Writing the address itself (it is the definition) is fine; any other plain use must
+                    // be a call argument, where the signature decides how the address is consumed.
+                    if (i == 0 && ReferenceEquals(instruction.Destination, address))
+                        continue;
+                    var firstArgument = instruction.OpCode == OpCode.CallVoid ? 1 : 2;
+                    if (!instruction.IsCall || i < firstArgument)
+                        return false;
+                    used = true;
+                    continue;
+                }
+
+                if (operand is MemoryOperand memory && (ReferenceEquals(memory.Base, address) || ReferenceEquals(memory.Index, address)))
+                {
+                    if (!allowAccesses || !ReferenceEquals(memory.Base, address) || memory.Index != null
+                        || memory.Addend < 0 || memory.AccessSize <= 0 || memory.Addend + memory.AccessSize > extent)
+                        return false;
+                    used = true;
+                }
+                else if (operand is AddressOf { Target: var target } && ReferenceEquals(target, address))
+                    return false;
+            }
+        }
+
+        return used;
+    }
+
+    private static FieldAnalysisContext? PackedMember(TypeAnalysisContext type, int offset, int pointerSize)
+    {
+        if (type is not { IsValueType: true, IsEnumType: false } or ByRefTypeAnalysisContext
+            || type.Type != LibCpp2IL.BinaryStructures.Il2CppTypeEnum.IL2CPP_TYPE_VALUETYPE
+            || type.GenericParameters.Count != 0
+            || (type.Attributes & System.Reflection.TypeAttributes.ExplicitLayout) != 0
+            || TypeSizes.UnboxedSize(type, pointerSize) != pointerSize)
+            return null;
+
+        var covering = type.Fields.Where(f => !f.IsStatic && f.Offset <= offset
+            && f.Offset + MemberSize(f.FieldType, pointerSize) > offset).ToList();
+        return covering is [{ } member] && member.Offset == offset
+            && MemberSize(member.FieldType, pointerSize) == 4 ? member : null;
+    }
+
+    private static long MemberSize(TypeAnalysisContext type, int pointerSize) =>
+        type.IsValueType ? TypeSizes.UnboxedSize(type, pointerSize) : pointerSize;
 
     // A type-metadata global load (Move local, typeof(T)) puts the runtime class pointer for T into
     // the local - an Il2CppClass*, not an instance of T. That is known exactly from the instruction,

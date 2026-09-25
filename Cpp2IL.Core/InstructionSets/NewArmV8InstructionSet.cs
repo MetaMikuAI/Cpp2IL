@@ -27,6 +27,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
     // GetIsilFromMethod runs in parallel, so cache resolved intrinsics concurrently.
     private readonly ConcurrentDictionary<(string Name, bool IsDouble, int ParameterCount), MethodAnalysisContext?> _mathMethods = new();
+    private readonly ConcurrentDictionary<Arm64ImportResolver.NativeMathFunction, MethodAnalysisContext?> _nativeMathMethods = new();
 
     private readonly ConcurrentDictionary<(ApplicationAnalysisContext App, ulong Target), TypeAnalysisContext?> _nullCheckHelpers = new();
 
@@ -133,6 +134,20 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             return null;
         });
 
+    // The managed method with exactly the C function's signature: no conversion may be implied.
+    internal MethodAnalysisContext? ResolveNativeMathMethod(ApplicationAnalysisContext app, Arm64ImportResolver.NativeMathFunction math)
+        => _nativeMathMethods.GetOrAdd(math, key =>
+        {
+            var type = key.IsDouble ? app.SystemTypes.SystemDoubleType : app.SystemTypes.SystemSingleType;
+            var mathType = app.GetAssemblyByName("mscorlib")?.GetTypeByFullName(key.TypeName);
+            var parameterCount = key.Arity + (key.Kind == Arm64ImportResolver.NativeMathKind.ModF ? 1 : 0);
+            return mathType?.Methods.SingleOrDefault(m => m.IsStatic && m.Name == key.MethodName
+                && m.ReturnType == type && m.Parameters.Count == parameterCount
+                && m.Parameters.Take(key.Arity).All(p => p.ParameterType == type)
+                && (key.Kind != Arm64ImportResolver.NativeMathKind.ModF
+                    || m.Parameters[^1].ParameterType is PointerTypeAnalysisContext { ElementType: var element } && element == type));
+        });
+
     public override BinarySlice GetRawBytesForMethod(MethodAnalysisContext context, bool isAttributeGenerator)
     {
         var binary = context.AppContext.Binary;
@@ -175,8 +190,26 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             if (operands[position] is Register { Name: var name } && name.StartsWith("V")
                 && Arm64CallingConventionResolver.FloatingAggregateFields(context.Parameters[i].ParameterType) != null)
                 operands[position] = new Register(null, $"hfa_parameter_{i}");
+            else if (operands[position] is Register { Name: var low } && low.StartsWith("X")
+                     && Arm64CallingConventionResolver.IntegerCompositeMembers(context.Parameters[i].ParameterType) != null)
+                operands[position] = new Register(null, $"composite_parameter_{i}");
         }
         return operands;
+    }
+
+    // A call leaves the caller-saved registers undefined, except those that hold its results.
+    // Without a known signature every AAPCS64 result register (X0-X1, V0-V3) may hold one.
+    private static readonly string[] PossibleResultRegisters = ["X0", "X1", "V0", "V1", "V2", "V3"];
+
+    internal static void ClobberCallerSaved(Instruction call, bool unknownSignature = false)
+    {
+        var results = new HashSet<string>(unknownSignature ? PossibleResultRegisters : [], StringComparer.Ordinal);
+        if (call.Destination is Register destination)
+            results.Add(destination.Name);
+        if (call.ImplicitDefinition is { } implicitDefinition)
+            results.Add(implicitDefinition.Name);
+        call.CallClobbers = Arm64CallingConventionResolver.CallerSavedRegisters.Where(name => !results.Contains(name))
+            .Select(name => new Register(null, name)).ToArray();
     }
 
     public override ulong GetInternalCallTarget(MethodAnalysisContext method)
@@ -449,6 +482,16 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         for (var i = 0; i < context.Parameters.Count; i++)
         {
             var position = i + (context.IsStatic ? 0 : 1);
+            if (arguments[position] is Register low && low.Name.StartsWith("X")
+                && Arm64CallingConventionResolver.IntegerCompositeMembers(context.Parameters[i].ParameterType) is { } members)
+            {
+                // Each X register carries one member of the value (the rest of it is padding).
+                var register = int.Parse(low.Name[1..]);
+                foreach (var (offset, size) in members)
+                    prologue.Add(new Instruction(-1, OpCode.Move, new Register(null, $"X{register++}"),
+                        new MemoryOperand(new Register(null, $"composite_parameter_{i}"), addend: offset, accessSize: size)));
+                continue;
+            }
             if (arguments[position] is not Register first || !first.Name.StartsWith("V")
                 || Arm64CallingConventionResolver.FloatingAggregateFields(context.Parameters[i].ParameterType) is not { } fields)
                 continue;
@@ -710,6 +753,19 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 {
                     var position = parameter + (ctx.IsStatic ? 0 : 1);
                     var type = ctx.Parameters[parameter].ParameterType;
+                    if (managedArguments[position] is Register low && low.Name.StartsWith("X")
+                        && Arm64CallingConventionResolver.IntegerCompositeMembers(type) is { } members)
+                    {
+                        // The two X registers carrying the value are one argument.
+                        var composite = new Register(null, $"composite_arg_{address:X}_{parameter}");
+                        context.StackAggregates[composite.Number] = type;
+                        var register = int.Parse(low.Name[1..]);
+                        foreach (var (offset, size) in members)
+                            Add(address, OpCode.Move, new MemoryOperand(composite, addend: offset, accessSize: size),
+                                new Register(null, $"X{register++}"));
+                        managedArguments[position] = composite;
+                        continue;
+                    }
                     if (managedArguments[position] is not Register first || !first.Name.StartsWith("V")
                         || Arm64CallingConventionResolver.FloatingAggregateFields(type) is not { } fields)
                         continue;
@@ -725,7 +781,10 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     managedArguments[position] = aggregate;
                 }
                 var returnFields = Arm64CallingConventionResolver.FloatingAggregateFields(ctx.ReturnType);
-                Register? aggregateResult = returnFields == null ? null : new Register(null, $"hfa_ret_{address:X}");
+                var returnMembers = ctx.IsVoid || returnFields != null ? null
+                    : Arm64CallingConventionResolver.IntegerCompositeMembers(ctx.ReturnType);
+                Register? aggregateResult = returnFields != null ? new Register(null, $"hfa_ret_{address:X}")
+                    : returnMembers != null ? new Register(null, $"composite_ret_{address:X}") : null;
                 if (aggregateResult != null) context.StackAggregates[aggregateResult.Value.Number] = ctx.ReturnType;
                 var returnDestination = ctx.IsVoid
                     ? null
@@ -735,6 +794,13 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     : Add(address, OpCode.Call, Imm(target), returnDestination!);
 
                 call.AddOperands(managedArguments);
+                call.DeclaredArguments = managedArguments.Length - 1; // all but the MethodInfo
+                ClobberCallerSaved(call);
+                if (returnMembers != null)
+                    for (var half = 0; half < 2; half++)
+                        Add(address, OpCode.Move, new Register(null, $"X{half}"),
+                            new MemoryOperand(aggregateResult!.Value, addend: returnMembers[half].Offset,
+                                accessSize: returnMembers[half].Size));
                 if (returnFields != null)
                     for (var component = 0; component < returnFields.Length; component++)
                     {
@@ -744,12 +810,68 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                                 accessSize: field.FieldType.FullName == "System.Single" ? 4 : 8));
                     }
             }
-            else
+            else if (!TryAddNativeMath(target))
             {
                 // Not a managed method, so we don't know its signature, preserve all argument registers
                 var call = Add(address, OpCode.Call, Imm(target), new Register(null, "X0"));
                 call.AddOperands(CallingConventions.ResolveForUnmanaged(context.AppContext, target));
+                ClobberCallerSaved(call, unknownSignature: true);
             }
+        }
+
+        // A call to a C math import whose definition is that of a managed operation. The C signature
+        // places every argument and the result in floating-point registers (ModF's pointer excepted).
+        bool TryAddNativeMath(ulong target)
+        {
+            if (Arm64ImportResolver.MathFunction(Arm64ImportResolver.Resolve(context.AppContext.Binary, target)) is not { } math)
+                return false;
+
+            // Scalar operations do not agree on whether S<n> of a register also used as V<n>.2S is named as
+            // lane 0 or as the whole register, so the value passed in such a register cannot be identified.
+            if (!math.IsDouble && Enumerable.Range(0, math.Arity)
+                    .Any(number => twoSLaneRegisters.Contains(NormalizeRegister(Arm64Register.S0 + number))))
+                return false;
+
+            IOperand Argument(int number) => Reg((math.IsDouble ? Arm64Register.D0 : Arm64Register.S0) + number);
+
+            if (math.Kind == Arm64ImportResolver.NativeMathKind.Remainder)
+            {
+                Add(address, OpCode.Modulo, Argument(0), Argument(0), Argument(1));
+                return true;
+            }
+
+            if (ResolveNativeMathMethod(context.AppContext, math) is { } method)
+            {
+                var operands = new List<IOperand>(math.Arity + 3) { method, Argument(0) };
+                for (var i = 0; i < math.Arity; i++)
+                    operands.Add(Argument(i));
+                if (math.Kind == Arm64ImportResolver.NativeMathKind.ModF)
+                    operands.Add(Reg(Arm64Register.X0));
+
+                ClobberCallerSaved(Add(address, OpCode.Call, operands));
+                return true;
+            }
+
+            // Without the single-precision method in the metadata no managed call to it was compiled here.
+            // The float function is then the compiler's narrowing of the double-precision method applied to
+            // the widened arguments, (float)Math.Sin((double)x), which is what the IL evaluates.
+            if (math.Kind != Arm64ImportResolver.NativeMathKind.Method || math.IsDouble
+                || ResolveNativeMathMethod(context.AppContext, math with { TypeName = "System.Math", IsDouble = true }) is not { } wide)
+                return false;
+
+            var types = context.AppContext.SystemTypes;
+            var widened = new List<IOperand>(math.Arity + 2) { wide, Reg(Arm64Register.D0) };
+            for (var i = 0; i < math.Arity; i++)
+            {
+                Add(address, OpCode.ConvertNumeric, Reg(Arm64Register.D0 + i), Argument(i),
+                    new NumericConversion(types.SystemSingleType, types.SystemDoubleType));
+                widened.Add(Reg(Arm64Register.D0 + i));
+            }
+
+            ClobberCallerSaved(Add(address, OpCode.Call, widened));
+            Add(address, OpCode.ConvertNumeric, Argument(0), Reg(Arm64Register.D0),
+                new NumericConversion(types.SystemDoubleType, types.SystemSingleType));
+            return true;
         }
 
         // AAPCS64 returns aggregates larger than 16 bytes through X8, which points at a caller
@@ -1626,6 +1748,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     // SSA as well; virtual-call recovery can replace the provisional X0 result
                     // once the managed signature is known.
                     call.ImplicitDefinition = new Register(null, "V0");
+                    ClobberCallerSaved(call, unknownSignature: true);
                     break;
                 }
             case Arm64Mnemonic.BR:

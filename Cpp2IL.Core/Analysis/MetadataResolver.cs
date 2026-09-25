@@ -264,6 +264,10 @@ public static class MetadataResolver
             ? IsAggregate(byRef.ElementType)
             : type is { IsValueType: true, IsEnumType: false, Type: Il2CppTypeEnum.IL2CPP_TYPE_VALUETYPE or Il2CppTypeEnum.IL2CPP_TYPE_GENERICINST };
 
+        // Frame slots whose address escapes hold their struct in place (a return buffer, a ref argument).
+        var addressedSlots = method.ControlFlowGraph!.Instructions.SelectMany(i => i.Operands)
+            .OfType<AddressOf>().Select(a => a.Target).OfType<LocalVariable>().Where(IsFrameSlot).ToHashSet();
+
         var changed = false;
 
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
@@ -320,6 +324,14 @@ public static class MetadataResolver
                 UnwrapAddressUpdate(ref fieldLocal, ref fieldOffset, definitions);
 
                 if (fieldLocal.Type == null)
+                    continue;
+
+                // A register copied from a value-type field holds (the first bytes of) the value, not
+                // its address. Dereferencing it reads through the value's first member, e.g. the
+                // object header of UniTask<T>.Awaiter.task.source, never a member of the struct.
+                // A frame slot used as a base addresses the struct stored in it, so only registers apply.
+                if (fieldLocal.Type is { IsValueType: true } and not ByRefTypeAnalysisContext && !IsFrameSlot(fieldLocal)
+                    && definitions.ContainsKey(fieldLocal) && HoldsValueTypeValue(fieldLocal, definitions, addressedSlots, []))
                     continue;
 
                 // check if static field access
@@ -390,16 +402,18 @@ public static class MetadataResolver
                     // leaving an untyped raw memory access behind.
                     // Static storage holds only its own type's statics, so a static containing field
                     // (Vector3.oneVector.y) is searched on the owner alone, never on its base types.
-                    for (var candidateOwner = genericOwner?.GenericType ?? owner;
+                    for (var candidateOwner = owner;
                          candidateOwner != null && field == null;
                          candidateOwner = staticOwner == null ? candidateOwner.BaseType : null)
                     {
-                        // Generic definition offsets are placeholders, not evidence for an
-                        // embedded member when the instantiated layout could not be proven.
-                        if (candidateOwner is GenericInstanceTypeAnalysisContext || candidateOwner.GenericParameters.Count > 0)
-                            continue;
-                        if (FindEmbeddedMember(candidateOwner, fieldOffset, staticOwner != null, memory.AccessSize,
-                                method.AppContext.Binary.PointerSizeBytes) is var (chain, nested))
+                        // Generic definition offsets are placeholders, so a generic owner or a
+                        // generic value-type field is searched through its computed layout instead.
+                        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+                        var embedded = IsComputedLayout(candidateOwner)
+                            ? null
+                            : FindEmbeddedMember(candidateOwner, fieldOffset, staticOwner != null, memory.AccessSize, pointerSize);
+                        embedded ??= FindComputedEmbeddedMember(candidateOwner, fieldOffset, staticOwner != null, memory.AccessSize, pointerSize);
+                        if (embedded is var (chain, nested))
                             (containingFields, field) = (chain, nested);
                     }
 
@@ -407,9 +421,14 @@ public static class MetadataResolver
                         continue;
                 }
 
+                // Bind the containing field before inspecting its members, so nested stores
+                // preserve both the substituted field type and the concrete declaring owner.
+                if (fieldGenericOwner != null && containingFields.Count == 0)
+                    field = new ConcreteGenericFieldAnalysisContext(field, fieldGenericOwner);
+
                 // Width is evidence for a partial access only if a later member proves the
                 // aggregate extends beyond it. Equal-sized whole-struct copies stay intact.
-                if (instruction.OpCode == OpCode.Move && fieldGenericOwner == null
+                if (instruction.OpCode == OpCode.Move
                     && (i == 1 && instruction.Destination is LocalVariable result && !aggregateCopies.Contains(result)
                         || i == 0 && (instruction.Operands[1] is Immediate
                             || OperandType(instruction.Operands[1], method, definitions) is { } sourceType && !IsAggregate(sourceType))
@@ -423,12 +442,8 @@ public static class MetadataResolver
                     continue;
                 }
 
-                // Bind the containing field before inspecting its members, so nested stores
-                // preserve both the substituted field type and the concrete declaring owner.
-                if (fieldGenericOwner != null && containingFields.Count == 0)
-                    field = new ConcreteGenericFieldAnalysisContext(field, fieldGenericOwner);
-
-                var resolved = new FieldReference(field, fieldLocal, (int)fieldOffset) { ContainingFields = containingFields };
+                var resolved = new FieldReference(field, fieldLocal, (int)fieldOffset)
+                    { ContainingFields = containingFields, AccessSize = memory.AccessSize };
 
                 // A scalar store at the start of an embedded value type is a store to its first
                 // member, not an assignment of the whole aggregate (e.g. Vector2.x). The native
@@ -493,10 +508,128 @@ public static class MetadataResolver
             {
                 var size = TypeSizes.UnboxedSize(member.FieldType, pointerSize);
                 return accessSize > 0 && member.FieldType.IsValueType && size > 0 && size < accessSize
+                    && !OnlyPaddingFollows(MemberSlots(parent.FieldType, false, pointerSize), relative, size, accessSize,
+                        TypeSizes.UnboxedSize(parent.FieldType, pointerSize))
                     ? null
                     : (chain, member);
             }
         }
+    }
+
+    /// <summary>
+    /// Finds the member at <paramref name="offset"/> when the path to it runs through a layout that
+    /// metadata does not record: a generic owner, or a containing field of a generic value type such as
+    /// <c>UniTask&lt;T&gt;.Awaiter.task.result</c>. Each level must be the unique value-type field
+    /// covering the offset in the computed layout, and the member must span the access apart from
+    /// trailing padding. Paths without a computed layout are left to <see cref="FindEmbeddedMember"/>.
+    /// </summary>
+    private static (IReadOnlyList<FieldAnalysisContext> Chain, FieldAnalysisContext Member)? FindComputedEmbeddedMember(
+        TypeAnalysisContext owner, long offset, bool isStatic, int accessSize, int pointerSize)
+    {
+        var computed = IsComputedLayout(owner);
+        var slots = MemberSlots(owner, isStatic, pointerSize);
+        var chain = new List<FieldAnalysisContext>();
+        var relative = offset;
+        while (slots != null)
+        {
+            var containing = slots.Where(s => IsValueContainer(s.Field.FieldType)
+                && s.Offset < relative && relative < s.Offset + s.Size).ToList();
+            if (containing is not [{ } parent])
+                return null;
+
+            chain.Add(parent.Field);
+            relative -= parent.Offset;
+            computed |= IsComputedLayout(parent.Field.FieldType);
+            slots = MemberSlots(parent.Field.FieldType, false, pointerSize);
+            if (slots?.Where(s => s.Offset == relative).ToList() is [{ } member])
+            {
+                if (!computed || member.Size <= 0)
+                    return null;
+                return accessSize <= member.Size || OnlyPaddingFollows(slots, relative, member.Size, accessSize, parent.Size)
+                    ? (chain, member.Field)
+                    : null;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Whether <paramref name="local"/> receives a value-type value, through moves and phis:
+    /// a by-value copy of a field, a call result returned in registers, or the contents of a frame
+    /// slot holding the struct in place. Such a register holds the value itself. A pointer to the
+    /// struct (this, a return buffer, a by-reference argument or a spilled copy of one) comes from none of them.
+    /// </summary>
+    private static bool HoldsValueTypeValue(LocalVariable local, Dictionary<LocalVariable, Instruction> definitions,
+        HashSet<LocalVariable> addressedSlots, HashSet<LocalVariable> visited)
+    {
+        if (!visited.Add(local))
+            return false;
+        // A value-type frame slot whose address is taken holds the struct itself, written in place by
+        // a call's return buffer or through a ref argument; loading from it copies (part of) the value.
+        if (addressedSlots.Contains(local) && local.Type is { IsValueType: true } and not ByRefTypeAnalysisContext)
+            return true;
+        if (!definitions.TryGetValue(local, out var definition))
+            return false;
+        return definition switch
+        {
+            { OpCode: OpCode.Move, Operands: [_, FieldReference { Field.FieldType.IsValueType: true }] } => true,
+            { OpCode: OpCode.Call, Destination: LocalVariable { Type: { IsValueType: true } and not ByRefTypeAnalysisContext } } => true,
+            { OpCode: OpCode.Move, Operands: [_, LocalVariable source] } => HoldsValueTypeValue(source, definitions, addressedSlots, visited),
+            // A register cannot hold a struct on one path and its address on another; an incoming
+            // value without a definition (an uninitialised stack slot version) decides nothing.
+            { OpCode: OpCode.Phi } => definition.Operands.Skip(1)
+                .Any(o => o is LocalVariable incoming && HoldsValueTypeValue(incoming, definitions, addressedSlots, visited)),
+            _ => false
+        };
+    }
+
+    private static bool IsFrameSlot(LocalVariable local) => local.Register.Name is { } name
+        && (name.StartsWith("stack_", StringComparison.Ordinal) || name.StartsWith("aggregate_stack_", StringComparison.Ordinal));
+
+    private static bool IsComputedLayout(TypeAnalysisContext type)
+        => type is GenericInstanceTypeAnalysisContext || type.GenericParameters.Count > 0;
+
+    // Only plain structs contain members: primitives wrap themselves (Single.m_value) and enums
+    // only wrap their underlying value.
+    private static bool IsValueContainer(TypeAnalysisContext type)
+        => type is { Type: Il2CppTypeEnum.IL2CPP_TYPE_VALUETYPE, IsEnumType: false }
+            or GenericInstanceTypeAnalysisContext { IsValueType: true, IsEnumType: false };
+
+    /// <summary>
+    /// The fields of <paramref name="type"/> at their offsets. Metadata offsets are authoritative for a
+    /// non-generic type; a generic definition or instance, whose metadata offsets are placeholders,
+    /// uses its computed layout with fields bound to the instantiation. A size of 0 is unknown.
+    /// </summary>
+    private static List<GenericInstanceFieldLayout.FieldSlot>? MemberSlots(TypeAnalysisContext type, bool isStatic, int pointerSize)
+    {
+        if (IsComputedLayout(type))
+            return isStatic ? null : GenericInstanceFieldLayout.ComputeLayout(type)?.Slots;
+        return type.Fields.Where(f => f.IsStatic == isStatic && (f.Attributes & FieldAttributes.Literal) == 0 && f.Offset >= 0)
+            .Select(f => new GenericInstanceFieldLayout.FieldSlot(f, f, f.Offset, FieldSize(f.FieldType, pointerSize)))
+            .ToList();
+    }
+
+    private static long FieldSize(TypeAnalysisContext type, int pointerSize)
+        => type is GenericParameterTypeAnalysisContext or PointerTypeAnalysisContext || !type.IsValueType ? pointerSize
+            : GenericInstanceFieldLayout.ValueTypeSizeAndAlignment(type) is { } layout ? layout.Size
+            : type is GenericInstanceTypeAnalysisContext ? 0
+            : TypeSizes.UnboxedSize(type, pointerSize);
+
+    /// <summary>
+    /// Whether an access of <paramref name="accessSize"/> bytes at a member only <paramref name="memberSize"/>
+    /// wide touches nothing but that member and its container's padding. ARM64 code clears or copies a
+    /// trailing short together with its padding in one 8-byte access; padding holds no managed state, so
+    /// the access is exactly one to the member. Every sibling needs a known extent, and the access must
+    /// stay inside the container.
+    /// </summary>
+    private static bool OnlyPaddingFollows(List<GenericInstanceFieldLayout.FieldSlot>? siblings, long memberOffset,
+        long memberSize, long accessSize, long containerSize)
+    {
+        var end = memberOffset + accessSize;
+        return siblings != null && memberSize > 0 && containerSize > 0 && end <= containerSize
+            && siblings.All(s => s.Size > 0
+                && (s.Offset == memberOffset || s.Offset + s.Size <= memberOffset || s.Offset >= end));
     }
 
     internal static FieldReference? ResolvePartialStructAccess(FieldAnalysisContext field, LocalVariable receiver,
@@ -507,16 +640,12 @@ public static class MetadataResolver
         if (width <= 0) return null;
         var parents = new List<FieldAnalysisContext>(containingFields ?? []);
         var seen = new HashSet<TypeAnalysisContext>();
-        while (field.FieldType is { IsValueType: true } type && seen.Add(type)
-            && type is not GenericInstanceTypeAnalysisContext && type.GenericParameters.Count == 0
-            && (type.Attributes & TypeAttributes.LayoutMask) != TypeAttributes.ExplicitLayout
-            && type.Definition is not { PackingSize: > 0 })
+        while (field.FieldType is { IsValueType: true } type && seen.Add(type) && StructFields(type) is { } fields)
         {
-            var fields = type.Fields.Where(f => !f.IsStatic).ToList();
             if (fields.Where(f => f.Offset == 0).ToList() is not [{ } first]) return null;
             if (!ExtendsPastAccess(type, [])) return null;
             parents.Add(field);
-            field = first;
+            field = first.Field;
             if (ScalarSize(field.FieldType) == width)
                 return new FieldReference(field, receiver, offset) { ContainingFields = parents.ToArray() };
         }
@@ -524,13 +653,23 @@ public static class MetadataResolver
 
         bool ExtendsPastAccess(TypeAnalysisContext type, HashSet<TypeAnalysisContext> visited)
         {
-            if (!type.IsValueType || !visited.Add(type) || type is GenericInstanceTypeAnalysisContext
-                || type.GenericParameters.Count != 0
-                || (type.Attributes & TypeAttributes.LayoutMask) == TypeAttributes.ExplicitLayout
-                || type.Definition is { PackingSize: > 0 }) return false;
-            var fields = type.Fields.Where(f => !f.IsStatic).ToList();
+            if (!type.IsValueType || !visited.Add(type) || StructFields(type) is not { } fields) return false;
             return fields.Any(f => f.Offset >= width)
-                || fields.Where(f => f.Offset == 0).ToList() is [{ } first] && ExtendsPastAccess(first.FieldType, visited);
+                || fields.Where(f => f.Offset == 0).ToList() is [{ } first] && ExtendsPastAccess(first.Field.FieldType, visited);
+        }
+
+        // A generic instance has no metadata offsets, so its members come from the computed layout,
+        // bound to the instantiation. Explicit and packed layouts are not inferred.
+        List<GenericInstanceFieldLayout.FieldSlot>? StructFields(TypeAnalysisContext type)
+        {
+            if (type is GenericInstanceTypeAnalysisContext)
+                return GenericInstanceFieldLayout.ComputeLayout(type)?.Slots;
+            if (type.GenericParameters.Count != 0
+                || (type.Attributes & TypeAttributes.LayoutMask) == TypeAttributes.ExplicitLayout
+                || type.Definition is { PackingSize: > 0 })
+                return null;
+            return type.Fields.Where(f => !f.IsStatic)
+                .Select(f => new GenericInstanceFieldLayout.FieldSlot(f, f, f.Offset, 0)).ToList();
         }
 
         int ScalarSize(TypeAnalysisContext type) => type is GenericParameterTypeAnalysisContext ? 0

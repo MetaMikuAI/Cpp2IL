@@ -54,6 +54,12 @@ public abstract class BaseKeyFunctionAddresses
 
     public ulong AddrPInvokeLookup; //TODO Re-find this and fix name
 
+    // Runtime helpers of inlined virtual dispatch. Both are located through Object::GetVirtualMethod (behind the
+    // exported il2cpp_object_get_virtual_method) and are recovered only as part of the dispatch that calls them,
+    // so they are deliberately not published as key functions.
+    public ulong il2cpp_vm_class_get_interface_invoke_data_slow_path; //GetInterfaceInvokeDataFromVTableSlowPath(obj, itf, slot), called when the inline klass->interfaceOffsets scan misses.
+    public ulong il2cpp_vm_runtime_get_generic_virtual_method; //Runtime::GetGenericVirtualMethod(vtableSlotMethod, genericMethod), picks the inflated override of a generic virtual method.
+
     public IEnumerable<KeyValuePair<string, ulong>> Pairs => resolvedAddressMap;
 
     protected ApplicationAnalysisContext _appContext = null!; //Always initialized before used
@@ -76,6 +82,22 @@ public abstract class BaseKeyFunctionAddresses
     /// </summary>
     public ulong ResolveKeyFunctionAddress(ulong address)
     {
+        if (FollowBranchThunks(address) is var resolved and not 0)
+            return resolved;
+
+        // A function that tests a flag of the class passed to it and then either returns or tail-calls a class
+        // initializer with that class is a class-initialization call too: class initialization is not part of
+        // the IL, and running an initializer for a class that needs none has no effect.
+        var initializer = FollowBranchThunks(GetGuardedTailCallTarget(address));
+        return initializer != 0 && (initializer == il2cpp_codegen_runtime_class_init
+                                    || initializer == il2cpp_runtime_class_init_actual
+                                    || initializer == il2cpp_runtime_class_init_export)
+            ? initializer
+            : 0;
+    }
+
+    private ulong FollowBranchThunks(ulong address)
+    {
         for (var hops = 0; address != 0 && hops <= MaxThunkHops; hops++)
         {
             if (resolvedAddressSet.Contains(address))
@@ -88,10 +110,36 @@ public abstract class BaseKeyFunctionAddresses
     }
 
     /// <summary>
+    /// Whether a call to <paramref name="address"/> runs <paramref name="function"/>, directly or through branch thunks.
+    /// </summary>
+    public bool CallReaches(ulong address, ulong function)
+    {
+        if (function == 0)
+            return false;
+
+        for (var hops = 0; address != 0 && hops <= MaxThunkHops; hops++)
+        {
+            if (address == function)
+                return true;
+
+            address = GetBranchThunkTarget(address);
+        }
+
+        return false;
+    }
+
+    /// <summary>
     /// If the function at <paramref name="address"/> is a single unconditional branch, returns its target, else 0.
     /// Calling such a function is calling its target: the branch leaves every argument and the return address as they are.
     /// </summary>
     protected virtual ulong GetBranchThunkTarget(ulong address) => 0;
+
+    /// <summary>
+    /// If the function at <paramref name="address"/> only loads a field of the object passed as its first argument
+    /// and, depending on it, either returns or tail-calls another function with its arguments unchanged, returns
+    /// that function, else 0.
+    /// </summary>
+    protected virtual ulong GetGuardedTailCallTarget(ulong address) => 0;
 
     private void FindExport(string name, out ulong ptr)
     {
@@ -147,6 +195,8 @@ public abstract class BaseKeyFunctionAddresses
 
         AttemptInstructionAnalysisToFillGaps();
 
+        FindVirtualDispatchHelpers();
+
         FindThunks();
         InitializeResolvedAddresses();
     }
@@ -191,6 +241,11 @@ public abstract class BaseKeyFunctionAddresses
         => FindAllThunkFunctions(metadataInit).FirstOrDefault();
 
     protected virtual void AttemptInstructionAnalysisToFillGaps()
+    {
+    }
+
+    // Fills il2cpp_vm_class_get_interface_invoke_data_slow_path and il2cpp_vm_runtime_get_generic_virtual_method.
+    protected virtual void FindVirtualDispatchHelpers()
     {
     }
 
