@@ -326,6 +326,9 @@ public static class MetadataResolver
                 if (fieldLocal.Type == null)
                     continue;
 
+                if (!MergedBaseAgrees(fieldLocal, fieldOffset, definitions))
+                    continue;
+
                 // A register copied from a value-type field holds (the first bytes of) the value, not
                 // its address. Dereferencing it reads through the value's first member, e.g. the
                 // object header of UniTask<T>.Awaiter.task.source, never a member of the struct.
@@ -766,6 +769,92 @@ public static class MetadataResolver
         DoubleLiteral => method.AppContext.SystemTypes.SystemDoubleType,
         _ => null
     };
+
+    // A register merged from several addresses (a branch or CSEL choosing &a.x, &b.y or a class's static
+    // storage) takes its type from whichever input propagation reached first, so resolving a load through
+    // it would read that input's member on every path. Resolve it only when every input addresses the same
+    // member. Merged object references are fine: the load reads the member of whichever object arrives.
+    internal static bool MergedBaseAgrees(LocalVariable local, long offset, Dictionary<LocalVariable, Instruction> definitions)
+    {
+        var inputs = new List<IOperand>();
+        var visited = new HashSet<LocalVariable>();
+        var pending = new Stack<IOperand>([local]);
+        var merged = false;
+        while (pending.TryPop(out var value))
+        {
+            if (value is LocalVariable variable && definitions.TryGetValue(variable, out var definition)
+                && definition is { OpCode: OpCode.Phi } or { OpCode: OpCode.Move, Operands: [_, LocalVariable] })
+            {
+                if (!visited.Add(variable)) continue;
+                merged |= definition.OpCode == OpCode.Phi;
+                foreach (var source in definition.Operands.Skip(1)) pending.Push(source);
+                continue;
+            }
+            inputs.Add(value);
+        }
+        if (!merged) return true;
+
+        static bool IsAddress(TypeAnalysisContext? type) => type is StaticFieldStorageTypeAnalysisContext or ByRefTypeAnalysisContext;
+        static TypeAnalysisContext? Owner(TypeAnalysisContext? type) => type switch
+        {
+            StaticFieldStorageTypeAnalysisContext storage => storage.OwnerType,
+            ByRefTypeAnalysisContext byRef => byRef.ElementType,
+            _ => type,
+        };
+
+        var expected = (Owner(local.Type), offset);
+        var addressed = IsAddress(local.Type);
+        var objects = false;
+        object? address = null;
+        foreach (var input in inputs)
+        {
+            if (input is Immediate { Value: 0 }) continue;
+            // A constant or a frame address is an address, never an object reference.
+            if (input is Immediate or AddressOf) return false;
+            if (input is not LocalVariable inputLocal)
+            {
+                if (addressed) return false;
+                objects = true;
+                continue;
+            }
+            var baseLocal = inputLocal;
+            var inputOffset = offset;
+            UnwrapAddressUpdate(ref baseLocal, ref inputOffset, definitions);
+            if (baseLocal == inputLocal && !IsAddress(inputLocal.Type))
+            {
+                objects = true;
+                continue;
+            }
+            addressed = true;
+            if (baseLocal.Type == null || !Equals(Owner(baseLocal.Type), expected.Item1) || inputOffset != expected.offset
+                || IsAddress(baseLocal.Type) != IsAddress(local.Type))
+                return false;
+            // Equal types are not the same address: separate literal slots, or two objects' interiors.
+            var identity = Identity(baseLocal, definitions);
+            if (address == null) address = identity;
+            else if (!Equals(address, identity)) return false;
+        }
+        return !(addressed && objects);
+    }
+
+    // What an address register holds: a class's static storage is the same wherever it is loaded;
+    // any other value is only known to be itself.
+    private static object Identity(LocalVariable local, Dictionary<LocalVariable, Instruction> definitions)
+    {
+        var visited = new HashSet<LocalVariable>();
+        while (visited.Add(local) && definitions.TryGetValue(local, out var definition))
+        {
+            if (definition is { OpCode: OpCode.Move, Operands: [_, LocalVariable copy] })
+            {
+                local = copy;
+                continue;
+            }
+            if (definition is { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Base: LocalVariable { Type: RuntimeClassTypeAnalysisContext klass }, Index: null } memory] })
+                return (klass.RepresentedType, memory.Addend);
+            break;
+        }
+        return local;
+    }
 
     private static void UnwrapAddressUpdate(ref LocalVariable local, ref long offset,
         Dictionary<LocalVariable, Instruction> definitions)

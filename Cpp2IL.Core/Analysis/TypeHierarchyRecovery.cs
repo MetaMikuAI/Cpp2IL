@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using System.Linq;
+using Cpp2IL.Core.Extensions;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
@@ -23,6 +24,7 @@ public static class TypeHierarchyRecovery
         var definitions = graph.Instructions.Where(i => i.Destination is LocalVariable)
             .ToDictionary(i => (LocalVariable)i.Destination!, i => i);
         var resolver = new Resolver(definitions);
+        var pending = new List<PendingGuard>();
         foreach (var block in graph.Blocks)
         foreach (var comparison in block.Instructions.ToArray())
         {
@@ -42,15 +44,19 @@ public static class TypeHierarchyRecovery
                 target = resolver.Value(left) as TypeAnalysisContext;
                 entry = resolver.Value(right) as MemoryOperand?;
             }
-            if (target == null || target is ReferencedTypeAnalysisContext || target.IsInterface || target.IsValueType
-                || entry is not { Base: { } address, Index: null, Addend: -8 })
+            if (target == null || target is ReferencedTypeAnalysisContext || target.IsInterface || target.IsValueType)
                 continue;
 
-            var add = resolver.Definition(address);
-            if (add is not { OpCode: OpCode.Add, Operands: [_, var a, var b] })
-                continue;
-            if (!resolver.MatchAddress(a, b, target, out var klass)
-                && !resolver.MatchAddress(b, a, target, out klass))
+            // The entry is typeHierarchy + depth * 8 - 8, or typeHierarchy indexed by depth - 1.
+            IOperand? klass = null;
+            if (entry is { Base: { } address, Index: null, Addend: -8 })
+            {
+                if (resolver.Definition(address) is not { OpCode: OpCode.Add, Operands: [_, var a, var b] }
+                    || !resolver.MatchAddress(a, b, target, out klass) && !resolver.MatchAddress(b, a, target, out klass))
+                    continue;
+            }
+            else if (entry is not { Base: { } hierarchy, Index: { } index, Scale: 8, Addend: 0 }
+                || !resolver.MatchIndexedAddress(hierarchy, index, target, out klass))
                 continue;
             if (resolver.Value(klass!) is not MemoryOperand { Base: LocalVariable receiver, Addend: 0, Index: null, Scale: 0 }
                 || receiver.Type == null || receiver.Type.IsValueType || receiver.Type is ReferencedTypeAnalysisContext)
@@ -73,6 +79,13 @@ public static class TypeHierarchyRecovery
             {
                 branch.SetOperand(1, new Immediate(taken == block ? 1 : 0));
             }
+            else if (block.Predecessors is [var candidateGuard]
+                && candidateGuard.Instructions.LastOrDefault() is { OpCode: OpCode.ConditionalJump } candidateBranch
+                && resolver.DepthCondition(candidateBranch.Operands[1], klass!, target) is { } enough
+                && Target(graph, candidateBranch) is { } candidateTaken
+                && (enough ? candidateTaken == block : candidateTaken != block)
+                && candidateGuard.Successors.FirstOrDefault(s => s != block) is { } candidateFailure)
+                pending.Add(new PendingGuard(candidateGuard, candidateBranch, block, candidateFailure, target, receiver));
 
             if (comparison.OpCode == OpCode.CheckEqual)
             {
@@ -90,6 +103,213 @@ public static class TypeHierarchyRecovery
             }
         }
         DeadCodeEliminator.Run(graph);
+
+        // Guards whose arms were not recognised above: now that every lookup is a managed test and its
+        // native loads are dead, compare the arms by walking them.
+        var bypassed = false;
+        foreach (var guard in pending)
+        {
+            if (guard.Branch.Operands[1] is Immediate || !MissMatchesFailure(guard, resolver)) continue;
+            guard.Branch.SetOperand(1, new Immediate(Target(graph, guard.Branch) == guard.Lookup ? 1 : 0));
+            bypassed = true;
+        }
+        if (bypassed) DeadCodeEliminator.Run(graph);
+        NarrowSelectedCasts(graph);
+    }
+
+    // CSEL lowers `obj as T` to result = match ? obj : null. On the arm where the test holds, the copy of obj
+    // is exactly obj as T, so make it that cast. The join with null is then a T, rather than the static type
+    // of obj or of a parameter it was passed to, and field offsets on the result resolve against T.
+    private static void NarrowSelectedCasts(ISILControlFlowGraph graph)
+    {
+        var definitions = graph.Instructions.Where(i => i.Destination is LocalVariable)
+            .GroupBy(i => (LocalVariable)i.Destination!).Where(g => g.Count() == 1)
+            .ToDictionary(g => g.Key, g => g.Single());
+        IOperand Value(IOperand value)
+        {
+            for (var i = 0; i < 32 && value is LocalVariable local && definitions.TryGetValue(local, out var definition)
+                && definition is { OpCode: OpCode.Move, Operands: [_, var source] }; i++)
+                value = source;
+            return value;
+        }
+        (Instruction Test, bool Positive)? Test(IOperand operand, int depth = 0)
+        {
+            if (depth > 16 || operand is not LocalVariable local || !definitions.TryGetValue(local, out var definition)) return null;
+            return definition switch
+            {
+                { OpCode: OpCode.IsInstance, Operands: [_, TypeAnalysisContext { IsValueType: false }, LocalVariable] } => (definition, true),
+                { OpCode: OpCode.Move, Operands: [_, LocalVariable copy] } => Test(copy, depth + 1),
+                { OpCode: OpCode.Not, Operands: [_, var inner] } => Test(inner, depth + 1) is { } p ? (p.Test, !p.Positive) : null,
+                { OpCode: OpCode.CheckEqual or OpCode.CheckNotEqual, Operands: [_, var inner, Immediate { Value: 0 }] }
+                    => Test(inner, depth + 1) is { } p ? (p.Test, p.Positive == (definition.OpCode == OpCode.CheckNotEqual)) : null,
+                _ => null,
+            };
+        }
+
+        foreach (var arm in graph.Blocks)
+        {
+            if (arm.Predecessors is not [var branchBlock] || arm.Successors is not [var join]
+                || branchBlock.Successors.Count != 2
+                || branchBlock.Instructions.LastOrDefault() is not { OpCode: OpCode.ConditionalJump, Operands: [Block taken, var condition] }
+                || Test(condition) is not { } predicate || predicate.Positive != (taken == arm))
+                continue;
+            var type = (TypeAnalysisContext)predicate.Test.Operands[1];
+            var source = predicate.Test.Operands[2];
+            var copies = arm.Instructions.Where(i => i.OpCode is not (OpCode.Nop or OpCode.Jump)).ToArray();
+            if (copies is not [{ OpCode: OpCode.Move, Operands: [LocalVariable picked, var copied] } copy]
+                || !ReferenceEquals(Value(copied), Value(source)))
+                continue;
+            var edge = join.Predecessors.IndexOf(arm) + 1;
+            var phi = join.Instructions.FirstOrDefault(i => i.OpCode == OpCode.Phi
+                && i.Operands.Count == join.Predecessors.Count + 1 && ReferenceEquals(i.Operands[edge], picked));
+            if (phi?.Destination is not LocalVariable result
+                || !phi.Operands.Skip(1).Where((_, k) => k + 1 != edge).All(o => Value(o) is Immediate { Value: 0 })
+                || !Narrows(type, picked.Type) || !Narrows(type, result.Type))
+                continue;
+            copy.OpCode = OpCode.TryCast;
+            copy.SetOperands(picked, type, source);
+            var previous = result.Type;
+            picked.Type = type;
+            result.Type = type;
+            // Plain copies of the join took its type from it.
+            var pending = new Queue<LocalVariable>([result]);
+            while (pending.TryDequeue(out var narrowed))
+                foreach (var use in graph.Instructions.Where(i => i is { OpCode: OpCode.Move, Operands: [LocalVariable, LocalVariable from] }
+                    && from == narrowed))
+                    if (use.Operands[0] is LocalVariable target && target.Type == previous && target.Type != type)
+                    {
+                        target.Type = type;
+                        pending.Enqueue(target);
+                    }
+        }
+    }
+
+    private static bool Narrows(TypeAnalysisContext type, TypeAnalysisContext? current) =>
+        current == null || current == type || current is not ReferencedTypeAnalysisContext && type.IsAssignableTo(current);
+
+    private sealed record PendingGuard(Block Guard, Instruction Branch, Block Lookup, Block Failure,
+        TypeAnalysisContext Target, LocalVariable Receiver);
+
+    // Bypassing the depth guard sends a shallow object - one that is no instance of the target - through the
+    // lookup arm instead of the failure arm. Walk both arms: on the lookup arm every IsInstance of the target on
+    // this receiver is false. The arms must reach a common block with equal phi inputs, or equal returns, and
+    // execute nothing but local computation on the way, so that no observable effect is added or skipped.
+    private static bool MissMatchesFailure(PendingGuard guard, Resolver resolver)
+    {
+        var miss = ArmWalk.Run(guard.Guard, guard.Lookup, resolver, guard.Target, guard.Receiver);
+        var failure = ArmWalk.Run(guard.Guard, guard.Failure, resolver, null, null);
+        for (var i = 1; i < miss.Blocks.Count; i++)
+        {
+            var join = miss.Blocks[i];
+            var j = failure.Blocks.IndexOf(join);
+            if (j < 0) continue;
+            var missEdge = join.Predecessors.IndexOf(miss.Blocks[i - 1]) + 1;
+            var failureEdge = join.Predecessors.IndexOf(j == 0 ? guard.Guard : failure.Blocks[j - 1]) + 1;
+            if (missEdge == 0 || failureEdge == 0) return false;
+            return join.Instructions.Where(p => p.OpCode == OpCode.Phi).All(p => missEdge < p.Operands.Count
+                && failureEdge < p.Operands.Count
+                && resolver.Same(miss.Evaluate(p.Operands[missEdge]), failure.Evaluate(p.Operands[failureEdge])));
+        }
+        return miss.Returned is { } missed && failure.Returned is { } failed
+            && (missed.Operands.Count == 0 && failed.Operands.Count == 0
+                || missed.Operands is [var a] && failed.Operands is [var b]
+                && resolver.Same(miss.Evaluate(a), failure.Evaluate(b)));
+    }
+
+    // Follows one arm from the guard while it only computes locals and its branches are decided.
+    private sealed class ArmWalk
+    {
+        public readonly List<Block> Blocks = [];
+        public Instruction? Returned;
+        private readonly Dictionary<LocalVariable, IOperand> _known = new();
+        private Resolver _resolver = null!;
+
+        public static ArmWalk Run(Block guard, Block start, Resolver resolver, TypeAnalysisContext? target, LocalVariable? receiver)
+        {
+            var walk = new ArmWalk { _resolver = resolver };
+            var predecessor = guard;
+            var block = start;
+            while (block != guard && !walk.Blocks.Contains(block) && walk.Blocks.Count < 16)
+            {
+                walk.Blocks.Add(block);
+                var edge = block.Predecessors.IndexOf(predecessor) + 1;
+                Block? next = null;
+                foreach (var instruction in block.Instructions)
+                {
+                    if (instruction.OpCode == OpCode.Nop) continue;
+                    if (instruction.OpCode == OpCode.Jump)
+                    {
+                        next = block.Successors is [var only] ? only : null;
+                        break;
+                    }
+                    if (instruction.OpCode == OpCode.Return)
+                    {
+                        walk.Returned = instruction;
+                        return walk;
+                    }
+                    if (instruction.OpCode == OpCode.ConditionalJump)
+                    {
+                        if (walk.Evaluate(instruction.Operands[1]) is not Immediate condition || block.Successors.Count != 2
+                            || instruction.Operands[0] is not Block taken || !block.Successors.Contains(taken))
+                            return walk;
+                        next = condition.Value != 0 ? taken : block.Successors.First(s => s != taken);
+                        break;
+                    }
+                    if (instruction.Destination is not LocalVariable destination
+                        || instruction.Operands.Any(o => o is MemoryOperand)
+                        || !walk.Compute(instruction, destination, edge, target, receiver))
+                        return walk;
+                }
+                if (next == null)
+                {
+                    if (block.Successors is not [var fallthrough]) return walk;
+                    next = fallthrough;
+                }
+                predecessor = block;
+                block = next;
+            }
+            return walk;
+        }
+
+        // Records what a local computation yields on this arm; false for anything that is not one.
+        private bool Compute(Instruction instruction, LocalVariable destination, int edge, TypeAnalysisContext? target, LocalVariable? receiver)
+        {
+            IOperand? value = null;
+            switch (instruction.OpCode)
+            {
+                case OpCode.Phi:
+                    if (edge <= 0 || edge >= instruction.Operands.Count) return false;
+                    value = Evaluate(instruction.Operands[edge]);
+                    break;
+                case OpCode.Move:
+                    value = Evaluate(instruction.Operands[1]);
+                    break;
+                case OpCode.IsInstance:
+                    if (target != null && receiver != null && instruction.Operands is [_, var tested, var instance]
+                        && Equals(_resolver.Value(tested), target) && _resolver.Same(Evaluate(instance), receiver))
+                        value = new Immediate(0);
+                    break;
+                case OpCode.Not when destination.Type?.FullName == "System.Boolean":
+                    if (Evaluate(instruction.Operands[1]) is Immediate { Value: 0 or 1 } negated)
+                        value = new Immediate(1 - negated.Value);
+                    break;
+                case OpCode.CheckEqual or OpCode.CheckNotEqual:
+                    if (Evaluate(instruction.Operands[1]) is Immediate left && Evaluate(instruction.Operands[2]) is Immediate right)
+                        value = new Immediate((left.Value == right.Value) == (instruction.OpCode == OpCode.CheckEqual) ? 1 : 0);
+                    break;
+                case OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.And or OpCode.Or or OpCode.Xor
+                    or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.Not or OpCode.Negate or OpCode.ZeroExtend
+                    or (>= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual):
+                    break;
+                default:
+                    return false;
+            }
+            if (value != null) _known[destination] = value;
+            return true;
+        }
+
+        public IOperand Evaluate(IOperand operand) =>
+            operand is LocalVariable local && _known.TryGetValue(local, out var value) ? value : _resolver.Value(operand);
     }
 
     private static Block? Target(ISILControlFlowGraph graph, Instruction branch) => branch.Operands[0] switch
@@ -218,6 +438,8 @@ public static class TypeHierarchyRecovery
             return _values[local] = result;
         }
 
+        public bool Same(IOperand a, IOperand b) => Equal(Value(a), Value(b));
+
         private bool Equal(IOperand a, IOperand b) => a is MemoryOperand x && b is MemoryOperand y
             ? x.Addend == y.Addend && x.Scale == y.Scale && Equals(x.Index, y.Index)
                 && x.Base != null && y.Base != null && Equals(Value(x.Base), Value(y.Base))
@@ -226,8 +448,22 @@ public static class TypeHierarchyRecovery
         public bool MatchAddress(IOperand hierarchy, IOperand scaledDepth, TypeAnalysisContext target, out IOperand? klass)
         {
             klass = null;
-            if (Value(hierarchy) is not MemoryOperand { Base: { } baseClass, Addend: 0xC8, Index: null, Scale: 0 }
-                || Definition(scaledDepth) is not { OpCode: OpCode.ShiftLeft, Operands: [_, var depth, Immediate { Value: 3 }] }) return false;
+            return Definition(scaledDepth) is { OpCode: OpCode.ShiftLeft, Operands: [_, var depth, Immediate { Value: 3 }] }
+                && MatchHierarchy(hierarchy, depth, target, out klass);
+        }
+
+        // LDR Xt, [typeHierarchy, index, LSL #3] with index = targetDepth - 1.
+        public bool MatchIndexedAddress(IOperand hierarchy, IOperand index, TypeAnalysisContext target, out IOperand? klass)
+        {
+            klass = null;
+            return Definition(index) is { OpCode: OpCode.Subtract, Operands: [_, var depth, Immediate { Value: 1 }] }
+                && MatchHierarchy(hierarchy, depth, target, out klass);
+        }
+
+        private bool MatchHierarchy(IOperand hierarchy, IOperand depth, TypeAnalysisContext target, out IOperand? klass)
+        {
+            klass = null;
+            if (Value(hierarchy) is not MemoryOperand { Base: { } baseClass, Addend: 0xC8, Index: null, Scale: 0 }) return false;
             // UXTB/UXTH/UXTW is redundant for Il2CppClass::typeHierarchyDepth, which is uint8_t.
             if (Definition(depth) is { OpCode: OpCode.ZeroExtend, Operands: [_, var narrow, Immediate { Value: 8 or 16 or 32 }] })
                 depth = narrow;

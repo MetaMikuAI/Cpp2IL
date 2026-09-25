@@ -418,6 +418,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // The receiver is typed, and unresolved calls still carry their raw argument registers.
         InterlockedHelperRecovery.Run(this);
         MetadataInitGuardRemover.RunSsaClassGuards(this);
+        MetadataInitGuardRemover.FoldCctorGuards(this);
         KeyFunctionRecovery.Run(this);
 
         // Needs the MethodInfo* receivers typed, so runs after resolution unlike the class-init guards
