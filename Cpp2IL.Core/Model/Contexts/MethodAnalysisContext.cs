@@ -436,6 +436,11 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         if (TypeTestFieldRecovery.Run(this))
             LocalVariables.ResolveTypesAndFields(this);
 
+        // Receivers that reach a shared generic call through a phi have their type now. Resolving
+        // the call against it lets resolution type the call's arguments.
+        if (SharedGenericCallRecovery.Run(this))
+            LocalVariables.ResolveTypesAndFields(this);
+
         // Class/RGCTX guards can retain stale interface lookup arguments until removed.
         retryInterfaceCleanup?.Invoke();
 
@@ -496,6 +501,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         // Near-last, as it depends on the final block layout
         EqualityBranchInverter.Run(this);
+
+        // Versions of an address-taken receiver are one typed local now.
+        SharedGenericCallRecovery.Run(this, afterSsa: true);
 
         // Every call that was going to resolve now has. Any argument registers it ended up
         // not using are just keeping their definitions alive, so drop them.

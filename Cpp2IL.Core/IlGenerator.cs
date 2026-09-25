@@ -858,9 +858,22 @@ public static class IlGenerator
                     break;
                 }
 
-                var importedMethod = targetMethod.ToMethodDescriptor();
+                // Blocks are emitted in graph order, which can put a constructor call before the
+                // allocation it belongs to. The allocation emits the fused newobj; this is its placeholder.
+                if (targetMethod.Name == ".ctor" && FindAllocation(context, instruction) != null)
+                {
+                    instructions.Add(CilOpCodes.Nop);
+                    break;
+                }
 
                 var thisParamIndex = instruction.OpCode == OpCode.Call ? 2 : 1;
+
+                // C# can only chain to the base type's constructor, which native code may have inlined.
+                if (context is { Name: ".ctor", IsStatic: false, DeclaringType: { } constructed } && targetMethod.Name == ".ctor"
+                    && thisParamIndex < instruction.Operands.Count && instruction.Operands[thisParamIndex] is LocalVariable { IsThis: true })
+                    targetMethod = ForwardingConstructorRecovery.ResolveBaseCall(constructed, targetMethod) ?? targetMethod;
+
+                var importedMethod = targetMethod.ToMethodDescriptor();
 
                 if (!targetMethod.IsStatic) // Load 'this' param
                 {
@@ -1095,6 +1108,33 @@ public static class IlGenerator
     }
     
     private static int ConstructorReceiverIndex(Instruction constructorCall) => constructorCall.OpCode == OpCode.CallVoid ? 1 : 2;
+
+    // The Newobj still to be emitted that will fuse with this constructor call, if any. One already
+    // emitted has fused with its own call, after which FindConstructorCall moves on to the next one.
+    private static Instruction? FindAllocation(MethodAnalysisContext context, Instruction constructorCall)
+    {
+        var receiver = ConstructorReceiverIndex(constructorCall);
+        if (receiver >= constructorCall.Operands.Count || constructorCall.Operands[receiver] is not LocalVariable newObject)
+            return null;
+
+        var blocks = context.ControlFlowGraph!.Blocks;
+        (int Block, int Index) EmissionPosition(Instruction instruction)
+        {
+            for (var i = 0; i < blocks.Count; i++)
+                if (blocks[i].Instructions.IndexOf(instruction) is >= 0 and var index)
+                    return (i, index);
+            return (-1, -1);
+        }
+
+        // With one allocation into the receiver, nothing but that allocation can change which call it fuses with.
+        var allocations = context.ControlFlowGraph.Instructions
+            .Where(i => i.OpCode == OpCode.Newobj && ReferenceEquals(i.Operands[0], newObject)).ToList();
+        return allocations is [{ } allocation]
+               && EmissionPosition(allocation).CompareTo(EmissionPosition(constructorCall)) > 0
+               && FindConstructorCall(context, allocation) == constructorCall
+            ? allocation
+            : null;
+    }
 
     // Try find the follow up CallVoid for a constructor, after a Newobj.
     internal static Instruction? FindConstructorCall(MethodAnalysisContext context, Instruction newobj)

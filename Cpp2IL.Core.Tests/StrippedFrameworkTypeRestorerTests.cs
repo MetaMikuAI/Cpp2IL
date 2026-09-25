@@ -77,6 +77,27 @@ public class StrippedFrameworkTypeRestorerTests
         Assert.That(attribute!.Methods.Any(m => m.Name == ".ctor" && m.Parameters is [{ ParameterType: var p }] && p == app.SystemTypes.SystemStringType));
     }
 
+    [Test]
+    public void RestoresTheMathConstantsADecompilerWritesForLiterals()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var math = app.SystemTypes.SystemObjectType.DeclaringAssembly.GetTypeByFullName("System.Math")!;
+        var kept = math.Fields.Where(f => f.Name is "PI" or "E").ToList();
+
+        StrippedFrameworkTypeRestorer.Restore(app);
+        StrippedFrameworkTypeRestorer.Restore(app);
+
+        foreach (var (name, value) in new[] { ("PI", System.Math.PI), ("E", System.Math.E) })
+        {
+            var field = math.Fields.Single(f => f.Name == name);
+            if (kept.Contains(field))
+                continue; // a constant the metadata kept is never replaced
+            Assert.That(field.IsStatic && field.Attributes.HasFlag(FieldAttributes.Literal) && field.Attributes.HasFlag(FieldAttributes.Public));
+            Assert.That(field.FieldType, Is.SameAs(app.SystemTypes.SystemDoubleType));
+            Assert.That(field.ConstantValue, Is.EqualTo(value));
+        }
+    }
+
     [TestCase(true)]
     [TestCase(false)]
     public void RestoresTheGetterOfAWriteOnlyAutoProperty(bool autoProperty)

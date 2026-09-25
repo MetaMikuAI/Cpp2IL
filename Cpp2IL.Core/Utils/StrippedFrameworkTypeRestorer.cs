@@ -14,6 +14,11 @@ namespace Cpp2IL.Core.Utils;
 /// The linker likewise strips the getter of an attribute's auto-property that is only ever set as a named
 /// argument. A named argument needs a read-write property, so such a getter is restored when the backing
 /// field proves the property is an auto-property.
+///
+/// Constants are inlined at compile time, so the linker strips the unused ones, but a decompiler writes a
+/// floating-point literal that is a simple fraction or multiple of pi or e as <c>Math.PI</c> or
+/// <c>Math.E</c> without checking the corlib still declares them. Those two are restored with their
+/// framework values.
 /// </summary>
 public static class StrippedFrameworkTypeRestorer
 {
@@ -34,6 +39,7 @@ public static class StrippedFrameworkTypeRestorer
             RestoreMethodImpl(appContext, corlib);
 
         RestoreAssemblyVersion(appContext, corlib);
+        RestoreMathConstants(appContext, corlib);
 
         foreach (var type in metadataTypes.Where(IsAttributeType))
             RestoreAutoPropertyGetters(type);
@@ -104,6 +110,19 @@ public static class StrippedFrameworkTypeRestorer
             TypeAttributes.Public | TypeAttributes.Sealed | TypeAttributes.BeforeFieldInit);
         InjectConstructor(attribute, [types.SystemStringType], ["version"]);
         InjectGetOnlyProperty(attribute, "Version", types.SystemStringType);
+    }
+
+    private static void RestoreMathConstants(ApplicationAnalysisContext appContext, AssemblyAnalysisContext corlib)
+    {
+        if (corlib.GetTypeByFullName("System.Math") is not { } math) return;
+
+        foreach (var (name, value) in new[] { ("PI", System.Math.PI), ("E", System.Math.E) })
+        {
+            if (math.Fields.Any(f => f.Name == name)) continue;
+            math.Fields.Add(new InjectedFieldAnalysisContext(name, appContext.SystemTypes.SystemDoubleType,
+                FieldAttributes.Public | FieldAttributes.Static | FieldAttributes.Literal | FieldAttributes.HasDefault, math,
+                constantValue: value));
+        }
     }
 
     internal static void RestoreAutoPropertyGetters(TypeAnalysisContext type)

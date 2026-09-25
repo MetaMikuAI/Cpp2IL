@@ -1270,8 +1270,16 @@ public static class MetadataResolver
         {
             switch (definition.OpCode)
             {
+                // The class operand is the exact runtime class allocated. The result's own type can be a
+                // weaker static type propagated from a use before the class operand resolved.
                 case OpCode.Newobj:
-                    return (definition.Operands[0] as LocalVariable)?.Type;
+                    return definition.Operands[1] switch
+                    {
+                        RuntimeClassTypeAnalysisContext { RepresentedType: var allocated } => allocated,
+                        LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: var allocated } } => allocated,
+                        TypeAnalysisContext allocated => allocated,
+                        _ => null,
+                    } ?? (definition.Operands[0] as LocalVariable)?.Type;
                 case OpCode.Move when definition.Operands[1] is LocalVariable source:
                     local = source;
                     continue;
@@ -1444,8 +1452,9 @@ public static class MetadataResolver
 
     private static bool CanSpecializeSharedGeneric(MethodAnalysisContext current, MethodAnalysisContext represented)
     {
-        // Reference-type method arguments share an object body too, even when their
-        // declaring type is not generic (e.g. Enumerable.FirstOrDefault<T>).
+        // Method arguments share a body too (object for reference types, the corlib enum of the same
+        // underlying type for enums), even when their declaring type is not generic
+        // (e.g. Enumerable.FirstOrDefault<T>).
         if (current is ConcreteGenericMethodAnalysisContext currentGeneric
             && represented is ConcreteGenericMethodAnalysisContext representedGeneric
             && ReferenceEquals(currentGeneric.BaseMethodContext, representedGeneric.BaseMethodContext)
@@ -1459,8 +1468,8 @@ public static class MetadataResolver
                 var before = currentGeneric.MethodGenericParameters[i];
                 var after = representedGeneric.MethodGenericParameters[i];
                 if (IsSameType(before, after)) continue;
-                if (before != current.AppContext.SystemTypes.SystemObjectType || after.IsValueType)
-                    return false; // Not a refinement of the canonical reference-type body.
+                if (!GenericSharing.IsSharedFormOf(before, after))
+                    return false; // Not a refinement of the shared body.
                 changed = true;
             }
             return changed;
@@ -1489,8 +1498,8 @@ public static class MetadataResolver
             || instance.GenericArguments.Count == 0)
             return false;
 
-        // IL2CPP uses System.Object as the canonical body for reference-type generic sharing.
-        return instance.GenericArguments.Any(argument => argument == method.AppContext.SystemTypes.SystemObjectType);
+        // IL2CPP compiles System.Object bodies for reference-type arguments and corlib enum bodies for enums.
+        return instance.GenericArguments.Any(GenericSharing.IsSharedRepresentative);
     }
 
     private static bool MatchesSharedGenericMethod(MethodAnalysisContext shared, MethodAnalysisContext represented)
@@ -1502,12 +1511,13 @@ public static class MetadataResolver
             return false;
 
         if (ReferenceEquals(BaseMethodOf(shared), BaseMethodOf(represented)))
-            return true;
+            return GenericSharing.MayServe(shared, represented);
 
         return shared.DeclaringType is GenericInstanceTypeAnalysisContext sharedInstance
             && represented.DeclaringType is GenericInstanceTypeAnalysisContext representedInstance
             && ReferenceEquals(sharedInstance.GenericType, representedInstance.GenericType)
-            && sharedInstance.GenericArguments.Count == representedInstance.GenericArguments.Count;
+            && sharedInstance.GenericArguments.Count == representedInstance.GenericArguments.Count
+            && GenericSharing.MayServe(sharedInstance.GenericArguments, representedInstance.GenericArguments);
     }
 
     private static MethodAnalysisContext? TrySpecializeSharedGeneric(MethodAnalysisContext shared, TypeAnalysisContext receiverType)
@@ -1536,6 +1546,10 @@ public static class MetadataResolver
 
             if (sameArguments)
                 return shared;
+
+            // A receiver the shared body cannot serve contradicts the call target.
+            if (!GenericSharing.MayServe(sharedInstance.GenericArguments, receiverInstance.GenericArguments))
+                return null;
 
             var matches = receiverInstance.GenericType.Methods
                 .Where(candidate => candidate.Name == shared.Name

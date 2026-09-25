@@ -112,6 +112,25 @@ public class GenericMethodSpecializationTests
         Assert.That(call.Operands[0], Is.SameAs(original));
     }
 
+    // IL2CPP shares enum instantiations through the internal corlib enum of the same underlying type.
+    [TestCase("Int32Enum", "TestIntEnum", true)]
+    [TestCase("Int32Enum", "TestLongEnum", false)]
+    [TestCase("Int32Enum", "Int32", false)]
+    [TestCase("Object", "TestIntEnum", false)]
+    public void RefinesSharedEnumBodiesOnlyToEnumsOfTheSameUnderlyingType(string before, string after, bool refines)
+    {
+        var types = _app.SystemTypes;
+        var corlib = types.SystemObjectType.DeclaringAssembly;
+        GenericSharingTests.SharedEnum(_app, types.SystemInt32Type);
+        foreach (var (name, underlying) in new[] { ("TestIntEnum", types.SystemInt32Type), ("TestLongEnum", types.SystemInt64Type) })
+            corlib.InjectType("System", name, types.EnumType, TypeAttributes.Public | TypeAttributes.Sealed).EnumUnderlyingType = underlying;
+
+        var (caller, call, target) = Create(before: before, after: after);
+        var original = call.Operands[0];
+        Assert.That(MetadataResolver.ResolveCallsViaMethodInfo(caller), Is.EqualTo(refines));
+        Assert.That(call.Operands[0], Is.SameAs(refines ? target : original));
+    }
+
     [Test]
     public void RejectsMetadataForAnotherMethod()
     {
