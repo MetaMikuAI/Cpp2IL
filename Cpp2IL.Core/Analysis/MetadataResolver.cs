@@ -1249,7 +1249,7 @@ public static class MetadataResolver
 
                 var firstArg = instruction.OpCode == OpCode.CallVoid ? 1 : 2;
                 var hiddenParamIndex = firstArg
-                    + (representedMethod.AppContext.InstructionSet.CallingConventionResolver?.ReturnsViaHiddenBuffer(representedMethod) == true ? 1 : 0)
+                    + (representedMethod.AppContext.InstructionSet.CallingConventionResolver?.ReturnBufferTakesArgumentSlot(representedMethod) == true ? 1 : 0)
                     + (representedMethod.IsStatic ? 0 : 1) + representedMethod.Parameters.Count;
 
                 // Nothing but the MethodInfo identifies an unregistered body, so it must be the one

@@ -28,6 +28,10 @@ public abstract class BaseCallingConventionResolver
     // false when the return buffer pointer lives outside the argument registers (e.g. arm64 uses x8)
     protected virtual bool HiddenBufferConsumesArgumentSlot => true;
 
+    // Whether the return buffer pointer takes the first integer argument slot of a call to ctx.
+    public bool ReturnBufferTakesArgumentSlot(MethodAnalysisContext ctx)
+        => HiddenBufferConsumesArgumentSlot && ReturnsViaHiddenBuffer(ctx);
+
     protected virtual int IntegerArgumentSlots(ParameterAnalysisContext parameter) => 1;
 
     public IOperand[] ResolveForUnmanaged(ApplicationAnalysisContext app, ulong target)
