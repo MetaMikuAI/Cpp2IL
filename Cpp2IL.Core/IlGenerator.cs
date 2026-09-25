@@ -120,6 +120,7 @@ public static class IlGenerator
 
         // Map ISIL locals to IL
         Dictionary<LocalVariable, CilLocalVariable> locals = [];
+        TypeUntypedCopies(context);
         var integerLocals = UntypedIntegerLocals(context);
         foreach (var local in context.Locals)
         {
@@ -637,6 +638,42 @@ public static class IlGenerator
         }
 
         return result;
+    }
+
+    // An untyped local that only ever receives copies of values of one type - of typed locals, or read
+    // through a byref such as an out parameter - takes that type. Copies of copies are typed in later rounds.
+    private static void TypeUntypedCopies(MethodAnalysisContext context)
+    {
+        var voidType = context.AppContext.SystemTypes.SystemVoidType;
+        bool Untyped(LocalVariable local) => local.Type == null || local.Type == voidType;
+
+        var definitions = new Dictionary<LocalVariable, List<Instruction>>();
+        foreach (var instruction in context.ControlFlowGraph!.Instructions)
+            if (instruction.Destination is LocalVariable destination && Untyped(destination)
+                && !context.ParameterLocals.Contains(destination))
+                (definitions.TryGetValue(destination, out var list) ? list : definitions[destination] = []).Add(instruction);
+
+        TypeAnalysisContext? SourceType(Instruction definition) => definition is { OpCode: OpCode.Move, Operands: [_, var source] }
+            ? source switch
+            {
+                LocalVariable local when !Untyped(local) => local.Type,
+                MemoryOperand { Index: null, Addend: 0, Scale: 0, Base: LocalVariable { Type: ByRefTypeAnalysisContext { ElementType: var referent } } } => referent,
+                _ => null
+            }
+            : null;
+
+        for (var changed = true; changed;)
+        {
+            changed = false;
+            foreach (var (local, defs) in definitions)
+            {
+                if (!Untyped(local) || SourceType(defs[0]) is not { } type
+                    || defs.Any(d => SourceType(d)?.FullName != type.FullName))
+                    continue;
+                local.Type = type;
+                changed = true;
+            }
+        }
     }
 
     // A memory operand LoadOperand cannot express in IL, only as a diagnostic and a native int zero.
@@ -1633,9 +1670,9 @@ public static class IlGenerator
                 if (memory.Index == null && memory.Addend == 0 && memory.Scale == 0
                     && memory.Base is LocalVariable local2)
                 {
-                    if (local2.Type is ByRefTypeAnalysisContext { ElementType: { IsValueType: true } referent })
+                    if (local2.Type is ByRefTypeAnalysisContext { ElementType: { } referent })
                     {
-                        // A Move through a byref value type is an indirect aggregate store:
+                        // A Move through a byref is an indirect store:
                         // save the value, load the destination address, then emit stobj.
                         var aggregateScratch = new CilLocalVariable(referent.ToTypeSignature());
                         method.CilMethodBody!.LocalVariables.Add(aggregateScratch);
