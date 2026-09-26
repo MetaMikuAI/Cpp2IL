@@ -92,8 +92,16 @@ public static class KeyFunctionRecovery
         // TryCast yields the object as the cast type, which only a reference type can be. A test of
         // the result against null alone is an isinst of any type, value types and open ones included.
         var testOnly = castType.IsValueType || castType is GenericParameterTypeAnalysisContext generic && !HasReferenceTypeConstraint(generic);
+        // Used as a value, the cast to an unconstrained type argument is castclass when a null result throws
+        // InvalidCastException: (T)obj, i.e. unbox.any !!T, which casts or unboxes whatever T is and throws on
+        // a mismatch itself.
+        var castToTypeArgument = false;
         if (testOnly && !OnlyComparedWithNull(method, result))
-            return false;
+        {
+            if (castType is not GenericParameterTypeAnalysisContext || !NullResultThrowsInvalidCast(method, result))
+                return false;
+            (testOnly, castToTypeArgument) = (false, true);
+        }
         if (target is not StringLiteral { Value: nameof(BaseKeyFunctionAddresses.il2cpp_vm_object_is_inst) })
         {
             if (target is not Immediate address) return false;
@@ -111,7 +119,7 @@ public static class KeyFunctionRecovery
         else
         {
             result.Type = castType;
-            instruction.OpCode = OpCode.TryCast;
+            instruction.OpCode = castToTypeArgument ? OpCode.Unbox : OpCode.TryCast;
         }
         instruction.SetOperands(result, castType, value);
         return true;
@@ -122,6 +130,15 @@ public static class KeyFunctionRecovery
         var uses = method.ControlFlowGraph!.Instructions.Where(i => DeadCodeEliminator.UsedLocals(i).Contains(result)).ToList();
         return uses.Count > 0 && uses.All(use => use is { OpCode: OpCode.CheckEqual or OpCode.CheckNotEqual, Operands: [_, var left, var right] }
             && (left == result && right is Immediate { Value: 0 } || right == result && left is Immediate { Value: 0 }));
+    }
+
+    private static bool NullResultThrowsInvalidCast(MethodAnalysisContext method, LocalVariable result)
+    {
+        var graph = method.ControlFlowGraph!;
+        var facts = new SsaFacts(graph);
+        return graph.Blocks.Any(block => facts.EqualityBranchOf(block) is { } branch
+            && (branch.Left == result && branch.Right is Immediate { Value: 0 } || branch.Right == result && branch.Left is Immediate { Value: 0 })
+            && SsaFacts.Throws(branch.WhenEqual, "InvalidCastException"));
     }
 
     private static bool HasReferenceTypeConstraint(GenericParameterTypeAnalysisContext type)
