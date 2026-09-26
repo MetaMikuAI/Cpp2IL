@@ -3,6 +3,7 @@ using System.Linq;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
+using LibCpp2IL.BinaryStructures;
 
 namespace Cpp2IL.Core.Analysis;
 
@@ -406,8 +407,30 @@ public static class LocalVariables
     {
         var pointerSize = method.AppContext.Binary.PointerSizeBytes;
         var instructions = method.ControlFlowGraph!.Instructions;
-        var assigned = instructions.Select(i => i.Destination).OfType<LocalVariable>().ToHashSet();
         var changed = false;
+
+        // A number stored into a struct local that fits its first member is a store to that member, which
+        // is how a frame slot holding a struct receives one (an async state machine's <>1__state = -1). A
+        // wider one packs several members (Vector2Int (1, 1) as 0x100000001) and a zero clears the whole
+        // value; both are left as they are.
+        foreach (var instruction in instructions)
+            if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable { Type: { Type: Il2CppTypeEnum.IL2CPP_TYPE_VALUETYPE, IsEnumType: false } structType } storage, Immediate { Value: not 0 } number] }
+                && SoleMemberAt(structType, 0, false) is { FieldType: { } memberType } first
+                && memberType.Namespace == "System"
+                && memberType.Name switch
+                {
+                    "Int64" or "UInt64" => true,
+                    "Int32" or "UInt32" => number.Value is >= int.MinValue and <= uint.MaxValue,
+                    "Int16" or "UInt16" => number.Value is >= short.MinValue and <= ushort.MaxValue,
+                    "Byte" or "SByte" or "Boolean" => number.Value is >= sbyte.MinValue and <= byte.MaxValue,
+                    _ => false
+                })
+            {
+                instruction.SetOperand(0, new FieldReference(first, storage, 0));
+                changed = true;
+            }
+
+        var assigned = instructions.Select(i => i.Destination).OfType<LocalVariable>().ToHashSet();
         foreach (var instruction in instructions)
         {
             if (instruction is not { OpCode: OpCode.Add, Operands: [LocalVariable destination, var left, var right] }
