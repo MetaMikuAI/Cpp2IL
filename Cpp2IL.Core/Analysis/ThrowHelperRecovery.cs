@@ -20,7 +20,7 @@ public static class ThrowHelperRecovery
 
     public static TypeAnalysisContext? GetThrownException(ApplicationAnalysisContext appContext, ulong address)
     {
-        var name = ResolveName(appContext, address, 0);
+        var name = ResolveName(appContext, address);
 
         if (name == null)
             return null;
@@ -85,39 +85,38 @@ public static class ThrowHelperRecovery
         return callTargets.Any(target => ReachesCall(appContext, target, wanted, depth + 1, visited));
     }
 
-    private static string? ResolveName(ApplicationAnalysisContext appContext, ulong address, int depth)
+    // Only a whole search from its own address is cached. Methods are analyzed in parallel, so publishing
+    // what the search passes on the way (a helper not yet resolved, or one cut short by the depth this
+    // search reached it at) would let other threads read it as that helper's answer.
+    internal static string? ResolveName(ApplicationAnalysisContext appContext, ulong address)
+        => appContext.ThrowHelperNamesByAddress.GetOrAdd(address, root => ResolveName(appContext, root, 0, []));
+
+    // reached holds the shallowest depth each helper was searched from. A helper reached again no
+    // shallower has nothing new within the depth left, which also ends a cycle; one reached by a
+    // shorter path is searched again, since more of what it calls is now in range.
+    private static string? ResolveName(ApplicationAnalysisContext appContext, ulong address, int depth, Dictionary<ulong, int> reached)
     {
-        if (appContext.ThrowHelperNamesByAddress.TryGetValue(address, out var cached))
-            return cached;
-
-        if (address == 0 || depth >= MaxDepth)
+        if (address == 0 || depth >= MaxDepth || reached.TryGetValue(address, out var shallowest) && shallowest <= depth)
             return null;
-
-        // Insert before recursing so a cycle terminates
-        appContext.ThrowHelperNamesByAddress[address] = null;
+        reached[address] = depth;
 
         var (dataReferences, callTargets) = appContext.InstructionSet.InspectPotentialThrowHelper(appContext, address);
 
-        var name = FindExceptionName(appContext, dataReferences);
+        if (FindExceptionName(appContext, dataReferences) is { } name)
+            return name;
 
-        if (name == null)
+        foreach (var target in callTargets)
         {
-            foreach (var target in callTargets)
-            {
-                // vm::Exception::Raise 接收异常对象，本体不会标识调用方 helper 的固定异常类型；
-                // 包装器仍需继续检查，因为类型名称位于包装器自身。
-                if (target == appContext.GetOrCreateKeyFunctionAddresses().il2cpp_vm_exception_raise)
-                    continue;
+            // vm::Exception::Raise 接收异常对象，本体不会标识调用方 helper 的固定异常类型；
+            // 包装器仍需继续检查，因为类型名称位于包装器自身。
+            if (target == appContext.GetOrCreateKeyFunctionAddresses().il2cpp_vm_exception_raise)
+                continue;
 
-                name = ResolveName(appContext, target, depth + 1);
-
-                if (name != null)
-                    break;
-            }
+            if (ResolveName(appContext, target, depth + 1, reached) is { } found)
+                return found;
         }
 
-        appContext.ThrowHelperNamesByAddress[address] = name;
-        return name;
+        return null;
     }
 
     private static string? FindExceptionName(ApplicationAnalysisContext appContext, IReadOnlyList<ulong> dataReferences)
