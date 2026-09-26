@@ -1717,7 +1717,8 @@ public static class MetadataResolver
                     continue;
 
                 var slot = (int)(offset / invokeDataSize);
-                if (ResolveVTableSlot(method.AppContext, receiverType, slot) is not { } resolved)
+                if ((ResolveVTableSlot(method.AppContext, receiverType, slot)
+                     ?? ResolveVTableSlotOfProvenReceiver(method, klassLocal, receiverType, slot, loads)) is not { } resolved)
                     continue;
 
                 var assembly = resolved.DeclaringType?.DeclaringAssembly ?? method.DeclaringType?.DeclaringAssembly;
@@ -1809,6 +1810,72 @@ public static class MetadataResolver
             LocalVariable local when loads.TryGetValue(local, out var load) => load,
             _ => null
         };
+    }
+
+    // The klass was read from an object typed only as a base class (e.g. Object from a shared generic
+    // InstantiateDialog<T>), whose vtable has no such slot. A call to an instance method of a derived type
+    // D with that object as the receiver proves it is a D, so the slot is looked up in D's vtable instead.
+    private static MethodAnalysisContext? ResolveVTableSlotOfProvenReceiver(MethodAnalysisContext method, LocalVariable klassLocal,
+        TypeAnalysisContext receiverType, int slot, Dictionary<LocalVariable, MemoryOperand> loads)
+    {
+        if (!loads.TryGetValue(klassLocal, out var klassLoad)
+            || klassLoad is not { Base: LocalVariable instance, Addend: 0 })
+            return null;
+
+        var aliases = new HashSet<LocalVariable> { instance };
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+            if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable copy, LocalVariable source] } && aliases.Contains(source))
+                aliases.Add(copy);
+
+        bool Derives(TypeAnalysisContext? type)
+        {
+            for (var baseType = type?.BaseType; baseType != null; baseType = baseType.BaseType)
+                if (baseType.FullName == receiverType.FullName)
+                    return true;
+            return false;
+        }
+
+        var proven = method.ControlFlowGraph.Instructions
+            .Where(i => i.IsCall && i.Operands[0] is MethodAnalysisContext { IsStatic: false }
+                && i.Operands.Count > (i.OpCode == OpCode.CallVoid ? 1 : 2)
+                && i.Operands[i.OpCode == OpCode.CallVoid ? 1 : 2] is LocalVariable receiver && aliases.Contains(receiver))
+            .Select(i => ((MethodAnalysisContext)i.Operands[0]).DeclaringType)
+            .Where(Derives).Distinct().ToList();
+
+        // Or the object is what a generic method returns as its own type argument (T InstantiateDialog<T>()),
+        // called from shared code whose only method type parameter is constrained to a class deriving from
+        // the klass type: that argument is the caller's T, so the object is at least its constraint.
+        if (proven.Count == 0
+            && Producer(instance) is { OpCode: OpCode.Call, Operands: [MethodAnalysisContext producer, ..] }
+            && BaseMethodOf(producer).ReturnType is GenericParameterTypeAnalysisContext { Type: Il2CppTypeEnum.IL2CPP_TYPE_MVAR }
+            && method.GenericParameters is [{ } typeParameter]
+            && typeParameter.ConstraintTypes.Where(c => !c.IsInterface && Derives(c)).ToList() is [{ } constraint])
+            proven.Add(constraint);
+
+        // The instruction that produced a value, looking through copies.
+        Instruction? Producer(LocalVariable value)
+        {
+            var seen = new HashSet<LocalVariable>();
+            while (seen.Add(value) && method.ControlFlowGraph.Instructions.FirstOrDefault(i => ReferenceEquals(i.Destination, value)) is { } definition)
+            {
+                if (definition is not { OpCode: OpCode.Move, Operands: [_, LocalVariable source] })
+                    return definition;
+                value = source;
+            }
+            return null;
+        }
+
+        // The most derived of them, provided they form one chain.
+        var mostDerived = proven.FirstOrDefault(candidate => proven.All(other => other == candidate || IsSubclass(candidate, other)));
+        return mostDerived == null ? null : ResolveVTableSlot(method.AppContext, mostDerived, slot);
+
+        static bool IsSubclass(TypeAnalysisContext type, TypeAnalysisContext ancestor)
+        {
+            for (var baseType = type.BaseType; baseType != null; baseType = baseType.BaseType)
+                if (baseType.FullName == ancestor.FullName)
+                    return true;
+            return false;
+        }
     }
 
     private static MethodAnalysisContext? ResolveVTableSlot(ApplicationAnalysisContext appContext, TypeAnalysisContext type, int slot)
