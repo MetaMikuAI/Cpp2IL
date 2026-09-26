@@ -454,6 +454,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
             retryResolvedInterfaceCleanup();
         }
 
+        // Every call is resolved: reads of X1 across one returning a two-register struct are its second member.
+        CompositeReturnRecovery.Run(this);
+
         // Run-once flags whose initializer call is gone; the folds below prune their "set it" arms.
         MetadataInitGuardRemover.FoldRunOnceFlags(this);
 
