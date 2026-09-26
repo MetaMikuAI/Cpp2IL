@@ -993,7 +993,14 @@ public static class IlGenerator
 
                 var importedMethod = targetMethod.ToMethodDescriptor();
 
-                if (!targetMethod.IsStatic) // Load 'this' param
+                // An instance call on a type-parameter value is constrained. T callvirt through its address.
+                var constrainedReceiver = !targetMethod.IsStatic && instruction.Operands.Count > thisParamIndex
+                    && instruction.Operands[thisParamIndex] is LocalVariable { Type: GenericParameterTypeAnalysisContext } receiverLocal
+                    && locals.ContainsKey(receiverLocal) ? receiverLocal : null;
+
+                if (constrainedReceiver != null)
+                    instructions.Add(CilOpCodes.Ldloca, locals[constrainedReceiver]);
+                else if (!targetMethod.IsStatic) // Load 'this' param
                 {
                     if ((instruction.Operands.Count - 1) >= thisParamIndex)
                         LoadOperand(instruction.Operands[thisParamIndex], method, locals, writeLine, targetMethod.DeclaringType);
@@ -1022,7 +1029,13 @@ public static class IlGenerator
                         PushDefaultOf(parameterType, instructions);
                 }
 
-                instructions.Add(CilOpCodes.Call, importedMethod);
+                if (constrainedReceiver != null)
+                {
+                    instructions.Add(CilOpCodes.Constrained, constrainedReceiver.Type!.ToTypeSignature().ToTypeDefOrRef());
+                    instructions.Add(CilOpCodes.Callvirt, importedMethod);
+                }
+                else
+                    instructions.Add(CilOpCodes.Call, importedMethod);
 
                 // the lifter's guess at whether the callee returns anything can disagree with the
                 // signature we later resolved, so go by the signature and balance the stack

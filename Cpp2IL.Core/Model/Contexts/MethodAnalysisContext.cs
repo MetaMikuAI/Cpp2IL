@@ -466,6 +466,15 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         while (ConstantFolder.Run(this) | ConstantBranchFolder.PruneSsa(ControlFlowGraph!) | EquivalentBranchFolder.Run(ControlFlowGraph!) | RedundantTypeCheckFolder.Run(ControlFlowGraph!))
             SsaSimplifier.Run(this);
 
+        // Values of a type argument that shared code keeps in stack buffers sized by its class, once
+        // copies are propagated; the folds prune what computed the buffers' sizes.
+        // Stack-protector checks the early pass could not see through yet; their failure calls hold every
+        // argument register, so they must go before unused buffers can.
+        StackProtectorRecovery.Run(this);
+        if (SharedValueStorageRecovery.Run(this))
+            while (ConstantFolder.Run(this) | ConstantBranchFolder.PruneSsa(ControlFlowGraph!))
+                SsaSimplifier.Run(this);
+
         InternalCallGuardRemover.Run(this);
         KeyFunctionRecovery.Run(this);
         // Generic specialization is finished. Drop its hidden metadata and guessed arguments
