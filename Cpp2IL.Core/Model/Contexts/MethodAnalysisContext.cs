@@ -420,6 +420,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         InterlockedHelperRecovery.Run(this);
         MetadataInitGuardRemover.RunSsaClassGuards(this);
         MetadataInitGuardRemover.FoldCctorGuards(this);
+        // Runtime helpers that only make sure an RGCTX class is initialized, left by the guard folds.
+        ClassEnsureCallRecovery.Run(this);
         KeyFunctionRecovery.Run(this);
 
         // Needs the MethodInfo* receivers typed, so runs after resolution unlike the class-init guards
