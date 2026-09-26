@@ -1158,6 +1158,18 @@ public static class MetadataResolver
                 continue;
             }
 
+            // Inside a generic type's own code 'this' is G<T1..Tn> over G's own parameters: the callee is G's
+            // definition method, whose shared body the instantiations of G also register.
+            if (receiverType is GenericInstanceTypeAnalysisContext selfInstance
+                && IsOwnInstantiation(selfInstance, selfInstance.GenericType)
+                && candidates.Where(c => !c.IsStatic && ReferenceEquals(c.DeclaringType, selfInstance.GenericType)).ToList() is [{ } own])
+            {
+                instruction.SetOperand(0, own);
+                own.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, own);
+                changed = true;
+                continue;
+            }
+
             // Handle methods with shared bodies
             var match = default(MethodAnalysisContext);
 
