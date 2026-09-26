@@ -369,6 +369,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         if (ConvertedIsil.Count == 0)
             return; //Nothing to do, empty function
 
+        // Constants loaded from a literal pool in read-only data are just their values
+        ConstantPoolRecovery.Run(this, ConvertedIsil);
+
         NativeMethodCloneRecovery.BeforeSsa(this);
         ControlFlowGraph = new ISILControlFlowGraph(ConvertedIsil);
         SharedTailCallSplitter.Run(ControlFlowGraph);
