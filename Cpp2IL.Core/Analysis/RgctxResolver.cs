@@ -3,6 +3,7 @@ using System.Linq;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 using Cpp2IL.Core.Utils;
+using LibCpp2IL;
 using LibCpp2IL.BinaryStructures;
 
 namespace Cpp2IL.Core.Analysis;
@@ -183,6 +184,18 @@ public static class RgctxResolver
                     return new RuntimeMethodInfoAnalysisContext(inflatedMethod, declaringType.DeclaringAssembly);
                 }
 
+                // A constrained call (constrained. T callvirt M): the method T implements M with, as the
+                // runtime picks it, or M itself when T is still a type parameter here.
+                case Il2CppRGCTXDataType.IL2CPP_RGCTX_DATA_CONSTRAINED:
+                {
+                    var constrained = GenericInstantiation.Instantiate(appContext.ResolveIl2CppType(entry.Type), typeArguments, methodArguments);
+                    if (MetadataUsage.DecodeMetadataUsage((uint)entry.MethodIndex, 0, appContext.LibCpp2IlContext) is not { Type: MetadataUsageType.MethodDef } usage
+                        || appContext.ResolveContextForMethod(usage.AsMethod()) is not { } called)
+                        return null;
+                    var target = ImplementationOn(constrained, called) ?? called;
+                    return new RuntimeMethodInfoAnalysisContext(target, (target.DeclaringType ?? constrained).DeclaringAssembly);
+                }
+
                 default:
                     return null;
             }
@@ -191,6 +204,23 @@ public static class RgctxResolver
         {
             return null;
         }
+    }
+
+    // The instance method of type (or a base) that implements or overrides called: same name, or an explicit
+    // interface implementation of it, with as many parameters. Built for a generic instance.
+    private static MethodAnalysisContext? ImplementationOn(TypeAnalysisContext type, MethodAnalysisContext called)
+    {
+        for (var current = type; current is not (null or GenericParameterTypeAnalysisContext); current = current.BaseType)
+        {
+            if (current == called.DeclaringType)
+                return null;
+            var instance = current as GenericInstanceTypeAnalysisContext;
+            var definition = instance?.GenericType ?? current;
+            if (definition.Methods.Where(m => !m.IsStatic && m.Parameters.Count == called.Parameters.Count
+                    && (m.Name == called.Name || m.Name.EndsWith("." + called.Name))).ToList() is [{ } implementation])
+                return instance == null ? implementation : new ConcreteGenericMethodAnalysisContext(implementation, instance.GenericArguments, []);
+        }
+        return null;
     }
 
     private static TypeAnalysisContext[] InflateAll(Il2CppType[] types, IReadOnlyList<TypeAnalysisContext> typeArguments, IReadOnlyList<TypeAnalysisContext> methodArguments, ApplicationAnalysisContext appContext)
