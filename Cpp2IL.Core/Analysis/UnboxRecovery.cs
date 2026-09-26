@@ -46,9 +46,13 @@ internal static class UnboxRecovery
                 || FindGuard(block, facts.Root(boxed), facts, dominators, elementClassLayout) is not { } guard)
                 continue;
             var type = guard.Type;
-            if (!type.IsValueType || type is GenericParameterTypeAnalysisContext || IsNullable(type)
-                || TypeSizes.UnboxedSize(type, pointerSize) != size
-                || value.Type != null && value.Type != type && !SameEnumStorage(type, value.Type))
+            // A type argument compared through the RGCTX (shared code) is unboxed as itself: unbox.any !!T
+            // is (T)obj whatever T turns out to be, so its size need not, and cannot, be checked.
+            if (type is GenericParameterTypeAnalysisContext
+                    ? value.Type != null && value.Type != type
+                    : !type.IsValueType || IsNullable(type)
+                      || TypeSizes.UnboxedSize(type, pointerSize) != size
+                      || value.Type != null && value.Type != type && !SameEnumStorage(type, value.Type))
                 continue;
 
             value.Type ??= type;

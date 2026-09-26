@@ -773,8 +773,9 @@ public static class IlGenerator
                 // Native aggregate zeroing can collapse to a scalar Move after adjacent ARM64
                 // stack slots are reconnected into one value-type local. A scalar ldc.i4.0 cannot
                 // be stored into that local in managed IL; initialize the aggregate explicitly.
+                // Likewise a zero stored into a type-parameter local is default(T), not null.
                 if (instruction.Operands is [LocalVariable { Type: { } valueType } zeroed, var zero]
-                    && IsAggregateValueType(valueType)
+                    && (IsAggregateValueType(valueType) || valueType is GenericParameterTypeAnalysisContext)
                     && IsZeroConstant(zero))
                 {
                     instructions.Add(CilOpCodes.Ldloca, locals[zeroed]);
@@ -933,7 +934,8 @@ public static class IlGenerator
                 break;
 
             case OpCode.Unbox:
-                if (instruction.Operands is [_, TypeAnalysisContext { IsValueType: true } unboxedType, var boxedObject])
+                // unbox.any also takes a type parameter, for which it is (T)obj whatever T is
+                if (instruction.Operands is [_, TypeAnalysisContext unboxedType and ({ IsValueType: true } or GenericParameterTypeAnalysisContext), var boxedObject])
                 {
                     LoadOperand(boxedObject, method, locals, writeLine, context.AppContext.SystemTypes.SystemObjectType);
                     instructions.Add(CilOpCodes.Unbox_Any, unboxedType.ToTypeSignature().ToTypeDefOrRef());
@@ -1494,6 +1496,10 @@ public static class IlGenerator
 
                 instructions.Add(CilOpCodes.Ldc_I4_0);
                 instructions.Add(CilOpCodes.Conv_I);
+                break;
+            // The class of a type, e.g. of a type argument from the RGCTX, handed to GetTypeFromHandle: typeof(T)
+            case RuntimeClassTypeAnalysisContext { RepresentedType: { } handleType } when expectedType?.FullName == "System.RuntimeTypeHandle":
+                instructions.Add(CilOpCodes.Ldtoken, handleType.ToTypeSignature().ToTypeDefOrRef());
                 break;
             case RuntimeClassTypeAnalysisContext or RgctxTableTypeAnalysisContext
                 or MethodRgctxTableTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext:
