@@ -20,10 +20,30 @@ internal static class ForwardingConstructorRecovery
             || allocated.GenericParameters.Count != 0 || allocated.BaseType != called.DeclaringType
             || called is not { Name: ".ctor", IsStatic: false, Parameters.Count: 0, UnderlyingPointer: not 0 })
             return null;
-        var constructors = allocated.Methods.Where(m => m is
+        return ForwardingConstructor(allocated, called);
+    }
+
+    // Native inlining can also leave a constructor calling a further ancestor's constructor in place
+    // of its base type's. Restore the base constructor only when its entire body forwards that call.
+    internal static MethodAnalysisContext? ResolveBaseCall(TypeAnalysisContext caller, MethodAnalysisContext called)
+    {
+        if (caller.AppContext.InstructionSet is not NewArmV8InstructionSet
+            || caller.BaseType is not { IsValueType: false } direct || direct is GenericInstanceTypeAnalysisContext
+            || direct.GenericParameters.Count != 0 || direct == called.DeclaringType
+            || called is not { Name: ".ctor", IsStatic: false, Parameters.Count: 0, UnderlyingPointer: not 0 })
+            return null;
+        for (var ancestor = direct.BaseType; ancestor != called.DeclaringType; ancestor = ancestor.BaseType)
+            if (ancestor == null) return null;
+        return ForwardingConstructor(direct, called);
+    }
+
+    // The type's only parameterless constructor, if its whole body is a tail call to the called one.
+    private static MethodAnalysisContext? ForwardingConstructor(TypeAnalysisContext type, MethodAnalysisContext called)
+    {
+        var constructors = type.Methods.Where(m => m is
             { Name: ".ctor", IsStatic: false, Parameters.Count: 0, UnderlyingPointer: not 0 }).ToList();
         if (constructors is not [{ } constructor]) return null;
-        var binary = allocated.AppContext.Binary;
+        var binary = type.AppContext.Binary;
         if (!binary.TryMapVirtualAddressToRaw(constructor.UnderlyingPointer, out var raw)) return null;
         var bytes = binary.GetRawBinaryContent();
         if (raw < 0 || raw > bytes.Length - 8

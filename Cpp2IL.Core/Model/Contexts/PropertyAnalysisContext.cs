@@ -11,7 +11,8 @@ public class PropertyAnalysisContext : HasCustomAttributesAndName, IPropertyInfo
     public TypeAnalysisContext DeclaringType { get; }
     public Il2CppPropertyDefinition? Definition { get; }
 
-    public MethodAnalysisContext? Getter { get; }
+    // Settable so a getter the linker stripped can be restored (see StrippedFrameworkTypeRestorer).
+    public MethodAnalysisContext? Getter { get; internal set; }
     public MethodAnalysisContext? Setter { get; }
 
     protected override int CustomAttributeIndex => Definition?.customAttributeIndex ?? -1;

@@ -23,6 +23,9 @@ public static class MetadataInitGuardRemover
     private const long InitialisedFlagOffset64 = 0x135;
     private const long InitialisedFlagOffset32 = 0xBD;
 
+    // Offset of Il2CppClass::cctor_finished_or_no_cctor on the 64-bit metadata v29/v31 layout.
+    private const long CctorFinishedOffset64 = 0xE0;
+
     // Offset of MethodInfo::rgctx_data
     private const long MethodRgctxOffset64 = 0x38;
     private const long MethodRgctxOffset32 = 0x1C;
@@ -195,6 +198,80 @@ public static class MetadataInitGuardRemover
             TryExcise(cfg, guard, init, merge, true);
         }
         DeadCodeEliminator.Run(cfg);
+    }
+
+    // IL2CPP_RUNTIME_CLASS_INIT(klass) is `if (!klass->cctor_finished_or_no_cctor) il2cpp_runtime_class_init(klass)`.
+    // Run excises it when the not-finished arm is only the initializer and rejoins. The compiler often also
+    // duplicates the continuation into that arm (reloads after the opaque call, a tail call), so the arms
+    // never rejoin. That arm assumes nothing about memory once the initializer has run, while the finished
+    // arm may reuse values loaded before the test; managed code initializes the class implicitly. With the
+    // initializer call already dropped, the not-finished arm is the continuation: branch to it unconditionally.
+    public static void FoldCctorGuards(MethodAnalysisContext method)
+    {
+        if (method.AppContext.Binary.PointerSizeBytes != 8 || method.AppContext.MetadataVersion is not (29 or 31 or 31.1f))
+            return;
+        FoldCctorGuards(method.ControlFlowGraph!, CctorFinishedOffset64);
+    }
+
+    internal static bool FoldCctorGuards(ISILControlFlowGraph cfg, long finishedOffset)
+    {
+        var definitions = cfg.Instructions.Where(i => i.Destination is LocalVariable)
+            .GroupBy(i => (LocalVariable)i.Destination!).Where(g => g.Count() == 1)
+            .ToDictionary(g => g.Key, g => g.Single());
+        var folded = false;
+        foreach (var guard in cfg.Blocks)
+        {
+            if (guard.Instructions.LastOrDefault() is not { OpCode: OpCode.ConditionalJump, Operands: [Block taken, var condition] } branch
+                || guard.Successors.Count != 2 || !guard.Successors.Contains(taken))
+                continue;
+            // A conditional jump is taken on a non-zero condition; track whether that means "finished".
+            var takenWhenFinished = true;
+            var seen = new HashSet<LocalVariable>();
+            while (condition is LocalVariable local && seen.Add(local) && definitions.TryGetValue(local, out var definition))
+            {
+                if (definition is { OpCode: OpCode.Move, Operands: [_, var source] })
+                    condition = source;
+                else if (definition is { OpCode: OpCode.Not, Operands: [_, var negated] } && IsBoolean(local))
+                {
+                    takenWhenFinished = !takenWhenFinished;
+                    condition = negated;
+                }
+                else if (definition is { OpCode: OpCode.CheckEqual or OpCode.CheckNotEqual, Operands: [_, var compared, Immediate { Value: 0 }] })
+                {
+                    if (definition.OpCode == OpCode.CheckEqual) takenWhenFinished = !takenWhenFinished;
+                    condition = compared;
+                }
+                else break;
+            }
+            if (Value(condition, definitions) is not MemoryOperand
+                { Base: LocalVariable { Type: RuntimeClassTypeAnalysisContext }, Index: null, Scale: 0, AccessSize: 0 or 4 } memory
+                || memory.Addend != finishedOffset)
+                continue;
+            var init = takenWhenFinished ? guard.Successors.First(s => s != taken) : taken;
+            // Run dropped every initializer call it could name; an unnamed call heading the arm may be one it could not.
+            if (FirstCall(init) is { Operands: [not StringLiteral and not MethodAnalysisContext, ..] })
+                continue;
+            branch.SetOperand(1, new Immediate(init == taken ? 1 : 0));
+            folded = true;
+        }
+        return folded;
+    }
+
+    private static bool IsBoolean(LocalVariable local) => local.Type?.FullName == "System.Boolean";
+
+    // The first call on the straight-line code that starts an arm, across blocks split at calls.
+    private static Instruction? FirstCall(Block block)
+    {
+        var seen = new HashSet<Block>();
+        while (seen.Add(block))
+        {
+            if (block.Instructions.FirstOrDefault(i => i.IsCall) is { } call)
+                return call;
+            if (block.Successors is not [var next] || next.Predecessors.Count != 1)
+                return null;
+            block = next;
+        }
+        return null;
     }
 
     private static IOperand Value(IOperand value, Dictionary<LocalVariable, Instruction> definitions)

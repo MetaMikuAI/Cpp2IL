@@ -56,6 +56,22 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
 
     private static Register Reg(Arm64Register reg) => new(null, NormalizeRegister(reg));
 
+    // The instruction's own encoding, for fields Disarm misdecodes.
+    private static uint? ReadWord(MethodAnalysisContext context, Arm64Instruction instruction)
+    {
+        var offset = instruction.Address - context.UnderlyingPointer;
+        if (instruction.Address < context.UnderlyingPointer || context.RawBytes.Length < 4
+            || offset > (ulong)(context.RawBytes.Length - 4)) return null;
+        return BinaryPrimitives.ReadUInt32LittleEndian(context.RawBytes.AsSpan().Slice((int)offset, 4));
+    }
+
+    // REV64 Vd.2S, Vn.2S, which Disarm does not decode: the two 32-bit lanes of Vn, swapped.
+    private static (int Destination, int Source)? ReverseTwoSLanes(MethodAnalysisContext context, Arm64Instruction instruction)
+        => instruction.Mnemonic == Arm64Mnemonic.UNIMPLEMENTED && ReadWord(context, instruction) is { } word
+           && (word & 0xFFFFFC00) == 0x0EA00800
+            ? ((int)(word & 31), (int)((word >> 5) & 31))
+            : null;
+
     // integer register 31 is SP or ZR depending on context, callers must decide which
     private static bool IsReg31(Arm64Register reg) => reg is Arm64Register.X31 or Arm64Register.W31;
 
@@ -355,6 +371,44 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                && (instruction.Op0Reg == Arm64Register.X30 || instruction.Op1Reg == Arm64Register.X30);
     }
 
+    /// <summary>
+    /// clang lowers <c>alloca(size)</c>, which IL2CPP emits for a value of a fully shared generic type,
+    /// to <c>mov xA, sp; sub xB, xA, size; mov sp, xB</c> with the size already rounded to the stack
+    /// alignment. Called at the final <c>mov sp, xB</c>, this rewrites the lifted subtraction into an
+    /// allocation of that size. Only a straight-line sequence qualifies: any branch, call or fixed stack
+    /// adjustment between the copy of sp and the subtraction leaves the lifted instructions as they are.
+    /// </summary>
+    internal static bool RecoverStackAllocation(List<Instruction> instructions, Register allocated)
+    {
+        Instruction? subtraction = null;
+        var stackCopy = default(Register);
+        for (var i = instructions.Count - 1; i >= 0; i--)
+        {
+            var instruction = instructions[i];
+            if (instruction.OpCode is OpCode.ShiftStack or OpCode.Jump or OpCode.ConditionalJump or OpCode.IndirectJump
+                or OpCode.Switch or OpCode.Return or OpCode.Call or OpCode.CallVoid or OpCode.IndirectCall or OpCode.Throw)
+                return false;
+            if (instruction.Destination is not Register defined) continue;
+            if (subtraction == null)
+            {
+                if (defined.Name != allocated.Name) continue;
+                if (instruction is not { OpCode: OpCode.Subtract, Operands: [_, Register copy, var size] }
+                    || size is Register { Name: var sizeName } && sizeName == copy.Name)
+                    return false;
+                subtraction = instruction;
+                stackCopy = copy;
+                continue;
+            }
+            if (defined.Name != stackCopy.Name) continue;
+            if (instruction is not { OpCode: OpCode.Move, Operands: [_, AddressOf { Target: StackOffset { Offset: 0 } }] })
+                return false;
+            subtraction.OpCode = OpCode.LocalAllocate;
+            subtraction.SetOperands(subtraction.Operands[0], subtraction.Operands[2]);
+            return true;
+        }
+        return false;
+    }
+
     public override List<Instruction> GetIsilFromMethod(MethodAnalysisContext context)
     {
         var insns = NewArm64Utils.GetArm64MethodBodyAtVirtualAddress(context.AppContext.Binary, context.UnderlyingPointer);
@@ -386,6 +440,11 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             if (instruction.Op2Kind == Arm64OperandKind.Register
                 && instruction.Op2Arrangement.ToString() == "TwoS")
                 twoSLaneRegisters.Add(NormalizeRegister(instruction.Op2Reg));
+            if (ReverseTwoSLanes(context, instruction) is var (reversed, source))
+            {
+                twoSLaneRegisters.Add("V" + reversed);
+                twoSLaneRegisters.Add("V" + source);
+            }
         }
 
         for (var nativeIndex = 0; nativeIndex < insns.Count; nativeIndex++)
@@ -701,38 +760,14 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             return shifted;
         }
 
+        // Lane 0 of V<n>.2S is the same 32 bits as scalar S<n>, so it keeps the register's own name.
         Register VectorLane(Arm64Register register, int lane) =>
-            new(null, $"{NormalizeRegister(register)}.S{lane}");
+            lane == 0 ? Reg(register) : new(null, $"{NormalizeRegister(register)}.S{lane}");
 
         bool IsTwoS(Arm64ArrangementSpecifier arrangement) => arrangement.ToString() == "TwoS";
 
-        IOperand ScalarOperand(int operand)
-        {
-            var register = operand switch
-            {
-                0 => instruction.Op0Reg,
-                1 => instruction.Op1Reg,
-                2 => instruction.Op2Reg,
-                3 => instruction.Op3Reg,
-                _ => throw new ArgumentOutOfRangeException(nameof(operand))
-            };
-            var kind = operand switch
-            {
-                0 => instruction.Op0Kind,
-                1 => instruction.Op1Kind,
-                2 => instruction.Op2Kind,
-                3 => instruction.Op3Kind,
-                _ => throw new ArgumentOutOfRangeException(nameof(operand))
-            };
-
-            // Scalar S<n> and the first lane of V<n>.2S share the same 32-bit register;
-            // preserve this alias when scalar instructions feed subsequent vector instructions.
-            return kind == Arm64OperandKind.Register
-                   && register is >= Arm64Register.S0 and <= Arm64Register.S31
-                   && twoSLaneRegisters.Contains(NormalizeRegister(register))
-                ? VectorLane(register, 0)
-                : ConvertOperand(instruction, operand);
-        }
+        // Scalar S<n> and the first lane of V<n>.2S share one name (see VectorLane).
+        IOperand ScalarOperand(int operand) => ConvertOperand(instruction, operand);
 
         IOperand VectorOperand(int operand, int lane)
         {
@@ -886,12 +921,6 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         bool TryAddNativeMath(ulong target)
         {
             if (Arm64ImportResolver.MathFunction(Arm64ImportResolver.Resolve(context.AppContext.Binary, target)) is not { } math)
-                return false;
-
-            // Scalar operations do not agree on whether S<n> of a register also used as V<n>.2S is named as
-            // lane 0 or as the whole register, so the value passed in such a register cannot be identified.
-            if (!math.IsDouble && Enumerable.Range(0, math.Arity)
-                    .Any(number => twoSLaneRegisters.Contains(NormalizeRegister(Arm64Register.S0 + number))))
                 return false;
 
             IOperand Argument(int number) => Reg((math.IsDouble ? Arm64Register.D0 : Arm64Register.S0) + number);
@@ -1229,6 +1258,14 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 }
 
                 Add(address, OpCode.Move, ScalarOperand(0), ScalarOperand(1));
+                // A whole-vector copy also carries the second .2S lane, which has a name of its own.
+                if (instruction.Mnemonic == Arm64Mnemonic.MOV
+                    && instruction is { Op0Kind: Arm64OperandKind.Register, Op1Kind: Arm64OperandKind.Register }
+                    && instruction.Op0Reg is >= Arm64Register.V0 and <= Arm64Register.V31
+                    && instruction.Op1Reg is >= Arm64Register.V0 and <= Arm64Register.V31
+                    && (twoSLaneRegisters.Contains(NormalizeRegister(instruction.Op0Reg))
+                        || twoSLaneRegisters.Contains(NormalizeRegister(instruction.Op1Reg))))
+                    Add(address, OpCode.Move, VectorLane(instruction.Op0Reg, 1), VectorLane(instruction.Op1Reg, 1));
                 break;
             case Arm64Mnemonic.FCVT:
             case Arm64Mnemonic.FCVTZS:
@@ -1419,6 +1456,15 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     if (IsReg31(instruction.Op0Reg) && IsReg31(instruction.Op1Reg) && instruction.Op2Kind == Arm64OperandKind.Immediate && !setsFlags)
                     {
                         Add(address, OpCode.ShiftStack, Imm(isSubtract ? -instruction.Op2Imm : instruction.Op2Imm));
+                        break;
+                    }
+
+                    // mov sp, xB completing a dynamic stack allocation (see RecoverStackAllocation)
+                    if (!isSubtract && !setsFlags && IsReg31(instruction.Op0Reg) && !IsReg31(instruction.Op1Reg)
+                        && instruction.Op2Kind == Arm64OperandKind.Immediate && instruction.Op2Imm == 0
+                        && RecoverStackAllocation(instructions, Reg(instruction.Op1Reg)))
+                    {
+                        Add(address, OpCode.Nop);
                         break;
                     }
 
@@ -1800,7 +1846,11 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     }
 
                     var dest = ScalarOperand(0);
-                    Add(address, OpCode.Subtract, dest, ScalarOperand(1), ScalarOperand(2));
+                    var subtrahend = ScalarOperand(2);
+                    // Disarm decodes the scalar encoding's Rm field as Rn, so take it from the word itself.
+                    if (ReadWord(context, instruction) is { } word && (word & 0xFFA0FC00) == 0x7EA0D400)
+                        subtrahend = Reg((isDouble ? Arm64Register.D0 : Arm64Register.S0) + (int)((word >> 16) & 31));
+                    Add(address, OpCode.Subtract, dest, ScalarOperand(1), subtrahend);
                     Add(address, OpCode.Call, abs, dest, dest);
                     break;
                 }
@@ -1977,6 +2027,15 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.UDF:
                 Add(address, OpCode.Interrupt);
                 break;
+            case Arm64Mnemonic.UNIMPLEMENTED when ReverseTwoSLanes(context, instruction) is var (reversed, source):
+                {
+                    // The source lanes are both read before either destination lane is written.
+                    var low = new Register(null, "TEMP_REV64");
+                    Add(address, OpCode.Move, low, VectorLane(Arm64Register.V0 + source, 0));
+                    Add(address, OpCode.Move, VectorLane(Arm64Register.V0 + reversed, 0), VectorLane(Arm64Register.V0 + source, 1));
+                    Add(address, OpCode.Move, VectorLane(Arm64Register.V0 + reversed, 1), low);
+                    break;
+                }
             case Arm64Mnemonic.MRS:
                 // system register read (thread pointer etc), value is opaque to analysis
                 Add(address, OpCode.Move, ConvertOperand(instruction, 0), new Register(null, "SYSREG"));
@@ -2123,6 +2182,10 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 Arm64VectorElementWidth.D => "D",
                 _ => throw new ArgumentOutOfRangeException(nameof(vectorElement.Width), $"Unknown vector element width {vectorElement.Width}")
             };
+
+            // Element S[0] is scalar S<n>, the name VectorLane gives lane 0.
+            if (vectorElement.Width == Arm64VectorElementWidth.S && vectorElement.Index == 0)
+                return Reg(reg);
 
             var name = $"{NormalizeRegister(reg)}.{width}{vectorElement.Index}";
             return new Register(null, name);

@@ -221,7 +221,8 @@ public class TypeHierarchyRecoveryTests
             extraPhi = new Instruction(101, OpCode.Phi, Local("otherResult"), new Immediate(7), new Immediate(8));
             instructions.Add(extraPhi);
         }
-        instructions.Add(new Instruction(102, OpCode.Return, merged));
+        // A differing phi is only an observable difference while its value is used.
+        instructions.Add(new Instruction(102, OpCode.Return, extraPhi?.Destination ?? merged));
         var graph = new ISILControlFlowGraph(instructions);
         var mergeBlock = graph.Blocks.Single(b => b.Instructions.Contains(phi));
         phi.SetOperands(merged);
@@ -258,6 +259,122 @@ public class TypeHierarchyRecoveryTests
         var (graph, locals, guard) = CreateResult(merge, wrongFallback: wrongFallback, sideEffect: sideEffect,
             differingPhi: differingPhi, failureSideEffect: failureSideEffect);
         TypeHierarchyRecovery.Run(graph, locals, _app.SystemTypes.SystemBooleanType);
+        Assert.That(guard.Operands[1], Is.TypeOf<LocalVariable>());
+    }
+
+    // `as` lowered with CSEL: chosen = match ? obj : null, then a null test that shares the guard's failure block.
+    // The entry is either typeHierarchy + depth * 8 - 8 or LDR [typeHierarchy, depth - 1, LSL #3].
+    private (ISILControlFlowGraph Graph, Instruction Guard, Instruction Check) CreateSelect(bool indexed,
+        string mutation = "none")
+    {
+        var objectType = _app.SystemTypes.SystemObjectType;
+        var boolean = _app.SystemTypes.SystemBooleanType;
+        var type = new InjectedTypeAnalysisContext(objectType.DeclaringAssembly, "Tests", "Derived", objectType, TypeAttributes.Public);
+        LocalVariable Local(string name, TypeAnalysisContext? ty = null) => new(name, new Register(null, name), ty);
+        var receiver = Local("obj", objectType);
+        var klass = Local("klass");
+        var target = Local("target");
+        var objectDepth = Local("objectDepth");
+        var targetDepth = Local("targetDepth");
+        var hierarchy = Local("hierarchy");
+        var entry = Local("entry");
+        var shallow = Local("shallow", boolean);
+        var match = Local("match", boolean);
+        var none = Local("none");
+        var picked = Local("picked");
+        var chosen = Local("chosen");
+        var isNull = Local("isNull", boolean);
+        var joined = Local("joined");
+        var failure = mutation == "phi"
+            ? new Instruction(40, OpCode.Phi, joined, new Immediate(0), none)
+            : new Instruction(40, OpCode.Return, new Immediate(0));
+        var select = new Instruction(19, OpCode.Phi, chosen, none, picked);
+        var pick = new Instruction(18, OpCode.Move, picked, receiver);
+        var check = new Instruction(14, OpCode.CheckEqual, match, entry, target);
+        var guard = new Instruction(5, OpCode.ConditionalJump, failure, shallow);
+        var instructions = new List<Instruction>
+        {
+            new(0, OpCode.Move, klass, new MemoryOperand(receiver)),
+            new(1, OpCode.Move, target, type),
+            new(2, OpCode.Move, objectDepth, new MemoryOperand(klass, addend: 0x130)),
+            new(3, OpCode.Move, targetDepth, new MemoryOperand(target, addend: 0x130)),
+            new(4, OpCode.CheckLess, shallow, objectDepth, targetDepth),
+            guard,
+            new(10, OpCode.Move, hierarchy, new MemoryOperand(klass, addend: 0xC8)),
+        };
+        if (indexed)
+        {
+            var index = Local("index");
+            instructions.Add(new Instruction(11, OpCode.Subtract, index, targetDepth, new Immediate(mutation == "offByOne" ? 2 : 1)));
+            instructions.Add(new Instruction(12, OpCode.Move, entry, new MemoryOperand(hierarchy, index, 0, 8)));
+        }
+        else
+        {
+            var scaled = Local("scaled");
+            var address = Local("address");
+            instructions.Add(new Instruction(11, OpCode.ShiftLeft, scaled, targetDepth, new Immediate(3)));
+            instructions.Add(new Instruction(12, OpCode.Add, address, hierarchy, scaled));
+            instructions.Add(new Instruction(13, OpCode.Move, entry, new MemoryOperand(address, addend: -8)));
+        }
+        instructions.Add(check);
+        instructions.Add(new Instruction(15, OpCode.ConditionalJump, pick, match));
+        instructions.Add(new Instruction(16, OpCode.Move, none, new Immediate(0)));
+        if (mutation == "sideEffect") instructions.Add(new Instruction(17, OpCode.CallVoid, new Immediate(1234)));
+        instructions.Add(new Instruction(17, OpCode.Jump, select));
+        instructions.Add(pick);
+        instructions.Add(select);
+        instructions.Add(new Instruction(20, OpCode.CheckEqual, isNull, chosen, new Immediate(0)));
+        instructions.Add(new Instruction(21, OpCode.ConditionalJump, failure, isNull));
+        instructions.Add(new Instruction(22, OpCode.Return, chosen));
+        instructions.Add(failure);
+        if (mutation == "phi") instructions.Add(new Instruction(41, OpCode.Return, joined));
+        var graph = new ISILControlFlowGraph(instructions);
+        var selectBlock = graph.Blocks.Single(b => b.Instructions.Contains(select));
+        select.SetOperands(new IOperand[] { chosen }.Concat(selectBlock.Predecessors
+            .Select(p => p.Instructions.Contains(pick) ? picked : none)).ToList());
+        if (mutation == "phi")
+        {
+            // The guard's arm yields 7 where the lookup's miss yields null: an observable difference.
+            var failureBlock = graph.Blocks.Single(b => b.Instructions.Contains(failure));
+            failure.SetOperands(new IOperand[] { joined }.Concat(failureBlock.Predecessors
+                .Select(p => p.Instructions.Contains(guard) ? new Immediate(7) : (IOperand)chosen)).ToList());
+        }
+        return (graph, guard, check);
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
+    public void RemovesGuardBeforeSelectedResult(bool indexed)
+    {
+        var (graph, guard, check) = CreateSelect(indexed);
+        TypeHierarchyRecovery.Run(graph, [], _app.SystemTypes.SystemBooleanType);
+        Assert.That(check.OpCode, Is.EqualTo(OpCode.IsInstance));
+        Assert.That(guard.Operands[1], Is.EqualTo(new Immediate(0)));
+        Assert.That(graph.Instructions.Any(i => i.Operands.Any(o => o is MemoryOperand)), Is.False);
+        // The selected copy is `obj as Derived`, so the join with null is a Derived.
+        var cast = graph.Instructions.Single(i => i.OpCode == OpCode.TryCast);
+        var join = graph.Instructions.Single(i => i.OpCode == OpCode.Phi);
+        Assert.That(cast.Operands[1], Is.SameAs(check.Operands[1]));
+        Assert.That(((LocalVariable)cast.Destination!).Type, Is.SameAs(check.Operands[1]));
+        Assert.That(((LocalVariable)join.Destination!).Type, Is.SameAs(check.Operands[1]));
+    }
+
+    [TestCase(false, "sideEffect")]
+    [TestCase(true, "phi")]
+    public void RetainsGuardBeforeSelectedResultWhenArmsDiffer(bool indexed, string mutation)
+    {
+        var (graph, guard, check) = CreateSelect(indexed, mutation);
+        TypeHierarchyRecovery.Run(graph, [], _app.SystemTypes.SystemBooleanType);
+        Assert.That(check.OpCode, Is.EqualTo(OpCode.IsInstance));
+        Assert.That(guard.Operands[1], Is.TypeOf<LocalVariable>());
+    }
+
+    [Test]
+    public void RejectsIndexedEntryOffByOne()
+    {
+        var (graph, guard, check) = CreateSelect(true, "offByOne");
+        TypeHierarchyRecovery.Run(graph, [], _app.SystemTypes.SystemBooleanType);
+        Assert.That(check.OpCode, Is.EqualTo(OpCode.CheckEqual));
         Assert.That(guard.Operands[1], Is.TypeOf<LocalVariable>());
     }
 

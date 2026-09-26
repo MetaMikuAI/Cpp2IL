@@ -31,7 +31,7 @@ public static class KeyFunctionRecovery
     ];
 
     //Both take the class to box as and a pointer to the value.
-    private static readonly HashSet<string> BoxFunctions =
+    internal static readonly HashSet<string> BoxFunctions =
     [
         nameof(BaseKeyFunctionAddresses.il2cpp_value_box),
         nameof(BaseKeyFunctionAddresses.il2cpp_vm_object_box),
@@ -61,6 +61,10 @@ public static class KeyFunctionRecovery
             else if (keyFunction == nameof(BaseKeyFunctionAddresses.InternalCalls_Resolve))
                 RewriteInternalCallResolve(instruction, method);
         }
+
+        // These need the whole graph: a proven store, a dominating class test, or the merge feeding a call.
+        if (ArrayStoreCheckRecovery.Run(method) | UnboxRecovery.Run(method) | MergedBoxRecovery.Run(method))
+            DeadCodeEliminator.Run(method.ControlFlowGraph!);
     }
 
     private static bool TryRewriteIsInst(Instruction instruction, MethodAnalysisContext method,
@@ -83,8 +87,12 @@ public static class KeyFunctionRecovery
                 or Il2CppTypeEnum.IL2CPP_TYPE_VAR or Il2CppTypeEnum.IL2CPP_TYPE_MVAR } type => type,
             _ => null
         };
-        if (castType == null || castType.IsValueType
-            || castType is GenericParameterTypeAnalysisContext generic && !HasReferenceTypeConstraint(generic))
+        if (castType == null)
+            return false;
+        // TryCast yields the object as the cast type, which only a reference type can be. A test of
+        // the result against null alone is an isinst of any type, value types and open ones included.
+        var testOnly = castType.IsValueType || castType is GenericParameterTypeAnalysisContext generic && !HasReferenceTypeConstraint(generic);
+        if (testOnly && !OnlyComparedWithNull(method, result))
             return false;
         if (target is not StringLiteral { Value: nameof(BaseKeyFunctionAddresses.il2cpp_vm_object_is_inst) })
         {
@@ -95,10 +103,25 @@ public static class KeyFunctionRecovery
                     || NewArm64KeyFunctionAddresses.GetBranchThunkTarget(method.AppContext, address.UnsignedValue) != known))
                 return false;
         }
-        result.Type = castType;
-        instruction.OpCode = OpCode.TryCast;
+        if (testOnly)
+        {
+            result.Type = method.AppContext.SystemTypes.SystemBooleanType;
+            instruction.OpCode = OpCode.IsInstance;
+        }
+        else
+        {
+            result.Type = castType;
+            instruction.OpCode = OpCode.TryCast;
+        }
         instruction.SetOperands(result, castType, value);
         return true;
+    }
+
+    private static bool OnlyComparedWithNull(MethodAnalysisContext method, LocalVariable result)
+    {
+        var uses = method.ControlFlowGraph!.Instructions.Where(i => DeadCodeEliminator.UsedLocals(i).Contains(result)).ToList();
+        return uses.Count > 0 && uses.All(use => use is { OpCode: OpCode.CheckEqual or OpCode.CheckNotEqual, Operands: [_, var left, var right] }
+            && (left == result && right is Immediate { Value: 0 } || right == result && left is Immediate { Value: 0 }));
     }
 
     private static bool HasReferenceTypeConstraint(GenericParameterTypeAnalysisContext type)

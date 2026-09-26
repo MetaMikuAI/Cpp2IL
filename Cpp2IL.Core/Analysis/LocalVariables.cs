@@ -243,6 +243,13 @@ public static class LocalVariables
         {
             if (instruction is { OpCode: OpCode.MultiplyHighSigned, Destination: LocalVariable product })
                 product.Type = method.AppContext.SystemTypes.SystemInt64Type;
+            // localloc yields an unmanaged pointer to raw stack bytes.
+            if (instruction is { OpCode: OpCode.LocalAllocate, Destination: LocalVariable allocated })
+            {
+                allocated.Type = method.AppContext.SystemTypes.SystemByteType.MakePointerType();
+                if (instruction.Operands[1] is LocalVariable { Type: null } size)
+                    size.Type = method.AppContext.SystemTypes.SystemUInt64Type;
+            }
             if (instruction is { OpCode: OpCode.ConvertNumeric,
                 Operands: [LocalVariable converted, _, NumericConversion conversion] })
                 converted.Type = conversion.TargetType;

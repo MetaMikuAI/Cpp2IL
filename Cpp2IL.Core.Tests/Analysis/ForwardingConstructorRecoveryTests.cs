@@ -1,6 +1,9 @@
 using System;
 using System.Buffers.Binary;
+using System.Reflection;
 using Cpp2IL.Core.Analysis;
+using Cpp2IL.Core.InstructionSets;
+using Cpp2IL.Core.Model.Contexts;
 
 namespace Cpp2IL.Core.Tests.Analysis;
 
@@ -36,6 +39,30 @@ public class ForwardingConstructorRecoveryTests
         BinaryPrimitives.WriteUInt32LittleEndian(body, prefix);
         BinaryPrimitives.WriteUInt32LittleEndian(body.AsSpan(4), 0x14000010);
         Assert.That(ForwardingConstructorRecovery.ForwardedTarget(body, 0x1000), Is.Null);
+    }
+
+    // Only a call to a further ancestor's parameterless constructor can stand for the base type's.
+    [TestCase("base")]
+    [TestCase("unrelated")]
+    [TestCase("parameters")]
+    [TestCase("noCode")]
+    public void BaseCallKeepsCallsItCannotProveInlined(string scenario)
+    {
+        Cpp2IlApi.ResetInternalState();
+        var app = TestGameLoader.LoadSimple2019Game();
+        app.InstructionSet = new NewArmV8InstructionSet();
+        var root = app.SystemTypes.SystemObjectType;
+        var corlib = root.DeclaringAssembly;
+        var grandparent = corlib.InjectType("Tests", "Grandparent", root, TypeAttributes.Public);
+        var parent = corlib.InjectType("Tests", "Parent", grandparent, TypeAttributes.Public);
+        var child = corlib.InjectType("Tests", "Child", parent, TypeAttributes.Public);
+        var unrelated = corlib.InjectType("Tests", "Unrelated", root, TypeAttributes.Public);
+        var owner = scenario switch { "base" => parent, "unrelated" => unrelated, _ => grandparent };
+        var called = scenario == "parameters"
+            ? owner.InjectMethodContext(".ctor", app.SystemTypes.SystemVoidType, MethodAttributes.Public, app.SystemTypes.SystemInt32Type)
+            : owner.InjectMethodContext(".ctor", app.SystemTypes.SystemVoidType, MethodAttributes.Public);
+        // Injected methods have no native code, so only the checks before reading the binary are exercised.
+        Assert.That(ForwardingConstructorRecovery.ResolveBaseCall(child, called), Is.Null);
     }
 
     [TestCase(0)]

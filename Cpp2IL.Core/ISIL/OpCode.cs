@@ -134,6 +134,9 @@ public enum OpCode
     /// <summary>Returns op 3 as the reference type in op 2, or null, into op 1.</summary>
     TryCast,
 
+    /// <summary>Unboxes the object in op 3 as the value type in op 2 (IL unbox.any) into op 1.</summary>
+    Unbox,
+
     /// <summary>Zero-extends the low op 3 bits of op 2 to UInt64 in op 1.</summary>
     ZeroExtend,
 
@@ -146,5 +149,8 @@ public enum OpCode
     /// <summary>
     /// Throws a new instance of the exception type described by op 1.
     /// </summary>
-    Throw
+    Throw,
+
+    /// <summary>Allocates op 2 bytes on the stack (IL localloc) and moves their address into op 1.</summary>
+    LocalAllocate
 }

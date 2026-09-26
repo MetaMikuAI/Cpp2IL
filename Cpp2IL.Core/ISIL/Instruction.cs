@@ -127,8 +127,10 @@ public class Instruction : IOperand
             case OpCode.Box:
             case OpCode.IsInstance:
             case OpCode.TryCast:
+            case OpCode.Unbox:
             case OpCode.ZeroExtend:
             case OpCode.SignExtend:
+            case OpCode.LocalAllocate:
                 if (newDestination != null)
                     SetOperand(0, newDestination);
                 return IsConstantValue(_operands[0]) ? null : _operands[0];
@@ -167,12 +169,12 @@ public class Instruction : IOperand
         {
             OpCode.Move or OpCode.ConvertNumeric or OpCode.ConditionalJump
                 or OpCode.ShiftStack or OpCode.Not or OpCode.Negate
-                or OpCode.Newobj or OpCode.ZeroExtend or OpCode.SignExtend
+                or OpCode.Newobj or OpCode.ZeroExtend or OpCode.SignExtend or OpCode.LocalAllocate
                 => [_operands[1]],
 
             OpCode.Switch => [_operands[0]],
 
-            OpCode.Box or OpCode.IsInstance or OpCode.TryCast => [_operands[2]],
+            OpCode.Box or OpCode.IsInstance or OpCode.TryCast or OpCode.Unbox => [_operands[2]],
 
             OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.MultiplyHighSigned
                 or OpCode.Divide or OpCode.Modulo or OpCode.ShiftLeft or OpCode.ShiftRight

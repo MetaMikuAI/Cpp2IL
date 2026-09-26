@@ -460,6 +460,111 @@ public class IlGeneratorTests
         return method.CreateDelegate<Func<bool>>()();
     }
 
+    // Blocks are emitted in graph order: here the constructor call's block precedes the allocation's,
+    // although the allocation runs first.
+    [TestCase(true)]
+    [TestCase(false)]
+    public void ConstructorCallFusesWithItsAllocationInEitherEmissionOrder(bool callBlockFirst)
+    {
+        var fixture = new AllocationFixture();
+        var created = new LocalVariable("created", new Register(null, "created"), fixture.Allocated);
+        var call = new Instruction(2, OpCode.CallVoid, fixture.Constructor, created);
+        var ret = new Instruction(3, OpCode.Return, created);
+        var allocation = new Instruction(4, OpCode.Newobj, created, fixture.Allocated);
+        var instructions = callBlockFirst
+            ? new List<Instruction> { new(1, OpCode.Jump, allocation), call, ret, allocation, new(5, OpCode.Jump, call) }
+            : [allocation, call, ret];
+
+        var il = fixture.Generate(instructions, created);
+
+        Assert.That(il.Count(i => i.OpCode == CilOpCodes.Newobj && i.Operand == fixture.ConstructorDefinition), Is.EqualTo(1));
+        Assert.That(il.Any(i => i.OpCode == CilOpCodes.Call && i.Operand == fixture.ConstructorDefinition), Is.False,
+            "the object must be constructed once");
+    }
+
+    // Each branch constructs the one allocation with its own constructor. The allocation fuses with the
+    // first; the other stays a call rather than disappearing.
+    [Test]
+    public void SecondConstructorOfTheSameAllocationIsStillEmitted()
+    {
+        var fixture = new AllocationFixture();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var (other, otherDefinition) = fixture.AddConstructor(app.SystemTypes.SystemInt32Type, fixture.Module.CorLibTypeFactory.Int32);
+        var created = new LocalVariable("created", new Register(null, "created"), fixture.Allocated);
+        var condition = new LocalVariable("condition", new Register(null, "condition"), app.SystemTypes.SystemBooleanType);
+        var argument = new LocalVariable("argument", new Register(null, "argument"), app.SystemTypes.SystemInt32Type);
+        var ret = new Instruction(5, OpCode.Return, created);
+        var otherCall = new Instruction(4, OpCode.CallVoid, other, created, argument);
+        var instructions = new List<Instruction>
+        {
+            new(0, OpCode.Newobj, created, fixture.Allocated),
+            new(1, OpCode.ConditionalJump, otherCall, condition),
+            new(2, OpCode.CallVoid, fixture.Constructor, created),
+            new(3, OpCode.Jump, ret),
+            otherCall, ret,
+        };
+
+        var il = fixture.Generate(instructions, created, condition, argument);
+
+        Assert.That(il.Count(i => i.OpCode == CilOpCodes.Newobj && i.Operand == fixture.ConstructorDefinition), Is.EqualTo(1));
+        Assert.That(il.Count(i => i.OpCode == CilOpCodes.Call && i.Operand == otherDefinition), Is.EqualTo(1));
+    }
+
+    private sealed class AllocationFixture
+    {
+        public readonly ModuleDefinition Module = new("Fusion.dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        public readonly TypeDefinition Type;
+        public readonly InjectedTypeAnalysisContext Allocated;
+        public readonly MethodAnalysisContext Constructor;
+        public readonly MethodDefinition ConstructorDefinition;
+
+        public AllocationFixture()
+        {
+            var app = Cpp2IlApi.CurrentAppContext!;
+            Type = new TypeDefinition("Tests", "Allocated", TypeAttributes.Public, Module.CorLibTypeFactory.Object.Type);
+            Module.TopLevelTypes.Add(Type);
+            foreach (var context in new[] { app.SystemTypes.SystemBooleanType, app.SystemTypes.SystemInt32Type })
+            {
+                var placeholder = new TypeDefinition(context.Namespace, context.Name, TypeAttributes.Public);
+                Module.TopLevelTypes.Add(placeholder);
+                context.PutExtraData("AsmResolverType", placeholder);
+            }
+            Allocated = new InjectedTypeAnalysisContext(app.SystemTypes.SystemObjectType.DeclaringAssembly, "Tests", "Allocated",
+                app.SystemTypes.SystemObjectType, System.Reflection.TypeAttributes.Public);
+            Allocated.PutExtraData("AsmResolverType", Type);
+            (Constructor, ConstructorDefinition) = AddConstructor();
+        }
+
+        public (MethodAnalysisContext Context, MethodDefinition Definition) AddConstructor(params (TypeAnalysisContext Context, TypeSignature Signature)[] parameters)
+        {
+            var app = Cpp2IlApi.CurrentAppContext!;
+            var context = Allocated.InjectMethodContext(".ctor", app.SystemTypes.SystemVoidType, ReflectionMethodAttributes.Public,
+                parameters.Select(p => p.Context).ToArray());
+            var definition = new MethodDefinition(".ctor", MethodAttributes.Public | MethodAttributes.SpecialName | MethodAttributes.RuntimeSpecialName,
+                MethodSignature.CreateInstance(Module.CorLibTypeFactory.Void, parameters.Select(p => p.Signature)));
+            Type.Methods.Add(definition);
+            context.PutExtraData("AsmResolverMethod", definition);
+            return (context, definition);
+        }
+
+        public (MethodAnalysisContext Context, MethodDefinition Definition) AddConstructor(TypeAnalysisContext parameter, TypeSignature signature)
+            => AddConstructor((parameter, signature));
+
+        public CilInstructionCollection Generate(List<Instruction> instructions, params LocalVariable[] locals)
+        {
+            var caller = new InjectedMethodAnalysisContext(Allocated, "Create", Allocated,
+                ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, [])
+            {
+                ControlFlowGraph = new ISILControlFlowGraph(instructions), Locals = [..locals], ParameterLocals = [], AnalysisWarnings = []
+            };
+            var generated = new MethodDefinition("Create", MethodAttributes.Public | MethodAttributes.Static,
+                MethodSignature.CreateStatic(Type.ToTypeSignature(false)));
+            Type.Methods.Add(generated);
+            IlGenerator.GenerateIl(caller, generated);
+            return generated.CilMethodBody!.Instructions;
+        }
+    }
+
     [Test]
     public void UnresolvedMemoryStore_IsReportedRatherThanDropped()
     {

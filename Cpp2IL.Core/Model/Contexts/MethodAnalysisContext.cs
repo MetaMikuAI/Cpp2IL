@@ -371,6 +371,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         NativeMethodCloneRecovery.BeforeSsa(this);
         ControlFlowGraph = new ISILControlFlowGraph(ConvertedIsil);
+        SharedTailCallSplitter.Run(ControlFlowGraph);
 
         // Indirect jumps/calls should probably be resolved here before stack analysis
 
@@ -415,7 +416,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         var retryInterfaceCleanup = InterfaceDispatchRecovery.Run(this);
 
         LocalVariables.ResolveTypesAndFields(this);
+        // The receiver is typed, and unresolved calls still carry their raw argument registers.
+        InterlockedHelperRecovery.Run(this);
         MetadataInitGuardRemover.RunSsaClassGuards(this);
+        MetadataInitGuardRemover.FoldCctorGuards(this);
         KeyFunctionRecovery.Run(this);
 
         // Needs the MethodInfo* receivers typed, so runs after resolution unlike the class-init guards
@@ -430,6 +434,11 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         TypeHierarchyRecovery.Run(this);
         if (TypeTestFieldRecovery.Run(this))
+            LocalVariables.ResolveTypesAndFields(this);
+
+        // Receivers that reach a shared generic call through a phi have their type now. Resolving
+        // the call against it lets resolution type the call's arguments.
+        if (SharedGenericCallRecovery.Run(this))
             LocalVariables.ResolveTypesAndFields(this);
 
         // Class/RGCTX guards can retain stale interface lookup arguments until removed.
@@ -493,12 +502,19 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Near-last, as it depends on the final block layout
         EqualityBranchInverter.Run(this);
 
+        // Versions of an address-taken receiver are one typed local now.
+        SharedGenericCallRecovery.Run(this, afterSsa: true);
+
         // Every call that was going to resolve now has. Any argument registers it ended up
         // not using are just keeping their definitions alive, so drop them.
         CallArgumentTrimmer.Run(this);
         FieldAddressRecovery.Run(this);
         ThrowHelperRecovery.TypeThrowOperands(this);
         DeadCodeEliminator.Run(this);
+
+        // Removing runtime checks and their dead values can leave a type-metadata branch with nothing on either side.
+        if (RuntimeCheckBranchFolder.Run(this))
+            DeadCodeEliminator.Run(this);
 
         LocalVariables.RemoveUnused(this);
     }

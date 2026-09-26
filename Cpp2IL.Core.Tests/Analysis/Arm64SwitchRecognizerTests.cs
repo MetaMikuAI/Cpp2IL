@@ -3,6 +3,7 @@ using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Linq;
 using Cpp2IL.Core.InstructionSets;
+using Disarm;
 
 namespace Cpp2IL.Core.Tests.Analysis;
 
@@ -21,6 +22,88 @@ public class Arm64SwitchRecognizerTests
         Arm64SwitchRecognizer.RemoveGuardBypasses(candidates, 0x1000);
         Assert.That(candidates, Is.Empty);
     }
+    private static List<Arm64Instruction> Disassemble(uint[] words, ulong start) => Disassembler.Disassemble(
+        words.SelectMany(BitConverter.GetBytes).ToArray(), start, new Disassembler.Options(true, true, false)).ToList();
+
+    private static ulong? Invariant(uint[] words, int register, ulong start = Start)
+        => Arm64SwitchRecognizer.ProveInvariantTable(Disassemble(words, start), words, register);
+
+    // The table base is materialized once before a loop and kept in X24; the dispatch only indexes it.
+    private static uint[] HoistedFixture()
+    {
+        var words = Enumerable.Repeat(0xD65F03C0u, 20).ToArray();
+        new uint[]
+        {
+            0x90000018, // ADRP X24, #0
+            0x912E2B18, // ADD X24,X24,#0xB8A
+            0xB9401268, // LDR W8,[X19,#16]
+            0x71000D1F, // CMP W8,#3
+            0x54000108, // B.HI +8
+            0x1000008A, // ADR X10, +16
+            0x38686B0B, // LDRB W11,[X24,X8]
+            0x8B0B094A, // ADD X10,X10,X11,LSL #2
+            0xD61F0140, // BR X10
+        }.CopyTo(words, 0);
+        return words;
+    }
+
+    [Test]
+    public void HoistedTableBaseIsReadFromItsOnlyMaterialization()
+    {
+        var words = HoistedFixture();
+        var result = Arm64SwitchRecognizer.Decode(words, Start, 6, (address, length) =>
+        {
+            Assert.That(address, Is.EqualTo((Start & ~0xFFFUL) + 0xB8A));
+            Assert.That(length, Is.EqualTo(4));
+            return [0, 1, 2, 3];
+        }, (register, _) => Invariant(words, register));
+        Assert.That(result, Is.Not.Null);
+        Assert.That(result!.Selector, Is.EqualTo(8));
+        Assert.That(result.GuardIndex, Is.EqualTo(4));
+        Assert.That(result.ProofStartIndex, Is.EqualTo(2));
+        Assert.That(result.DefaultTarget, Is.EqualTo(Start + 48));
+        Assert.That(result.Targets, Is.EqualTo(new ulong[] { Start + 36, Start + 40, Start + 44, Start + 48 }));
+        Assert.That(Arm64SwitchRecognizer.Decode(words, Start, 6, (_, _) => [0, 1, 2, 3]), Is.Null);
+    }
+
+    [TestCase(0xAA0003F8u)] // MOV X24,X0 repoints the base
+    [TestCase(0x90000038u)] // ADRP X24 without its ADD
+    [TestCase(0xF8408718u)] // LDR X24,[X24],#8 moves the base
+    public void HoistedTableRejectsAnyOtherWrite(uint instruction)
+    {
+        var words = HoistedFixture();
+        words[13] = instruction;
+        Assert.That(Invariant(words, 24), Is.Null);
+        Assert.That(Arm64SwitchRecognizer.Decode(words, Start, 6, (_, _) => [0, 1, 2, 3], (register, _) => Invariant(words, register)), Is.Null);
+    }
+
+    [Test]
+    public void InvariantTableAcceptsFrameRestoreOnTheWayOut()
+    {
+        uint[] words = [0x90000018, 0x912E2B18, 0xA9415FF8, 0xD65F03C0]; // ADRP; ADD; LDP X24,X23,[SP,#16]; RET
+        Assert.That(Invariant(words, 24), Is.EqualTo((Start & ~0xFFFUL) + 0xB8A));
+        words = [0x90000018, 0x912E2B18, 0xA9415FF8, 0xD61F0060]; // a tail call through X3
+        Assert.That(Invariant(words, 24), Is.EqualTo((Start & ~0xFFFUL) + 0xB8A));
+        words = [0x90000018, 0x912E2B18, 0xA9415FF8, 0x54FFFFC0, 0xD65F03C0]; // the restore can branch back
+        Assert.That(Invariant(words, 24), Is.Null);
+        words = [0x90000018, 0x912E2B18, 0xA9415FF8, 0x8B0B094A, 0xD61F0140]; // a dispatch stays inside the method
+        Assert.That(Invariant(words, 24), Is.Null);
+    }
+
+    [Test]
+    public void InvariantTableRejectsSplitOrClobberedMaterializations()
+    {
+        // A branch between ADRP and ADD leaves the page alone in the register on one path.
+        Assert.That(Invariant([0x90000018, 0xB4000040, 0x912E2B18, 0xD65F03C0, 0xD65F03C0], 24), Is.Null);
+        // A branch landing on the ADD skips the ADRP.
+        Assert.That(Invariant([0x90000018, 0x912E2B18, 0xD65F03C0, 0x17FFFFFE], 24), Is.Null);
+        // Two different tables in one register.
+        Assert.That(Invariant([0x90000018, 0x912E2B18, 0x90000018, 0x91004318, 0xD65F03C0], 24), Is.Null);
+        // A call clobbers a caller-saved register but preserves a callee-saved one.
+        Assert.That(Invariant([0x90000009, 0x91004129, 0x94000002, 0xD65F03C0, 0xD65F03C0], 9), Is.Null);
+        Assert.That(Invariant([0x90000018, 0x912E2B18, 0x94000002, 0xD65F03C0, 0xD65F03C0], 24), Is.Not.Null);
+    }
+
     private static uint[] Fixture()
     {
         // Captured dispatch; unrelated case bodies are RETs to keep the fixture small.
@@ -65,15 +148,31 @@ public class Arm64SwitchRecognizerTests
         }
     }
 
+    [TestCase(0xAA0003E8u)] // MOV X8,X0 clobbers selector without clearing upper bits.
+    [TestCase(0xB9000268u)] // STR W8,[X19]: the selector must not be touched at all.
     [TestCase(0xF9400A68u)] // LDR X8 clobbers selector without clearing upper bits.
     [TestCase(0x94000001u)] // BL
     [TestCase(0x14000001u)] // B
     [TestCase(0xF8408674u)] // Post-indexed load changes its base too.
+    [TestCase(0x90000008u)] // ADRP X8 repoints the selector.
+    [TestCase(0x91000508u)] // ADD X8,X8,#1 leaves the upper bits unproven.
+    [TestCase(0xB1000529u)] // ADDS X9,X9,#1 sets the flags.
     public void DefinitionSearchStopsAtUnprovenInstructions(uint instruction)
     {
         var words = ScheduledLoadFixture(2);
         words[1] = instruction;
         Assert.That(Arm64SwitchRecognizer.Decode(words, Start, 9, (_, _) => [0, 41, 86, 97]), Is.Null);
+    }
+
+    [TestCase(0xAA0003F3u)] // MOV X19,X0
+    [TestCase(0xB9001400u)] // STR W0,[X0,#20]
+    [TestCase(0x90000019u)] // ADRP X25 materializes an unrelated address.
+    [TestCase(0x91004339u)] // ADD X25,X25,#16
+    public void SelectorDefinitionMayBeFollowedByIndependentMovesAndStores(uint instruction)
+    {
+        var words = ScheduledLoadFixture(2);
+        words[1] = instruction;
+        Assert.That(Arm64SwitchRecognizer.Decode(words, Start, 9, (_, _) => [0, 41, 86, 97]), Is.Not.Null);
     }
 
     [TestCase(0, true)] [TestCase(1, false)] [TestCase(2, false)] [TestCase(3, false)]
@@ -209,6 +308,9 @@ public class Arm64SwitchRecognizerTests
         Assert.That(result, Is.Not.Null);
     }
 
+    [TestCase(0x39404268u, true)] // LDRB W8,[X19,#16]
+    [TestCase(0x79402268u, true)] // LDRH W8,[X19,#16]
+    [TestCase(0x39804268u, false)] // LDRSB X8 sign-extends into the upper half
     [TestCase(0x51000C08u, true)] // SUB W8,W0,#3
     [TestCase(0x51000908u, true)] // SUB W8,W8,#2
     [TestCase(0x11000C08u, true)] // ADD W8,W0,#3 (negative first case)
@@ -231,30 +333,4 @@ public class Arm64SwitchRecognizerTests
             Assert.That(result.Targets, Is.EqualTo(new ulong[] { 0x525A3A0, 0x525A444, 0x525A4F8, 0x525A524 }));
         }
     }
-
-    private const uint HoistedPage = 0x90000035; // ADRP X21, +0x4000
-    private const uint HoistedAdd = 0x910042B5; // ADD X21, X21, #0x10
-    private const uint HoistedLoad = 0x38686AAA; // LDRB W10, [X21, X8]
-    private const uint Restore = 0xA94157F6; // LDP X22, X21, [SP, #0x10]
-    private const uint Nop = 0xD503201F;
-    private const uint Ret = 0xD65F03C0;
-
-    [Test]
-    public void HoistedTableRegisterSurvivesEpilogueRestore()
-        => Assert.That(Arm64SwitchRecognizer.HoistedTableAddress([HoistedPage, HoistedAdd, Nop, HoistedLoad, Restore, Ret], 0x1000, 21, 3),
-            Is.EqualTo(0x5010UL));
-
-    [Test]
-    public void HoistedTableRegisterRejectsOtherWrites()
-        => Assert.That(Arm64SwitchRecognizer.HoistedTableAddress([HoistedPage, HoistedAdd, 0xAA0003F5 /* MOV X21, X0 */, HoistedLoad, Ret], 0x1000, 21, 3),
-            Is.Null);
-
-    [Test]
-    public void HoistedTableRegisterRejectsRestoreBeforeMoreCode()
-        => Assert.That(Arm64SwitchRecognizer.HoistedTableAddress([HoistedPage, HoistedAdd, Restore, Nop, Nop, Nop, Nop, Nop, Nop, HoistedLoad, Ret], 0x1000, 21, 9),
-            Is.Null);
-
-    [Test]
-    public void HoistedTableNeedsCalleeSavedRegister()
-        => Assert.That(Arm64SwitchRecognizer.HoistedTableAddress([0x90000029 /* ADRP X9 */, 0x91004129, Nop, 0x38686A2A, Ret], 0x1000, 9, 3), Is.Null);
 }
