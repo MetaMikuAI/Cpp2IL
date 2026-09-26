@@ -1170,6 +1170,23 @@ public static class MetadataResolver
                 continue;
             }
 
+            // More generally, when every candidate is the same method of a generic type G, a receiver typed as
+            // G<args> (e.g. a generic state machine d__31<T> over the caller's T, started by an inlined
+            // builder.Start) picks the instantiation G<args>.M, built if nobody registered it. Constructors wait
+            // for their allocation type (ResolveConstructorCalls): a receiver's static type can be a guess.
+            if (receiverType is GenericInstanceTypeAnalysisContext receiverInstance
+                && BaseMethodOf(candidates[0]) is { IsStatic: false, GenericParameters.Count: 0, Name: not ".ctor" } shared
+                && ReferenceEquals(shared.DeclaringType, receiverInstance.GenericType)
+                && candidates.All(c => ReferenceEquals(BaseMethodOf(c), shared)))
+            {
+                var instantiated = candidates.FirstOrDefault(c => IsSameType(c.DeclaringType, receiverInstance))
+                    ?? new ConcreteGenericMethodAnalysisContext(shared, receiverInstance.GenericArguments, []);
+                instruction.SetOperand(0, instantiated);
+                instantiated.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, instantiated);
+                changed = true;
+                continue;
+            }
+
             // Handle methods with shared bodies
             var match = default(MethodAnalysisContext);
 
