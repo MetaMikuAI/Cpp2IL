@@ -452,6 +452,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
             retryResolvedInterfaceCleanup();
         }
 
+        // Run-once flags whose initializer call is gone; the folds below prune their "set it" arms.
+        MetadataInitGuardRemover.FoldRunOnceFlags(this);
+
         // Copy/constant propagation belongs in SSA, where one definition dominates all uses and phis
         // make joins explicit, so forwarding a value is an unconditional global substitution.
         SsaSimplifier.Run(this);

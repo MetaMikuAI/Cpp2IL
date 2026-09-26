@@ -449,4 +449,94 @@ public static class MetadataInitGuardRemover
             cfg.Blocks.Remove(block);
         }
     }
+
+    /// <summary>
+    /// A byte at an absolute address that the method only reads and sets to 1 is an IL2CPP run-once flag
+    /// (s_Il2CppMethodInitialized and the like) whose initializer call is already gone: managed code reaches
+    /// statics only through klass->static_fields, never by absolute address. Read it as set, as the other
+    /// init guards assume, and drop the stores; the branch folds that follow remove the dead "set it" arm.
+    /// </summary>
+    public static bool FoldRunOnceFlags(MethodAnalysisContext method)
+    {
+        var cfg = method.ControlFlowGraph!;
+        var definitions = cfg.Instructions.Where(i => i.Destination is LocalVariable)
+            .GroupBy(i => (LocalVariable)i.Destination!).Where(g => g.Count() == 1).ToDictionary(g => g.Key, g => g.Single());
+
+        // The constant a local holds: an immediate, through copies and through phis that agree on it
+        // (a hoisted page register carried round a loop).
+        long? Constant(IOperand value, HashSet<LocalVariable> seen)
+        {
+            if (value is Immediate { Value: > 0 } immediate)
+                return immediate.Value;
+            if (value is not LocalVariable local || !seen.Add(local) || !definitions.TryGetValue(local, out var definition))
+                return null;
+            if (definition is { OpCode: OpCode.Move, Operands: [_, var source] })
+                return Constant(source, seen);
+            if (definition.OpCode != OpCode.Phi)
+                return null;
+            long? agreed = null;
+            foreach (var input in definition.Operands.Skip(1))
+            {
+                // An input already on the path is the loop carrying the value round: it adds nothing.
+                if (input is LocalVariable carried && seen.Contains(carried))
+                    continue;
+                if (Constant(input, seen) is not { } inputValue || agreed != null && agreed != inputValue)
+                    return null;
+                agreed = inputValue;
+            }
+            return agreed;
+        }
+
+        long? Address(IOperand operand) => operand switch
+        {
+            MemoryOperand { Index: null, Scale: 0, IsConstant: true } constant => constant.Addend,
+            MemoryOperand { Index: null, Scale: 0, Base: LocalVariable local } memory
+                => Constant(local, []) is { } page ? page + memory.Addend : null,
+            _ => null
+        };
+
+        bool IsOne(IOperand value)
+        {
+            var seen = new HashSet<LocalVariable>();
+            while (value is LocalVariable local && seen.Add(local) && definitions.TryGetValue(local, out var definition)
+                   && definition is { OpCode: OpCode.Move, Operands: [_, var source] })
+                value = source;
+            return value is Immediate { Value: 1 };
+        }
+
+        // Every access to each absolute byte: loads into a local, stores of 1, or anything else.
+        var loads = new Dictionary<long, List<Instruction>>();
+        var stores = new Dictionary<long, List<Instruction>>();
+        var other = new HashSet<long>();
+        foreach (var instruction in cfg.Instructions)
+            for (var i = 0; i < instruction.Operands.Count; i++)
+            {
+                if (Address(instruction.Operands[i]) is not { } address)
+                    continue;
+                var access = ((MemoryOperand)instruction.Operands[i]).AccessSize;
+                if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable, _] } && i == 1 && access is 0 or 1)
+                    (loads.TryGetValue(address, out var l) ? l : loads[address] = []).Add(instruction);
+                else if (instruction is { OpCode: OpCode.Move, Operands: [_, var stored] } && i == 0 && access is 0 or 1 && IsOne(stored))
+                    (stores.TryGetValue(address, out var st) ? st : stores[address] = []).Add(instruction);
+                else
+                    other.Add(address);
+            }
+
+        var changed = false;
+        foreach (var (address, sets) in stores)
+        {
+            if (other.Contains(address) || !loads.TryGetValue(address, out var reads))
+                continue;
+            foreach (var read in reads)
+                read.SetOperand(1, new Immediate(1));
+            foreach (var set in sets)
+            {
+                set.OpCode = OpCode.Nop;
+                set.SetOperands();
+            }
+            changed = true;
+        }
+
+        return changed;
+    }
 }
