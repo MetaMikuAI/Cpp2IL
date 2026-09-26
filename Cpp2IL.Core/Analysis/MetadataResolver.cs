@@ -242,7 +242,7 @@ public static class MetadataResolver
     /// typed (a field load types its result, which is the base of the next load), more offsets
     /// resolve, so this is re-run until it stops finding new fields.
     /// </summary>
-    public static bool ResolveFieldOffsets(MethodAnalysisContext method)
+    public static bool ResolveFieldOffsets(MethodAnalysisContext method, bool deferUntypedStores = false)
     {
         var definitions = new Dictionary<LocalVariable, Instruction>();
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
@@ -444,6 +444,16 @@ public static class MetadataResolver
                     changed = true;
                     continue;
                 }
+
+                // A store narrower than the struct field it starts, of a value not yet typed, waits for the
+                // value's type: the whole field's type would otherwise flow back onto the value from this very
+                // store, and the first-member choice below could never be made. What never gets a type is
+                // resolved once type propagation settles.
+                if (deferUntypedStores && instruction.OpCode == OpCode.Move && i == 0 && field.FieldType is { IsValueType: true } fieldType
+                    && IsAggregate(fieldType) && memory.AccessSize > 0
+                    && instruction.Operands[1] is LocalVariable { Type: null } untypedValue && !aggregateCopies.Contains(untypedValue)
+                    && memory.AccessSize < TypeSizes.UnboxedSize(fieldType, method.AppContext.Binary.PointerSizeBytes))
+                    continue;
 
                 var resolved = new FieldReference(field, fieldLocal, (int)fieldOffset)
                     { ContainingFields = containingFields, AccessSize = memory.AccessSize };

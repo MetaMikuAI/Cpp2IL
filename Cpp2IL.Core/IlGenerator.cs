@@ -665,7 +665,8 @@ public static class IlGenerator
             ? source switch
             {
                 LocalVariable local when !Untyped(local) => local.Type,
-                MemoryOperand { Index: null, Addend: 0, Scale: 0, Base: LocalVariable { Type: ByRefTypeAnalysisContext { ElementType: var referent } } } => referent,
+                MemoryOperand { Index: null, Addend: 0, Scale: 0, Base: LocalVariable { Type: ByRefTypeAnalysisContext { ElementType: var referent } } }
+                    when IsScalar(referent) => referent,
                 _ => null
             }
             : null;
@@ -694,6 +695,12 @@ public static class IlGenerator
         => operand is LocalVariable { Type: { IsValueType: false } type }
            && type is not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext or GenericParameterTypeAnalysisContext)
            && type != type.AppContext.SystemTypes.SystemVoidType;
+
+    // A value one register load reads whole: a reference, a primitive or an enum. Through a byref to any
+    // other struct, a load reads just one of its members.
+    private static bool IsScalar(TypeAnalysisContext type)
+        => !type.IsValueType || type.IsEnumType || type.Namespace == "System" && type.Name is "Boolean" or "Char" or "SByte"
+            or "Byte" or "Int16" or "UInt16" or "Int32" or "UInt32" or "Int64" or "UInt64" or "IntPtr" or "UIntPtr" or "Single" or "Double";
 
     // A memory operand LoadOperand cannot express in IL, only as a diagnostic and a native int zero.
     private static bool IsUnmanagedLoad(IOperand operand)
@@ -1390,6 +1397,11 @@ public static class IlGenerator
             case Immediate { Value: 0 } when expectedType?.FullName == "System.Double":
                 instructions.Add(CilOpCodes.Ldc_R8, 0d);
                 break;
+            // A native zero stored as a reference is null
+            case Immediate { Value: 0 } when expectedType is { IsValueType: false }
+                and not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext or GenericParameterTypeAnalysisContext):
+                instructions.Add(CilOpCodes.Ldnull);
+                break;
             case Immediate { Value: >= int.MinValue and <= int.MaxValue } immediate:
                 instructions.Add(CilOpCodes.Ldc_I4, (int)immediate.Value);
                 break;
@@ -1451,8 +1463,14 @@ public static class IlGenerator
                 }
                 instructions.Add(CilOpCodes.Ldstr, Diagnostic("Unmanaged memory load: " + operand));
                 instructions.Add(CilOpCodes.Call, writeLine);
-                instructions.Add(CilOpCodes.Ldc_I4_0);
-                instructions.Add(CilOpCodes.Conv_I);
+                // The placeholder value: null where a reference is expected, else a native int zero
+                if (expectedType is { IsValueType: false } and not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext or GenericParameterTypeAnalysisContext))
+                    instructions.Add(CilOpCodes.Ldnull);
+                else
+                {
+                    instructions.Add(CilOpCodes.Ldc_I4_0);
+                    instructions.Add(CilOpCodes.Conv_I);
+                }
                 break;
             case RuntimeMethodInfoAnalysisContext runtimeMethod:
                 // A delegate constructor takes its target as a native pointer, which is exactly ldftn.
@@ -1647,6 +1665,8 @@ public static class IlGenerator
             LocalVariable local => local.Type,
             FieldReference field => field.Field.FieldType,
             ArrayAccess { Array.Type: SzArrayTypeAnalysisContext array } => array.ElementType,
+            // A store through a byref (e.g. to an out parameter) stores its referent
+            MemoryOperand { Index: null, Addend: 0, Scale: 0, Base: LocalVariable { Type: ByRefTypeAnalysisContext { ElementType: var referent } } } => referent,
             _ => null
         };
 

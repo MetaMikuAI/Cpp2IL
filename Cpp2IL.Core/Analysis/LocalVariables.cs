@@ -292,7 +292,7 @@ public static class LocalVariables
             changed |= PropagateCopiesOnce(method);
             changed |= PropagateFromCallParameters(method);
             changed |= AggregateCopyRecovery.Run(method);
-            changed |= MetadataResolver.ResolveFieldOffsets(method);
+            changed |= MetadataResolver.ResolveFieldOffsets(method, deferUntypedStores: true);
             changed |= RefineObjectFieldLoads(method);
             changed |= RgctxResolver.Run(method);
             changed |= RecoverPackedMembers(method);
@@ -301,6 +301,10 @@ public static class LocalVariables
             changed |= TypeAddressedLocals(method);
             changed |= PropagateTypesOnce(method);
         }
+
+        // Stores deferred for their value's type that never came get resolved as they would have been.
+        if (MetadataResolver.ResolveFieldOffsets(method))
+            PropagateTypesOnce(method);
     }
 
     // A call taking object constrains assignability, not the actual type of a field load.
@@ -695,15 +699,26 @@ public static class LocalVariables
         } while (changed);
     }
 
-    // Only copies of class-typed locals: a value type or interface may be just what a register holds of
-    // a larger value (the first member of a struct passed in two registers), which the callee knows better.
+    // Only copies of class-typed parameters ('this' above all), directly or through such copies: a value
+    // type or interface may be just what a register holds of a larger value (the first member of a struct
+    // passed in two registers), and typing other copies ahead of the usual order upsets later passes.
     private static bool PropagateCopiesOnce(MethodAnalysisContext method)
     {
+        var sources = new HashSet<LocalVariable>(method.ParameterLocals);
         var changed = false;
-        foreach (var instruction in method.ControlFlowGraph!.Instructions)
-            if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable { Type: null } copy, LocalVariable { Type: { IsValueType: false, IsInterface: false } type }] }
-                && type is not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext or GenericParameterTypeAnalysisContext))
-                changed |= SetTypeIfUnknown(copy, type);
+        for (var grown = true; grown;)
+        {
+            grown = false;
+            foreach (var instruction in method.ControlFlowGraph!.Instructions)
+                if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable { Type: null } copy, LocalVariable { Type: { IsValueType: false, IsInterface: false } type } source] }
+                    && sources.Contains(source)
+                    && type is not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext or GenericParameterTypeAnalysisContext)
+                    && SetTypeIfUnknown(copy, type))
+                {
+                    sources.Add(copy);
+                    grown = changed = true;
+                }
+        }
         return changed;
     }
 
