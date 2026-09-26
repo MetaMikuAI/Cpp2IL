@@ -365,14 +365,11 @@ public static class MetadataResolver
                 }
                 if (staticOwner is GenericInstanceTypeAnalysisContext staticGeneric)
                 {
-                    // Instantiations do not populate Fields. Generic definitions can report
-                    // every offset as zero, so only a sole stored static field is unambiguous
-                    // without computing the instantiated static layout.
-                    var storedFields = staticGeneric.GenericType.Fields.Where(f => f.IsStatic
-                        && (f.Attributes & FieldAttributes.Literal) == 0).ToList();
-                    if (storedFields.Count != 1 || fieldOffset != 0 || storedFields[0].Offset != 0)
+                    // Instantiations do not populate Fields and generic definitions can report every
+                    // offset as zero, so the instantiated static layout is computed instead.
+                    field = StaticFieldAtOffset(staticGeneric.GenericType, fieldOffset, method.AppContext.Binary.PointerSizeBytes);
+                    if (field == null)
                         continue;
-                    field = storedFields[0];
                 }
                 for (var candidateOwner = owner; candidateOwner != null && field == null; candidateOwner = candidateOwner.BaseType)
                 {
@@ -603,6 +600,42 @@ public static class MetadataResolver
 
     private static bool IsFrameSlot(LocalVariable local) => local.Register.Name is { } name
         && (name.StartsWith("stack_", StringComparison.Ordinal) || name.StartsWith("aggregate_stack_", StringComparison.Ordinal));
+
+    /// <summary>
+    /// The static field of a generic type at <paramref name="offset"/> in its static storage. IL2CPP lays static
+    /// fields out like instance ones: in declaration order, each at its natural alignment. That is known for
+    /// every instantiation when no static field's size depends on a type argument (a reference or a
+    /// non-generic struct), which covers lambda caches such as &lt;&gt;c__8&lt;A, B&gt;.
+    /// </summary>
+    private static FieldAnalysisContext? StaticFieldAtOffset(TypeAnalysisContext definition, long offset, int pointerSize)
+    {
+        var current = 0L;
+        foreach (var field in definition.Fields.Where(f => f.IsStatic && (f.Attributes & FieldAttributes.Literal) == 0))
+        {
+            // Thread statics live in separate storage and carry an encoded offset.
+            if (field.Offset < 0)
+                return null;
+            var type = field.FieldType;
+            long size, alignment;
+            if (type is GenericParameterTypeAnalysisContext or ByRefTypeAnalysisContext)
+                return null;
+            if (!type.IsValueType || type is PointerTypeAnalysisContext)
+                (size, alignment) = (pointerSize, pointerSize);
+            else if (type is not GenericInstanceTypeAnalysisContext && GenericInstanceFieldLayout.ValueTypeSizeAndAlignment(type) is var (valueSize, valueAlignment))
+                (size, alignment) = (valueSize, valueAlignment);
+            else
+                return null;
+            if (size <= 0 || alignment <= 0)
+                return null;
+            current = (current + alignment - 1) / alignment * alignment;
+            if (current == offset)
+                return field;
+            if (current > offset)
+                return null;
+            current += size;
+        }
+        return null;
+    }
 
     /// <summary>
     /// A zero store wider than the member at its offset clears several adjacent members of one embedded

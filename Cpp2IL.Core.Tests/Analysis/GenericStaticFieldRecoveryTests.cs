@@ -30,6 +30,9 @@ public class GenericStaticFieldRecoveryTests
         var fieldType = new SzArrayTypeAnalysisContext(parameter);
         var attributes = FieldAttributes.Public | FieldAttributes.Static;
         var offset = shape == "threadStatic" ? -1 : shape == "nonzero" ? 8 : 0;
+        // A static field sized by the type argument makes every later offset instantiation-dependent.
+        if (shape == "sizedByArgument")
+            definition.Fields.Add(new InjectedFieldAnalysisContext("Sized", parameter, FieldAttributes.Public | FieldAttributes.Static, definition, 0));
         definition.Fields.Add(new InjectedFieldAnalysisContext("Value", fieldType,
             shape == "literalOnly" ? attributes | FieldAttributes.Literal : attributes, definition, offset));
         if (shape is "ambiguous" or "distinctOffsets")
@@ -94,8 +97,22 @@ public class GenericStaticFieldRecoveryTests
         Assert.That(access.Operands[1], Is.TypeOf<FieldReference>());
     }
 
-    [TestCase("ambiguous", 0)]
-    [TestCase("distinctOffsets", 0)]
+    // IL2CPP lays static fields out in declaration order at their natural alignment, so with sizes that do
+    // not depend on the type argument each field's offset is the same in every instantiation, whatever
+    // placeholder offsets the generic definition reports.
+    [TestCase("ambiguous", 0, "Value")]
+    [TestCase("ambiguous", 8, "Other")]
+    [TestCase("distinctOffsets", 0, "Value")]
+    [TestCase("distinctOffsets", 8, "Other")]
+    public void ComputesStaticLayoutOfSeveralFields(string shape, long accessOffset, string expected)
+    {
+        var (method, access, _, _, _, _) = Create(shape: shape, accessOffset: accessOffset);
+        LocalVariables.ResolveTypesAndFields(method);
+        Assert.That(access.Operands[1], Is.TypeOf<FieldReference>());
+        Assert.That(((FieldReference)access.Operands[1]).Field.Name, Is.EqualTo(expected));
+    }
+
+    [TestCase("sizedByArgument", 8)]
     [TestCase("literalOnly", 0)]
     [TestCase("threadStatic", 0)]
     [TestCase("nonzero", 8)]
