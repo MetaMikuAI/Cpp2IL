@@ -421,7 +421,11 @@ public static class MetadataResolver
                     }
 
                     if (field == null)
+                    {
+                        if (staticOwner == null && TrySplitZeroStore(method, instruction, i, owner, fieldLocal, fieldOffset, memory.AccessSize))
+                            changed = true;
                         continue;
+                    }
                 }
 
                 // Bind the containing field before inspecting its members, so nested stores
@@ -599,6 +603,54 @@ public static class MetadataResolver
 
     private static bool IsFrameSlot(LocalVariable local) => local.Register.Name is { } name
         && (name.StartsWith("stack_", StringComparison.Ordinal) || name.StartsWith("aggregate_stack_", StringComparison.Ordinal));
+
+    /// <summary>
+    /// A zero store wider than the member at its offset clears several adjacent members of one embedded
+    /// value type at once, e.g. the result and token of an awaiter being reset to default. When it covers
+    /// those members exactly (padding aside) and cuts none of them, split it into a zero store to each.
+    /// </summary>
+    private static bool TrySplitZeroStore(MethodAnalysisContext method, Instruction store, int operandIndex, TypeAnalysisContext owner,
+        LocalVariable fieldLocal, long offset, int accessSize)
+    {
+        if (operandIndex != 0 || accessSize <= 0 || store is not { OpCode: OpCode.Move, Operands: [MemoryOperand, Immediate { Value: 0 }] }
+            || IsComputedLayout(owner)
+            || method.ControlFlowGraph!.Blocks.FirstOrDefault(b => b.Instructions.Contains(store)) is not { } block)
+            return false;
+
+        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+        var slots = MemberSlots(owner, false, pointerSize);
+        var chain = new List<FieldAnalysisContext>();
+        var relative = offset;
+        while (slots != null)
+        {
+            // The value-type field holding the whole store, then what the store covers inside it.
+            if (slots.Where(s => IsValueContainer(s.Field.FieldType) && s.Size > 0
+                    && s.Offset <= relative && relative + accessSize <= s.Offset + s.Size).ToList() is not [{ } parent])
+                return false;
+            chain.Add(parent.Field);
+            relative -= parent.Offset;
+            slots = MemberSlots(parent.Field.FieldType, false, pointerSize);
+            if (slots == null)
+                return false;
+
+            var covered = slots.Where(s => s.Offset < relative + accessSize && s.Offset + s.Size > relative).ToList();
+            if (covered.Count < 2)
+                continue; // inside a single member: descend into it if it is a struct
+            if (covered.Any(s => s.Size <= 0 || s.Offset < relative || s.Offset + s.Size > relative + accessSize))
+                return false;
+
+            var baseOffset = offset - relative;
+            var stores = covered.Select(member => new Instruction(-1, OpCode.Move,
+                new FieldReference(member.Field, fieldLocal, (int)(baseOffset + member.Offset))
+                    { ContainingFields = chain.ToArray(), AccessSize = (int)member.Size },
+                new Immediate(0)) { NativeAddress = store.NativeAddress }).ToList();
+            store.SetOperand(0, stores[0].Operands[0]);
+            block.Instructions.InsertRange(block.Instructions.IndexOf(store) + 1, stores.Skip(1));
+            return true;
+        }
+
+        return false;
+    }
 
     private static bool IsComputedLayout(TypeAnalysisContext type)
         => type is GenericInstanceTypeAnalysisContext || type.GenericParameters.Count > 0;
