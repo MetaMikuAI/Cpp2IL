@@ -471,8 +471,11 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         CallArgumentTrimmer.Run(this);
         PinnedArrayRecovery.Run(this);
         ArrayRecovery.RecoverSplitAccesses(this);
-        // Recovered elements expose managed field chains; do not rerun call inference.
-        while (MetadataResolver.ResolveFieldOffsets(this))
+        // Recovered elements expose managed field chains and the classes of virtual receivers (e.g. a
+        // dialog taken from a DialogBase[]); do not rerun call inference. The recovered elements' types
+        // reach their klass loads only by propagation, so propagate before resolving.
+        LocalVariables.PropagateKnownTypes(this);
+        while (MetadataResolver.ResolveFieldOffsets(this) | MetadataResolver.ResolveVirtualCalls(this))
             LocalVariables.PropagateKnownTypes(this);
         LocalVariables.PropagateKnownTypes(this);
         BooleanFlagSimplifier.SimplifyLiteralOperations(this);
