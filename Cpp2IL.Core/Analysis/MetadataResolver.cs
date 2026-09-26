@@ -1726,6 +1726,29 @@ public static class MetadataResolver
             }
         }
 
+        // A MethodInfo* read out of a vtable slot on its own is the method a delegate to a virtual method
+        // binds to (ldvirtftn): IL2CPP builds new Action(this.M) from the VirtualInvokeData's method.
+        foreach (var instruction in method.ControlFlowGraph.Instructions)
+        {
+            if (instruction is not { OpCode: OpCode.Move, Operands: [LocalVariable destination, MemoryOperand
+                {
+                    Base: LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: { } ownerType } },
+                    Index: null, Scale: 0, Addend: var addend
+                }] })
+                continue;
+
+            var offset = addend - vtableOffset - pointerSize;
+            if (offset < 0 || offset % invokeDataSize != 0
+                || ResolveVTableSlot(method.AppContext, ownerType, (int)(offset / invokeDataSize)) is not { } slotMethod
+                || (slotMethod.DeclaringType?.DeclaringAssembly ?? method.DeclaringType?.DeclaringAssembly) is not { } slotAssembly)
+                continue;
+
+            var methodInfo = new RuntimeMethodInfoAnalysisContext(slotMethod, slotAssembly);
+            instruction.SetOperand(1, methodInfo);
+            destination.Type = methodInfo;
+            changed = true;
+        }
+
         return changed;
 
         MemoryOperand? SlotLoad(IOperand operand) => operand switch
