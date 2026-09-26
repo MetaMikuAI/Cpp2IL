@@ -1453,7 +1453,7 @@ public static class MetadataResolver
             if (!instruction.IsCall)
                 continue;
 
-            if (GetMethodInfoArgument(instruction) is not { RepresentedMethod: { } representedMethod })
+            if (GetMethodInfoArgument(instruction, method) is not { RepresentedMethod: { } representedMethod })
                 //No MethodInfo to work with
                 continue;
 
@@ -1946,13 +1946,15 @@ public static class MetadataResolver
     private static MethodAnalysisContext BaseMethodOf(MethodAnalysisContext method) =>
         method is ConcreteGenericMethodAnalysisContext { BaseMethodContext: { } baseMethod } ? baseMethod : method;
 
-    private static RuntimeMethodInfoAnalysisContext? GetMethodInfoArgument(Instruction call)
+    // The caller's own MethodInfo can linger in a later argument register after the call's real one
+    // (a static callee taking only its MethodInfo in X0, with the caller's still in X1); skip it.
+    private static RuntimeMethodInfoAnalysisContext? GetMethodInfoArgument(Instruction call, MethodAnalysisContext? caller = null)
     {
         var firstArg = call.OpCode == OpCode.CallVoid ? 1 : 2;
 
         for (var i = call.Operands.Count - 1; i >= firstArg; i--)
         {
-            if (AsMethodInfo(call.Operands[i]) is { } methodInfo)
+            if (AsMethodInfo(call.Operands[i]) is { } methodInfo && !ReferenceEquals(methodInfo.RepresentedMethod, caller))
                 return methodInfo;
         }
 
