@@ -9,7 +9,12 @@ using Disarm.InternalDisassembly;
 namespace Cpp2IL.Core.InstructionSets;
 
 internal sealed record Arm64SwitchDispatch(int LoadIndex, int GuardIndex, int Selector, int OffsetRegister,
-    int TargetRegister, ulong DefaultTarget, uint[] Offsets, ulong[] Targets, int? ProofStartIndex = null, bool HoistedTable = false);
+    int TargetRegister, ulong DefaultTarget, uint[] Offsets, ulong[] Targets, int? ProofStartIndex = null, bool HoistedTable = false,
+    int? ScheduledRegister = null, ulong ScheduledValue = 0)
+{
+    // A constant move the compiler scheduled between the target computation and the BR runs before every case.
+    public int BranchIndex => LoadIndex + (ScheduledRegister == null ? 2 : 3);
+}
 
 // Clang's compact unsigned byte/halfword jump table, guarded by an unsigned W
 // comparison. Keep the original guard and preserve the dispatch scratch values.
@@ -82,10 +87,16 @@ internal static class Arm64SwitchRecognizer
         var offsetReg = (int)(load & 31);
         var add = words[loadIndex + 1];
         var targetReg = (int)(add & 31);
+        var branchIndex = loadIndex + 2;
+        int? scheduledRegister = null;
+        ulong scheduledValue = 0;
+        if (ImmediateMove(words[branchIndex]) is var (movedRegister, movedValue) && movedRegister != targetReg
+            && movedRegister != offsetReg && branchIndex + 1 < words.Length)
+            (scheduledRegister, scheduledValue, branchIndex) = (movedRegister, movedValue, branchIndex + 1);
         if ((add & 0xFFE0FC00) != 0x8B000800 // ADD Xd,Xn,Xm,LSL #2
             || ((add >> 5) & 31) != targetReg || ((add >> 16) & 31) != offsetReg
-            || (words[loadIndex + 2] & 0xFFFFFC1F) != 0xD61F0000
-            || ((words[loadIndex + 2] >> 5) & 31) != targetReg
+            || (words[branchIndex] & 0xFFFFFC1F) != 0xD61F0000
+            || ((words[branchIndex] >> 5) & 31) != targetReg
             || new[] { selector, table, offsetReg, targetReg }.Any(r => r == 31)
             || table == targetReg || offsetReg == targetReg || selector == table || selector == targetReg) return null;
         var label = words[loadIndex - 1];
@@ -161,7 +172,7 @@ internal static class Arm64SwitchRecognizer
             targets[i] = targetBase + offsets[i] * 4UL;
         }
         var candidate = new Arm64SwitchDispatch(loadIndex, guardIndex, selector, offsetReg, targetReg, defaultTarget, offsets, targets,
-            proofStartIndex);
+            proofStartIndex, ScheduledRegister: scheduledRegister, ScheduledValue: scheduledValue);
         if (targets.Append(defaultTarget).Any(t => t < start || (t - start) % 4 != 0 || (t - start) / 4 >= (ulong)words.Length
             || InsideGuard(t, candidate, start))) return null;
         for (var i = 0; i < words.Length; i++)
@@ -280,13 +291,24 @@ internal static class Arm64SwitchRecognizer
     // Writes at most its first register operand: a plain load, a register move (ORR with the zero
     // register), an address computation (ADRP, or ADD/SUB immediate without flags), or an
     // unsigned-offset store, which writes no register at all.
+    // MOVZ/MOVN Rd,#imm: (Rd, the value it leaves in Xd). A W destination zero-extends.
+    internal static (int Register, ulong Value)? ImmediateMove(uint word)
+    {
+        var wide = (word & 0x80000000) != 0;
+        var opcode = word & 0x7F800000;
+        if (opcode is not (0x52800000 or 0x12800000) || (word & 31) == 31 || !wide && (word & 0x00400000) != 0) return null;
+        var value = (ulong)((word >> 5) & 0xFFFF) << (int)(16 * ((word >> 21) & 3));
+        if (opcode == 0x12800000) value = ~value;
+        return ((int)(word & 31), wide ? value : value & 0xFFFFFFFF);
+    }
+
     private static bool IsIndependent(uint word) => IsPlainLoad(word) || (word & 0x7FE0FFE0) == 0x2A0003E0
         || (word & 0x9F000000) == 0x90000000 || (word & 0x7F800000) is 0x11000000 or 0x51000000
         || (word & 0xFFC00000) is 0xF9000000 or 0xB9000000 or 0x79000000 or 0x39000000;
     private static int ConditionalOffset(uint word) => (int)((word & 0x00FFFFE0) << 8) >> 11;
     private static long AdrImmediate(uint word) => (int)((((word >> 5) & 0x7FFFF) << 2 | (word >> 29) & 3) << 11) >> 11;
     private static bool InsideGuard(ulong target, Arm64SwitchDispatch dispatch, ulong start)
-        => target > start + (ulong)(dispatch.ProofStartIndex ?? dispatch.GuardIndex - 2) * 4 && target <= start + (ulong)(dispatch.LoadIndex + 2) * 4;
+        => target > start + (ulong)(dispatch.ProofStartIndex ?? dispatch.GuardIndex - 2) * 4 && target <= start + (ulong)dispatch.BranchIndex * 4;
     private static ulong? DirectTarget(uint word, ulong pc)
     {
         long delta;

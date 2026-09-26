@@ -459,17 +459,19 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     var entry = new Instruction(-1, OpCode.Move, new Register(null, $"X{dispatch.OffsetRegister}"), Imm(dispatch.Offsets[caseIndex]));
                     switchCases.Add(entry);
                     switchCases.Add(new Instruction(-1, OpCode.Move, new Register(null, $"X{dispatch.TargetRegister}"), Imm(dispatch.Targets[caseIndex])));
+                    if (dispatch.ScheduledRegister is { } scheduled)
+                        switchCases.Add(new Instruction(-1, OpCode.Move, new Register(null, $"X{scheduled}"), Imm(dispatch.ScheduledValue)));
                     switchCases.Add(new Instruction(-1, OpCode.Jump, Imm(dispatch.Targets[caseIndex])));
                     operands.Add(entry);
                 }
                 addresses.Add(insns[nativeIndex].Address);
                 instructions.Add(new Instruction(instructions.Count, OpCode.Switch, operands));
-                foreach (var name in new[] { $"X{dispatch.OffsetRegister}", $"X{dispatch.TargetRegister}" })
+                foreach (var name in new[] { $"X{dispatch.OffsetRegister}", $"X{dispatch.TargetRegister}", $"X{dispatch.ScheduledRegister}" })
                 {
                     integerConstants.Remove(name);
                     adrpOffsets.Remove(name);
                 }
-                nativeIndex += 2;
+                nativeIndex = dispatch.BranchIndex;
                 continue;
             }
             ConvertInstructionStatement(insns[nativeIndex], instructions, addresses, context, twoSLaneRegisters);

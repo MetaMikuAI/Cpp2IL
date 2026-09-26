@@ -333,4 +333,13 @@ public class Arm64SwitchRecognizerTests
             Assert.That(result.Targets, Is.EqualTo(new ulong[] { 0x525A3A0, 0x525A444, 0x525A4F8, 0x525A524 }));
         }
     }
+
+    [TestCase(0x12800008u, 8, 0xFFFFFFFFUL)] // MOV W8, #-1 (MOVN, zero-extended)
+    [TestCase(0xD28000A1u, 1, 5UL)] // MOV X1, #5
+    [TestCase(0x92800000u, 0, ulong.MaxValue)] // MOV X0, #-1
+    public void DecodesScheduledImmediateMove(uint word, int register, ulong value)
+        => Assert.That(Arm64SwitchRecognizer.ImmediateMove(word), Is.EqualTo((register, value)));
+
+    [Test]
+    public void RejectsNonMoveAsScheduledInstruction() => Assert.That(Arm64SwitchRecognizer.ImmediateMove(0x8B000800), Is.Null);
 }
