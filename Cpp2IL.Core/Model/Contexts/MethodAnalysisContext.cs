@@ -495,7 +495,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // dialog taken from a DialogBase[]); do not rerun call inference. The recovered elements' types
         // reach their klass loads only by propagation, so propagate before resolving.
         LocalVariables.PropagateKnownTypes(this);
-        while (MetadataResolver.ResolveFieldOffsets(this) | MetadataResolver.ResolveVirtualCalls(this))
+        while (MetadataResolver.ResolveFieldOffsets(this) | MetadataResolver.ResolveVirtualCalls(this) | MetadataResolver.ResolveMethodInfoCalls(this))
             LocalVariables.PropagateKnownTypes(this);
         LocalVariables.PropagateKnownTypes(this);
         BooleanFlagSimplifier.SimplifyLiteralOperations(this);

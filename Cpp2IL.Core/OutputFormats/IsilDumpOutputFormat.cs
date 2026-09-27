@@ -20,6 +20,8 @@ public class IsilDumpOutputFormat : Cpp2IlOutputFormat
     {
         outputRoot = Path.Combine(outputRoot, "IsilDump");
 
+        // CPP2IL_ISIL_FILTER limits the dump to types whose full name contains it.
+        var filter = Environment.GetEnvironmentVariable("CPP2IL_ISIL_FILTER");
         var numAssemblies = context.Assemblies.Count;
         var i = 1;
         foreach (var assembly in context.Assemblies)
@@ -34,6 +36,9 @@ public class IsilDumpOutputFormat : Cpp2IlOutputFormat
                     return;
 
                 if (type.Methods.Count == 0)
+                    return;
+
+                if (!string.IsNullOrEmpty(filter) && !type.FullName.Contains(filter, StringComparison.Ordinal))
                     return;
 
                 var typeDump = new StringBuilder();

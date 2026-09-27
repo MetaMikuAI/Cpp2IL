@@ -1747,6 +1747,46 @@ public static class MetadataResolver
     // Resolves virtual dispatch through <c>[klass + vtableOffset + slot * sizeof(VirtualInvokeData)]</c>
     // as long as the klass local's represented type is known. Handles both a normal call and a tail
     // call, which the lifter leaves as an IndirectJump.
+    /// <summary>
+    /// Shared generic code calls a method it only knows through an RGCTX MethodInfo by that MethodInfo's
+    /// methodPointer, its first field: <c>info->methodPointer(args..., info)</c>. With the MethodInfo resolved
+    /// (e.g. the constructor of a shared state machine), that is a direct call of the method.
+    /// </summary>
+    public static bool ResolveMethodInfoCalls(MethodAnalysisContext method)
+    {
+        var definitions = method.ControlFlowGraph!.Instructions.Where(i => i.Destination is LocalVariable)
+            .GroupBy(i => (LocalVariable)i.Destination!).Where(g => g.Count() == 1).ToDictionary(g => g.Key, g => g.Single());
+        var changed = false;
+        foreach (var instruction in method.ControlFlowGraph.Instructions)
+        {
+            if (instruction.OpCode != OpCode.IndirectCall || instruction.Operands.Count < 2)
+                continue;
+
+            var target = instruction.Operands[0];
+            if (target is LocalVariable pointer && definitions.TryGetValue(pointer, out var pointerLoad)
+                && pointerLoad is { OpCode: OpCode.Move, Operands: [_, MemoryOperand load] })
+                target = load;
+            if (target is not MemoryOperand { Base: LocalVariable infoLocal, Index: null, Scale: 0, Addend: 0 })
+                continue;
+
+            var info = infoLocal.Type as RuntimeMethodInfoAnalysisContext;
+            if (definitions.TryGetValue(infoLocal, out var infoDefinition) && infoDefinition is { OpCode: OpCode.Move, Operands: [_, RuntimeMethodInfoAnalysisContext constant] })
+                info = constant;
+            if (info?.RepresentedMethod is not { } resolved)
+                continue;
+
+            var callingConventions = resolved.AppContext.InstructionSet.CallingConventionResolver;
+            instruction.OpCode = resolved.IsVoid ? OpCode.CallVoid : OpCode.Call;
+            instruction.SetOperand(0, resolved);
+            if (resolved.IsVoid)
+                instruction.RemoveOperandAt(1);
+            callingConventions?.RemapRawArguments(instruction, resolved);
+            changed = true;
+        }
+
+        return changed;
+    }
+
     public static bool ResolveVirtualCalls(MethodAnalysisContext method)
     {
         var pointerSize = method.AppContext.Binary.PointerSizeBytes;
