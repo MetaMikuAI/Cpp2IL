@@ -771,6 +771,17 @@ public static class LocalVariables
                 case OpCode.Phi:
                     changed |= PropagatePhi(instruction);
                     break;
+                // The allocated class, once its operand resolves, over a base class the object was typed
+                // with first (Object, from the inlined base constructor call): types only narrow.
+                case OpCode.Newobj when instruction.Operands is [LocalVariable allocated, var klass, ..]
+                                        && InstantiatedType(klass) is { IsValueType: false } allocatedType
+                                        && allocatedType is not ReferencedTypeAnalysisContext && allocatedType.GenericParameters.Count == 0
+                                        && !multiplyDefined.Contains(allocated)
+                                        && allocated.Type?.FullName != allocatedType.FullName
+                                        && (allocated.Type == null || DerivesFrom(allocatedType, allocated.Type)):
+                    allocated.Type = allocatedType;
+                    changed = true;
+                    break;
                 case OpCode.Box:
                     // Boxing metadata proves the addressed payload type, not the
                     // reference type of the boxed result or its native address.
