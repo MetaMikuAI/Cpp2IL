@@ -609,7 +609,7 @@ public static class MetadataResolver
     /// every instantiation when no static field's size depends on a type argument (a reference or a
     /// non-generic struct), which covers lambda caches such as &lt;&gt;c__8&lt;A, B&gt;.
     /// </summary>
-    private static bool IsReferenceTypeParameter(GenericParameterTypeAnalysisContext parameter)
+    internal static bool IsReferenceTypeParameter(GenericParameterTypeAnalysisContext parameter)
         => (parameter.Attributes & GenericParameterAttributes.ReferenceTypeConstraint) != 0
            || parameter.ConstraintTypes.Any(c => c is not GenericParameterTypeAnalysisContext && !c.IsValueType && !c.IsInterface
                                                  && c.FullName is not ("System.Object" or "System.ValueType" or "System.Enum"));

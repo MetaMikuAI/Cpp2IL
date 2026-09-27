@@ -68,11 +68,16 @@ public class Arm64CallingConventionResolver : BaseCallingConventionResolver
             return false;
         var members = generic.GenericType.Fields.Where(f => !f.IsStatic)
             .Select(f => new ConcreteGenericFieldAnalysisContext(f, generic).FieldType).ToList();
-        if (members.Count == 0)
+        if (members.Count == 0 || members.Any(IsSharedTypeParameter))
             return false;
         var floating = members.All(m => m.FullName == "System.Single") || members.All(m => m.FullName == "System.Double");
         return !floating;
     }
+
+    // A member typed by a type parameter that may be a value type has no fixed size in shared code, which
+    // passes such a struct by reference instead.
+    private static bool IsSharedTypeParameter(TypeAnalysisContext member)
+        => member is GenericParameterTypeAnalysisContext parameter && !Analysis.MetadataResolver.IsReferenceTypeParameter(parameter);
 
     // AAPCS64 C.10/C.12: a composite of 9 to 16 bytes that is not an HFA occupies two consecutive
     // X registers, each holding the next 8 bytes of the value's memory image. Returns the members
@@ -84,7 +89,27 @@ public class Arm64CallingConventionResolver : BaseCallingConventionResolver
             || TypeSizes.UnboxedSize(type, PtrSize) is not (> 8 and <= 16))
             return null;
         var leaves = new List<(long Offset, int Size, bool Float)>();
-        if (FlattenMembers(type, 0, leaves, 0) == null || leaves.Count == 0)
+        if (type is GenericInstanceTypeAnalysisContext generic)
+        {
+            // A constructed struct is laid out from its instantiated members; only scalars, enums and
+            // references are taken as leaves (a nested struct member is left unproven).
+            if (Analysis.GenericInstanceFieldLayout.ComputeLayout(generic) is not { Complete: true } layout)
+                return null;
+            foreach (var slot in layout.Slots)
+            {
+                var memberType = slot.Field.FieldType;
+                if (IsSharedTypeParameter(memberType))
+                    return null;
+                if (memberType.IsValueType && !memberType.IsEnumType && ScalarSize(memberType) == 0)
+                    return null;
+                if (slot.Size is not (1 or 2 or 4 or 8))
+                    return null;
+                leaves.Add((slot.Offset, (int)slot.Size, memberType.IsValueType && !memberType.IsEnumType && IsFloatingPoint(memberType)));
+            }
+        }
+        else if (FlattenMembers(type, 0, leaves, 0) == null)
+            return null;
+        if (leaves.Count == 0)
             return null;
         // Members of one floating-point type form an HFA, which travels in SIMD registers.
         if (leaves.All(l => l.Float && l.Size == leaves[0].Size))

@@ -880,7 +880,8 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                     managedArguments[position] = aggregate;
                 }
                 var returnFields = Arm64CallingConventionResolver.FloatingAggregateFields(ctx.ReturnType);
-                var returnMembers = ctx.IsVoid || returnFields != null ? null
+                // A generic composite return's members are not resolved through its storage yet, so keep it whole.
+                var returnMembers = ctx.IsVoid || returnFields != null || ctx.ReturnType is GenericInstanceTypeAnalysisContext ? null
                     : Arm64CallingConventionResolver.IntegerCompositeMembers(ctx.ReturnType);
                 Register? aggregateResult = returnFields != null ? new Register(null, $"hfa_ret_{address:X}")
                     : returnMembers != null ? new Register(null, $"composite_ret_{address:X}") : null;
