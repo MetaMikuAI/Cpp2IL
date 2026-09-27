@@ -652,6 +652,11 @@ public static class ArrayRecovery
                     // expanding its arithmetic could move Int32 overflow past the extension.
                     { OpCode: OpCode.SignExtend, Operands: [_, LocalVariable { Type.FullName: "System.Int32" } source, Immediate { Value: 32 }] }
                         => new Affine(source, 1, 0),
+                    // Likewise UXTW (or a 32-bit mask) of a UInt32 index: hash_table[(uint)h].
+                    { OpCode: OpCode.ZeroExtend, Operands: [_, LocalVariable { Type.FullName: "System.UInt32" or "System.Int32" } source, Immediate { Value: 32 }] }
+                        => new Affine(source, 1, 0),
+                    { OpCode: OpCode.And, Operands: [_, LocalVariable { Type.FullName: "System.UInt32" } source, Immediate { Value: 0xFFFFFFFF }] }
+                        => new Affine(source, 1, 0),
                     // A storage read is a captured value, not address arithmetic to expand.
                     { OpCode: OpCode.Move, Operands: [_, FieldReference or ArrayAccess or ArrayLength] } => new Affine(local, 1, 0),
                     { OpCode: OpCode.Move, Operands: [_, MemoryOperand lea] } => allowLea ? EvaluateLea(lea, definitions, depth + 1) : new Affine(local, 1, 0),
