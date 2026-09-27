@@ -66,7 +66,13 @@ public static class ArrayRecovery
                     continue;
                 }
                 var stride = ElementSize(((SzArrayTypeAnalysisContext)address.Array.Type!).ElementType, pointerSize);
-                if (stride == 0 || memory.AccessSize != 0 && memory.AccessSize != stride)
+                if (stride == 0)
+                {
+                    if (i == 0 && instruction.OpCode == OpCode.Move)
+                        RecoverStructMemberStore(method, block, instruction, memory, address, pointerSize, definitions);
+                    continue;
+                }
+                if (memory.AccessSize != 0 && memory.AccessSize != stride)
                     continue;
                 var offset = Sum(address.Offset, new Affine(null, 0, memory.Addend));
                 if (memory.Index != null)
@@ -116,6 +122,65 @@ public static class ArrayRecovery
                     destination.Type ??= ((SzArrayTypeAnalysisContext)address.Array.Type!).ElementType;
             }
         }
+    }
+
+    // A store into a member of a struct element, arr[i].member = value, addresses the element's interior:
+    // [array + header + i * size + member]. Point a reference at the element (ldelema) and store through
+    // it, so that the member is resolved like one of a ref parameter's.
+    private static void RecoverStructMemberStore(MethodAnalysisContext method, Block block, Instruction store, MemoryOperand memory,
+        (LocalVariable Array, Affine Offset) address, int pointerSize, Dictionary<LocalVariable, Instruction?> definitions)
+    {
+        var elementType = ((SzArrayTypeAnalysisContext)address.Array.Type!).ElementType;
+        var elementSize = MetadataElementSize(elementType, pointerSize);
+        if (!elementType.IsValueType || elementType.IsEnumType || memory.Index != null || elementSize <= 0)
+            return;
+
+        var offset = address.Offset.Offset + memory.Addend - ElementsOffset(pointerSize);
+        IOperand index;
+        long member;
+        if (address.Offset.Root == null)
+        {
+            if (offset < 0)
+                return;
+            index = new Immediate(offset / elementSize);
+            member = offset % elementSize;
+        }
+        else
+        {
+            if (address.Offset.Multiplier != elementSize || offset < 0 || offset >= elementSize || !IsNativeIndex(address.Offset.Root))
+                return;
+            TypeIndex(address.Offset.Root, method, definitions, new HashSet<LocalVariable>());
+            index = address.Offset.Root;
+            member = offset;
+        }
+        if (memory.AccessSize <= 0 || member + memory.AccessSize > elementSize)
+            return;
+
+        // A store of the whole element with a value of its type is arr[i] = value.
+        var value = store.Operands[1];
+        if (member == 0 && memory.AccessSize == elementSize)
+        {
+            if (value is LocalVariable { Type: { } valueType } && valueType.FullName == elementType.FullName)
+                store.SetOperand(0, new ArrayAccess(address.Array, index));
+            return;
+        }
+
+        // Otherwise it must be exactly one member: a wider store spans several (x and y of a Vector2 as one
+        // 64-bit constant), which the member alone would misread.
+        var definition = elementType is GenericInstanceTypeAnalysisContext generic ? generic.GenericType : elementType;
+        if (elementType is GenericInstanceTypeAnalysisContext
+            || GenericInstanceFieldLayout.FindFieldAtUnboxedOffset(definition, member) is not { } field
+            || field.FieldType.IsValueType && !field.FieldType.IsEnumType && ElementSize(field.FieldType, pointerSize) == 0
+            || TypeSizes.UnboxedSize(field.FieldType, pointerSize) != memory.AccessSize)
+            return;
+
+        var name = $"arrayElement{method.Locals.Count}";
+        var element = new LocalVariable(name, new Register(null, name), elementType.MakeByReferenceType());
+        method.Locals.Add(element);
+        var reference = new Instruction(store.Index, OpCode.Move, element, new AddressOf(new ArrayAccess(address.Array, index)));
+        block.Instructions.Insert(block.Instructions.IndexOf(store), reference);
+        definitions[element] = reference;
+        store.SetOperand(0, new MemoryOperand(element, null, member, 0, memory.AccessSize));
     }
 
     private static (LocalVariable Array, Affine Offset)? ResolveArrayAddress(IOperand? operand,
