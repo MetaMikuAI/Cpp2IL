@@ -542,6 +542,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         if (RuntimeCheckBranchFolder.Run(this))
             DeadCodeEliminator.Run(this);
 
+        // Every type is final: a struct held in a register moved into a scalar is its first member.
+        AggregatePieceRecovery.Run(this);
+
         LocalVariables.RemoveUnused(this);
     }
 
