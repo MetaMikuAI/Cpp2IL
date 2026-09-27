@@ -38,6 +38,7 @@ public static class ArrayRecovery
         // Expose freshly allocated arrays while address definitions are still in SSA.
         foreach (var instruction in cfg.Instructions) RecoverAllocation(instruction);
         var definitions = SingleDefinitions(cfg);
+        Dictionary<LocalVariable, List<(Instruction Instruction, int OperandIndex)>>? uses = null;
         var peers = new Dictionary<LocalVariable, List<Instruction>>();
         foreach (var block in cfg.Blocks)
         {
@@ -68,8 +69,8 @@ public static class ArrayRecovery
                 var stride = ElementSize(((SzArrayTypeAnalysisContext)address.Array.Type!).ElementType, pointerSize);
                 if (stride == 0)
                 {
-                    if (i == 0 && instruction.OpCode == OpCode.Move)
-                        RecoverStructMemberStore(method, block, instruction, memory, address, pointerSize, definitions);
+                    if (instruction.OpCode == OpCode.Move && (i == 0 || i == 1 && IsValueLoad(instruction, uses ??= CollectUses(cfg))))
+                        RecoverStructMemberAccess(method, block, instruction, i, memory, address, pointerSize, definitions);
                     continue;
                 }
                 if (memory.AccessSize != 0 && memory.AccessSize != stride)
@@ -124,11 +125,16 @@ public static class ArrayRecovery
         }
     }
 
-    // A store into a member of a struct element, arr[i].member = value, addresses the element's interior:
-    // [array + header + i * size + member]. Point a reference at the element (ldelema) and store through
+    // A move from memory is a load, not a lifted lea, once its value is used other than as an address.
+    private static bool IsValueLoad(Instruction load, Dictionary<LocalVariable, List<(Instruction Instruction, int OperandIndex)>> uses)
+        => load.Destination is LocalVariable destination && uses.TryGetValue(destination, out var destinationUses)
+           && destinationUses.Any(u => !u.Instruction.IsCall && !IsMemoryBase(u.Instruction.Operands[u.OperandIndex], destination));
+
+    // An access of a member of a struct element, arr[i].member, addresses the element's interior:
+    // [array + header + i * size + member]. Point a reference at the element (ldelema) and access through
     // it, so that the member is resolved like one of a ref parameter's.
-    private static void RecoverStructMemberStore(MethodAnalysisContext method, Block block, Instruction store, MemoryOperand memory,
-        (LocalVariable Array, Affine Offset) address, int pointerSize, Dictionary<LocalVariable, Instruction?> definitions)
+    private static void RecoverStructMemberAccess(MethodAnalysisContext method, Block block, Instruction store, int operandIndex,
+        MemoryOperand memory, (LocalVariable Array, Affine Offset) address, int pointerSize, Dictionary<LocalVariable, Instruction?> definitions)
     {
         var elementType = ((SzArrayTypeAnalysisContext)address.Array.Type!).ElementType;
         var elementSize = MetadataElementSize(elementType, pointerSize);
@@ -156,11 +162,12 @@ public static class ArrayRecovery
         if (memory.AccessSize <= 0 || member + memory.AccessSize > elementSize)
             return;
 
-        // A store of the whole element with a value of its type is arr[i] = value.
+        // A store of the whole element with a value of its type is arr[i] = value. A whole-element load is
+        // left to the element-address path.
         var value = store.Operands[1];
         if (member == 0 && memory.AccessSize == elementSize)
         {
-            if (value is LocalVariable { Type: { } valueType } && valueType.FullName == elementType.FullName)
+            if (operandIndex == 0 && value is LocalVariable { Type: { } valueType } && valueType.FullName == elementType.FullName)
                 store.SetOperand(0, new ArrayAccess(address.Array, index));
             return;
         }
@@ -180,7 +187,10 @@ public static class ArrayRecovery
         var reference = new Instruction(store.Index, OpCode.Move, element, new AddressOf(new ArrayAccess(address.Array, index)));
         block.Instructions.Insert(block.Instructions.IndexOf(store), reference);
         definitions[element] = reference;
-        store.SetOperand(0, new MemoryOperand(element, null, member, 0, memory.AccessSize));
+        store.SetOperand(operandIndex, new MemoryOperand(element, null, member, 0, memory.AccessSize));
+        // A load was typed by guesswork from its uses (the element type); the member's type is what it reads.
+        if (operandIndex == 1 && store.Destination is LocalVariable loaded && (loaded.Type == null || loaded.Type.FullName == elementType.FullName))
+            loaded.Type = field.FieldType;
     }
 
     private static (LocalVariable Array, Affine Offset)? ResolveArrayAddress(IOperand? operand,
