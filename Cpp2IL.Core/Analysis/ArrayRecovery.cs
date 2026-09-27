@@ -349,6 +349,10 @@ public static class ArrayRecovery
         if (!elementType.IsValueType)
             return pointerSize;
 
+        // An enum's elements are its underlying integers (MenuScreenType[] from an inlined List<T>.Add).
+        if (elementType.IsEnumType && elementType.EnumUnderlyingType is { } underlying && underlying != elementType)
+            elementType = underlying;
+
         return elementType.FullName switch
         {
             "System.Boolean" or "System.Byte" or "System.SByte" => 1,
