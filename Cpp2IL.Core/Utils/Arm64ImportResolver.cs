@@ -51,6 +51,8 @@ internal static class Arm64ImportResolver
         Remainder,
         // Math(F).ModF(x, &integral), whose integral part is written through X0.
         ModF,
+        // sincos(f)(x, &sin, &cos): Sin(x) and Cos(x), which the compiler merged, written through X0 and X1.
+        SinCos,
     }
 
     internal readonly record struct NativeMathFunction(NativeMathKind Kind, string TypeName, string MethodName, bool IsDouble, int Arity);
@@ -63,6 +65,8 @@ internal static class Arm64ImportResolver
         "fmod" => new(NativeMathKind.Remainder, "", "", true, 2),
         "modff" => new(NativeMathKind.ModF, "System.MathF", "ModF", false, 1),
         "modf" => new(NativeMathKind.ModF, "System.Math", "ModF", true, 1),
+        "sincosf" => new(NativeMathKind.SinCos, "System.MathF", "Sin", false, 1),
+        "sincos" => new(NativeMathKind.SinCos, "System.Math", "Sin", true, 1),
         "atan2f" or "powf" => new(NativeMathKind.Method, "System.MathF", MathMethodName(name[..^1]), false, 2),
         "atan2" or "pow" => new(NativeMathKind.Method, "System.Math", MathMethodName(name), true, 2),
         "sinf" or "cosf" or "tanf" or "asinf" or "acosf" or "atanf" or "sinhf" or "coshf" or "tanhf"

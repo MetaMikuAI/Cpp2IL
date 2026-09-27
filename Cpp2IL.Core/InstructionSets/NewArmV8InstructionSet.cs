@@ -933,6 +933,9 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
                 return true;
             }
 
+            if (math.Kind == Arm64ImportResolver.NativeMathKind.SinCos)
+                return TryAddSinCos(math, Argument(0));
+
             if (ResolveNativeMathMethod(context.AppContext, math) is { } method)
             {
                 var operands = new List<IOperand>(math.Arity + 3) { method, Argument(0) };
@@ -965,6 +968,68 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             Add(address, OpCode.ConvertNumeric, Argument(0), Reg(Arm64Register.D0),
                 new NumericConversion(types.SystemDoubleType, types.SystemSingleType));
             return true;
+        }
+
+        // sincos(f)(x, &sin, &cos) is Sin(x) and Cos(x) stored through X0 and X1. The angle and the pointers
+        // are kept in temporaries, as each call takes over the argument registers.
+        bool TryAddSinCos(Arm64ImportResolver.NativeMathFunction math, IOperand angle)
+        {
+            var types = context.AppContext.SystemTypes;
+            var sin = ResolveNativeMathMethod(context.AppContext, math with { Kind = Arm64ImportResolver.NativeMathKind.Method, MethodName = "Sin" });
+            var cos = ResolveNativeMathMethod(context.AppContext, math with { Kind = Arm64ImportResolver.NativeMathKind.Method, MethodName = "Cos" });
+            // Without the single-precision methods, the double ones on the widened angle, narrowed back.
+            var widen = false;
+            if ((sin == null || cos == null) && !math.IsDouble)
+            {
+                var wide = math with { Kind = Arm64ImportResolver.NativeMathKind.Method, TypeName = "System.Math", IsDouble = true };
+                sin = ResolveNativeMathMethod(context.AppContext, wide with { MethodName = "Sin" });
+                cos = ResolveNativeMathMethod(context.AppContext, wide with { MethodName = "Cos" });
+                widen = true;
+            }
+            if (sin == null || cos == null)
+                return false;
+
+            var savedAngle = new Register(null, "TEMP_SINCOS_ANGLE");
+            var sinPointer = new Register(null, "TEMP_SINCOS_SIN_PTR");
+            var cosPointer = new Register(null, "TEMP_SINCOS_COS_PTR");
+            // The results normally go to frame slots whose addresses were just put in X0 and X1: store to the
+            // slots themselves, which stack analysis follows, rather than through the pointers.
+            var sinSlot = AddressedSlot("X0");
+            var cosSlot = AddressedSlot("X1");
+            Add(address, OpCode.Move, sinPointer, Reg(Arm64Register.X0));
+            Add(address, OpCode.Move, cosPointer, Reg(Arm64Register.X1));
+            if (widen)
+                Add(address, OpCode.ConvertNumeric, savedAngle, angle, new NumericConversion(types.SystemSingleType, types.SystemDoubleType));
+            else
+                Add(address, OpCode.Move, savedAngle, angle);
+
+            var size = math.IsDouble ? 8 : 4;
+            Instruction? lastCall = null;
+            foreach (var (method, pointer, slot, name) in new[] { (sin, sinPointer, sinSlot, "TEMP_SINCOS_SIN"), (cos, cosPointer, cosSlot, "TEMP_SINCOS_COS") })
+            {
+                var result = new Register(null, name);
+                lastCall = Add(address, OpCode.Call, method, result, savedAngle);
+                if (widen)
+                    Add(address, OpCode.ConvertNumeric, result, result, new NumericConversion(types.SystemDoubleType, types.SystemSingleType));
+                Add(address, OpCode.Move, slot ?? new MemoryOperand(pointer, accessSize: size), result);
+            }
+            // The native call clobbers what any call does; the temporaries carry what outlives it.
+            ClobberCallerSaved(lastCall!);
+            return true;
+        }
+
+        // The operand a register was last given the address of (Move reg, &slot), if that is what it holds.
+        IOperand? AddressedSlot(string register)
+        {
+            for (var i = instructions.Count - 1; i >= 0; i--)
+            {
+                var candidate = instructions[i];
+                if (candidate is { OpCode: OpCode.Move, Operands: [Register destination, AddressOf { Target: var target }] } && destination.Name == register)
+                    return target;
+                if (candidate.Destination is Register written && written.Name == register || candidate.IsCall || candidate.OpCode is OpCode.Jump or OpCode.ConditionalJump)
+                    return null;
+            }
+            return null;
         }
 
         // A call to a C memory import, made to its UnsafeUtility twin. The arguments are X0..X2 in order.
