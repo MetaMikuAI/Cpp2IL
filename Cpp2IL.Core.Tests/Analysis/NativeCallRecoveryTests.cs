@@ -26,6 +26,8 @@ public class NativeCallRecoveryTests
     [TestCase("fmodf", "Remainder", false)]
     [TestCase("fmod", "Remainder", true)]
     [TestCase("modf", "ModF", true)]
+    [TestCase("sincosf", "SinCos", false)]
+    [TestCase("sincos", "SinCos", true)]
     public void MapsRemainderAndModF(string import, string kind, bool isDouble)
     {
         var function = Arm64ImportResolver.MathFunction(import);
@@ -33,10 +35,9 @@ public class NativeCallRecoveryTests
         Assert.That(function?.IsDouble, Is.EqualTo(isDouble));
     }
 
-    // exp2f and ldexpf are produced by compiler rewrites of other expressions, sincosf computes two results.
+    // exp2f and ldexpf are produced by compiler rewrites of other expressions.
     [TestCase("exp2f")]
     [TestCase("ldexpf")]
-    [TestCase("sincosf")]
     [TestCase("memcpy")]
     [TestCase(null)]
     public void LeavesOtherImportsUnmapped(string? import) => Assert.That(Arm64ImportResolver.MathFunction(import), Is.Null);
