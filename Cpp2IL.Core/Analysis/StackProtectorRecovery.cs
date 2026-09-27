@@ -104,7 +104,7 @@ public static class StackProtectorRecovery
         }
 
         if (definition is not { OpCode: OpCode.CheckEqual or OpCode.CheckNotEqual, Operands: [_, var left, var right] }
-            || !IsGuard(left, definitions) || !IsGuard(right, definitions))
+            || !IsGuard(left, definitions, graph) || !IsGuard(right, definitions, graph))
             return false;
 
         // The failure path must be the one taken exactly when the two guard values differ.
@@ -118,17 +118,36 @@ public static class StackProtectorRecovery
     }
 
     // A load of the guard, or a copy of one (such as the value the prologue saved in the frame).
-    private static bool IsGuard(IOperand operand, Dictionary<LocalVariable, Instruction> definitions,
-        HashSet<LocalVariable>? merging = null)
+    private static bool IsGuard(IOperand operand, Dictionary<LocalVariable, Instruction> definitions, ISILControlFlowGraph graph,
+        HashSet<LocalVariable>? merging = null, bool throughFrame = true)
     {
         var value = Copied(operand, definitions);
 
         // A merge of copies of the guard. Values that only circulate between the merges add nothing else.
         if (value is LocalVariable merged && definitions.TryGetValue(merged, out var phi) && phi.OpCode == OpCode.Phi)
-            return !(merging ??= []).Add(merged) || phi.Operands.Skip(1).All(source => IsGuard(source, definitions, merging));
+            return !(merging ??= []).Add(merged) || phi.Operands.Skip(1).All(source => IsGuard(source, definitions, graph, merging, throughFrame));
 
-        return value is MemoryOperand { Base: { } threadPointer, Index: null, Scale: 0, Addend: GuardOffset }
-               && Copied(threadPointer, definitions) is Register { Name: "SYSREG" } or LocalVariable { Register.Name: "SYSREG" };
+        if (value is MemoryOperand { Base: { } threadPointer, Index: null, Scale: 0, Addend: GuardOffset }
+            && IsThreadPointer(threadPointer, definitions, []))
+            return true;
+
+        // The copy the prologue saved in a frame addressed through the frame pointer (a method with a
+        // stackalloc does so): read back from the slot a guard was stored to.
+        return throughFrame && value is MemoryOperand { Base: LocalVariable frame, Index: null, Scale: 0, Addend: < 0 and var slot }
+               && frame.Register.Name == "X29"
+               && graph.Instructions.Any(i => i is { OpCode: OpCode.Move, Operands: [MemoryOperand { Base: LocalVariable storedFrame, Index: null, Addend: var storedSlot }, var stored] }
+                                              && storedSlot == slot && storedFrame.Register.Name == "X29"
+                                              && IsGuard(stored, definitions, graph, null, false));
+    }
+
+    // TPIDR_EL0, or a merge of copies of it: a callee-saved register holding it across a loop is a phi.
+    private static bool IsThreadPointer(IOperand operand, Dictionary<LocalVariable, Instruction> definitions, HashSet<LocalVariable> merging)
+    {
+        var value = Copied(operand, definitions);
+        if (value is Register { Name: "SYSREG" } or LocalVariable { Register.Name: "SYSREG" })
+            return true;
+        return value is LocalVariable merged && definitions.TryGetValue(merged, out var phi) && phi.OpCode == OpCode.Phi
+               && (!merging.Add(merged) || phi.Operands.Skip(1).All(source => IsThreadPointer(source, definitions, merging)));
     }
 
     private static IOperand Copied(IOperand operand, Dictionary<LocalVariable, Instruction> definitions)
