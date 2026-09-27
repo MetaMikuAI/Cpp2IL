@@ -18,7 +18,10 @@ public static class InterfaceDispatchRecovery
     // Invoke it after the caller's normal type/virtual-call resolution pass.
     // Generic virtual calls are only recovered once types are resolved (afterTypeResolution): their parameter
     // types, often a base class, would otherwise claim argument locals before field loads type them exactly.
-    public static Action? Run(MethodAnalysisContext method, bool afterTypeResolution = false)
+    // final: every pass that recovers native helper calls from their arguments has run.
+    public delegate void Cleanup(bool final = false);
+
+    public static Cleanup? Run(MethodAnalysisContext method, bool afterTypeResolution = false)
     {
         // offsets below are the 64-bit Il2CppClass layout
         if (method.AppContext.Binary.PointerSizeBytes != 8)
@@ -83,8 +86,8 @@ public static class InterfaceDispatchRecovery
         }
 
         if (matches.Count == 0 && genericHelpers.Count == 0) return null;
-        Cleanup();
-        return Cleanup;
+        CleanupLookups(false);
+        return CleanupLookups;
 
         // Locating the helper disassembles the runtime, so only a matching call shape asks for it.
         bool ReachesGenericVirtualMethod(ulong address)
@@ -93,7 +96,7 @@ public static class InterfaceDispatchRecovery
             return keys.CallReaches(address, keys.il2cpp_vm_runtime_get_generic_virtual_method);
         }
 
-        void Cleanup()
+        void CleanupLookups(bool final)
         {
             // Rewrite all dispatches before checking whether lookup values are dead.
             // Retrying after normal type resolution lets newly resolved virtual calls
@@ -107,7 +110,7 @@ public static class InterfaceDispatchRecovery
             foreach (var match in matches)
             {
                 var klass = Definition(definitions, match.KlassLocal);
-                if (!TryExciseLookup(cfg, match, homeBlock, ref dominators)) continue;
+                if (!TryExciseLookup(cfg, match, homeBlock, ref dominators, final ? method.AppContext.MethodsByAddress : null)) continue;
                 if (match.Resolved.FullName == "System.IDisposable::Dispose" && match.Dispatch.NativeAddress != 0
                     && klass is { NativeAddress: not 0, Operands: [_, MemoryOperand { Base: LocalVariable receiver }] })
                     method.NativeDisposals.Add(new(match.Dispatch, klass.NativeAddress, receiver.Register.Name));
@@ -431,7 +434,8 @@ public static class InterfaceDispatchRecovery
     }
 
     // Bailing here is fine, it just leaves the (already resolved) call with dead lookup around it
-    private static bool TryExciseLookup(ISILControlFlowGraph cfg, Match match, Dictionary<Instruction, Block> homeBlock, ref DominatorInfo? dominators)
+    private static bool TryExciseLookup(ISILControlFlowGraph cfg, Match match, Dictionary<Instruction, Block> homeBlock, ref DominatorInfo? dominators,
+        IReadOnlyDictionary<ulong, List<MethodAnalysisContext>>? managedMethods)
     {
         var merge = match.Merge;
 
@@ -451,7 +455,7 @@ public static class InterfaceDispatchRecovery
         if (!RegionIsSideEffectFree(region, match.SlowCall) || AnyValueEscapes(cfg, region, merge))
             return false;
 
-        if (!MergePhisAreDead(cfg, merge, region, out var removable, out var forwarded))
+        if (!MergePhisAreDead(cfg, merge, region, managedMethods, out var removable, out var forwarded))
             return false;
 
         foreach (var instruction in removable)
@@ -597,11 +601,13 @@ public static class InterfaceDispatchRecovery
 
     // They may only feed loads off the VirtualInvokeData pointer, which must themselves be dead, or
     // carry one value from outside the region along every path, which the head then passes on directly
-    private static bool MergePhisAreDead(ISILControlFlowGraph cfg, Block merge, HashSet<Block> region, out List<Instruction> removable,
+    private static bool MergePhisAreDead(ISILControlFlowGraph cfg, Block merge, HashSet<Block> region,
+        IReadOnlyDictionary<ulong, List<MethodAnalysisContext>>? managedMethods, out List<Instruction> removable,
         out List<(Instruction Phi, IOperand Value)> forwarded)
     {
         removable = [];
         forwarded = [];
+        var stale = new List<(Instruction Call, int Index)>();
         var regionDefinitions = region.SelectMany(b => b.Instructions).Select(i => i.Destination).OfType<LocalVariable>().ToHashSet();
 
         var useSites = new Dictionary<LocalVariable, List<Instruction>>();
@@ -634,18 +640,56 @@ public static class InterfaceDispatchRecovery
                 continue;
             }
 
-            foreach (var use in useSites.TryGetValue(phiDest, out var phiUses) ? phiUses : [])
-            {
-                if (use is not { OpCode: OpCode.Move, Operands: [LocalVariable loaded, MemoryOperand] }
-                    || (useSites.TryGetValue(loaded, out var loadUses) && loadUses.Count > 0))
-                    return false;
-
-                removable.Add(use);
-            }
-
+            if (!StaleWeb(phiDest, useSites, managedMethods, removable, stale))
+                return false;
             removable.Add(phi);
         }
 
+        foreach (var (call, index) in stale)
+            call.SetOperand(index, new Immediate(0));
+        return true;
+    }
+
+    // The lookup's values (the VirtualInvokeData pointer, and its method and methodPtr loaded off it) may
+    // still sit in registers at later calls to unresolved native functions, whose arguments are every
+    // argument register guessed and never emitted. Given managedMethods (the final cleanup), such a use is stale; a phi or copy carrying a value only there,
+    // or into a load off it, is dead with it. Anything else is a real use.
+    private static bool StaleWeb(LocalVariable root, Dictionary<LocalVariable, List<Instruction>> useSites,
+        IReadOnlyDictionary<ulong, List<MethodAnalysisContext>>? managedMethods, List<Instruction> removable,
+        List<(Instruction Call, int Index)> stale)
+    {
+        var visited = new HashSet<LocalVariable>();
+        var pending = new Stack<LocalVariable>([root]);
+        while (pending.TryPop(out var local))
+        {
+            if (!visited.Add(local) || !useSites.TryGetValue(local, out var uses))
+                continue;
+            if (visited.Count > 64)
+                return false;
+            foreach (var use in uses)
+            {
+                if (use.OpCode == OpCode.Phi || use is { OpCode: OpCode.Move, Operands: [LocalVariable, LocalVariable or MemoryOperand { Index: null }] })
+                {
+                    if (use.Operands[1] is MemoryOperand { Base: var based } && based != local)
+                        return false;
+                    removable.Add(use);
+                    pending.Push((LocalVariable)use.Operands[0]);
+                    continue;
+                }
+                // Only once nothing recovers such calls from their arguments any more (an array accessor, a
+                // class-init helper, a shared generic method at a managed address; an indirect call may still
+                // turn out to be a delegate's invoke_impl).
+                if (managedMethods == null || use is not { OpCode: OpCode.Call or OpCode.CallVoid, Operands: [Immediate target, ..] }
+                    || managedMethods.ContainsKey(target.UnsignedValue))
+                    return false;
+                // Only the value itself as an argument; one nested in another operand (a field or element
+                // of it, its address) is really read.
+                var direct = Enumerable.Range(1, use.Operands.Count - 1).Where(i => ReferenceEquals(use.Operands[i], local)).ToList();
+                if (direct.Count != DeadCodeEliminator.UsedLocals(use).Count(l => l == local))
+                    return false;
+                stale.AddRange(direct.Select(i => (use, i)));
+            }
+        }
         return true;
     }
 

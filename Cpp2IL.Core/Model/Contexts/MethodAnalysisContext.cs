@@ -519,8 +519,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         // Boxing and array allocation recovery release guessed native arguments. Retry
         // only after both, while SSA phis still prove whether lookup values are dead.
-        retryInterfaceCleanup?.Invoke();
-        retryResolvedInterfaceCleanup?.Invoke();
+        retryInterfaceCleanup?.Invoke(final: true);
+        retryResolvedInterfaceCleanup?.Invoke(final: true);
 
         // Type-check and field recovery above leave the metadata reads they replaced (a class's
         // typeHierarchyDepth, say) unused. Out of SSA, coalesced locals would make them look live.

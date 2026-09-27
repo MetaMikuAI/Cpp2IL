@@ -36,6 +36,7 @@ public class InterfaceDispatchCleanupTests
     [TestCase("arrayLength", false)]
     [TestCase("elementAddress", false)]
     [TestCase("address", false)]
+    [TestCase("staleNativeArgument", true)]
     public void ResolvesDownstreamVirtualCallsBeforeCheckingLookupLiveness(string use, bool removed)
     {
         Cpp2IlApi.ResetInternalState();
@@ -176,6 +177,9 @@ public class InterfaceDispatchCleanupTests
             "address" => new AddressOf(stale),
             _ => null,
         };
+        Instruction? staleUse = null;
+        if (use == "staleNativeArgument")
+            instructions.Add(staleUse = new(35, OpCode.CallVoid, new Immediate(0x5678), stale));
         if (liveOperand != null)
             instructions.Add(use == "fieldStore"
                 ? new(35, OpCode.Move, liveOperand, new Immediate(1))
@@ -214,6 +218,13 @@ public class InterfaceDispatchCleanupTests
                 "The initializer still holds a guessed argument from the interface lookup");
             MetadataInitGuardRemover.RunSsaClassGuards(cfg, 0x135);
             retryCleanup?.Invoke();
+        }
+        if (use == "staleNativeArgument")
+        {
+            Assert.That(cfg.Instructions.Contains(slowCall), Is.True,
+                "Until the final cleanup a native helper may still be recovered from its arguments");
+            retryCleanup?.Invoke(final: true);
+            Assert.That(staleUse!.Operands[1], Is.InstanceOf<Immediate>(), "the never-emitted guessed argument is dropped");
         }
         if (use.StartsWith("lateGeneric"))
         {
