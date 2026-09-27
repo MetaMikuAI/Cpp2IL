@@ -483,6 +483,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Instance fields that shared code reaches through their FieldInfo, once copies are propagated.
         if (SharedFieldAccessRecovery.Run(this))
             SsaSimplifier.Run(this);
+        // Outlined, bounds-checked array element accessors.
+        ArrayAccessorRecovery.Run(this);
 
         InternalCallGuardRemover.Run(this);
         KeyFunctionRecovery.Run(this);
