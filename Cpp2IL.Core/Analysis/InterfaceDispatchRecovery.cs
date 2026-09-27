@@ -218,6 +218,10 @@ public static class InterfaceDispatchRecovery
 
         var slotLocal = genericMethod != null ? slotArg : null;
         var declaringInterface = ResolveConstant(definitions, interfaceArg) as TypeAnalysisContext;
+        // Shared generic code reads the interface out of its RGCTX (through a class-init guard's phi), which
+        // type resolution has named: IUniTaskSource<bool> for an awaiter's GetResult.
+        if (declaringInterface == null && interfaceArg.Type is RuntimeClassTypeAnalysisContext { RepresentedType: var rgctxInterface })
+            declaringInterface = rgctxInterface;
         if (declaringInterface == null && genericMethod != null && IsMethodInfoField(definitions, interfaceArg, genericMethod, MethodInfoKlassOffset))
             declaringInterface = genericMethod.RepresentedMethod.DeclaringType;
         if (declaringInterface == null)
