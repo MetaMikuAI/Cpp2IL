@@ -480,6 +480,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         if (SharedValueStorageRecovery.Run(this))
             while (ConstantFolder.Run(this) | ConstantBranchFolder.PruneSsa(ControlFlowGraph!))
                 SsaSimplifier.Run(this);
+        // Tests of whether a type argument is a value type, which shared code reads from its class.
+        SharedValueTypeTestRecovery.Run(this);
         // Instance fields that shared code reaches through their FieldInfo, once copies are propagated.
         if (SharedFieldAccessRecovery.Run(this))
             SsaSimplifier.Run(this);
