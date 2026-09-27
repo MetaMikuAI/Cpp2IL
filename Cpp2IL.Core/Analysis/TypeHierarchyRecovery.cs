@@ -59,8 +59,10 @@ public static class TypeHierarchyRecovery
             else if (entry is not { Base: { } hierarchy, Index: { } index, Scale: 8, Addend: 0 }
                 || !resolver.MatchIndexedAddress(hierarchy, index, target, out klass))
                 continue;
+            // Reading its class at 0 makes the receiver an object; an untyped one (an element taken from an
+            // inlined List<T> indexer before array recovery) is tested just the same.
             if (resolver.Value(klass!) is not MemoryOperand { Base: LocalVariable receiver, Addend: 0, Index: null, Scale: 0 }
-                || receiver.Type == null || receiver.Type.IsValueType || receiver.Type is ReferencedTypeAnalysisContext and not GenericInstanceTypeAnalysisContext)
+                || receiver.Type != null && (receiver.Type.IsValueType || receiver.Type is ReferencedTypeAnalysisContext and not GenericInstanceTypeAnalysisContext))
                 continue;
 
             // Only bypass a guard when its failure is the same as the hierarchy check's failure.
