@@ -106,6 +106,9 @@ public static class TypeHierarchyRecovery
             }
         }
         DeadCodeEliminator.Run(graph);
+        // A loop-carried register copy nothing reads (a scratch register holding the receiver) would
+        // otherwise make the arms' phi inputs differ.
+        if (pending.Count > 0) DeadCodeEliminator.RemoveDeadCopyCycles(graph);
 
         // Guards whose arms were not recognised above: now that every lookup is a managed test and its
         // native loads are dead, compare the arms by walking them.
