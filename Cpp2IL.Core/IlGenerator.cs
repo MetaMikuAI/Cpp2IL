@@ -1561,6 +1561,22 @@ public static class IlGenerator
             return;
         }
 
+        // A local function takes its struct closure by reference, and ILSpy fails on the whole assembly
+        // unless that is the address of a local of the closure type. An argument not recovered as one
+        // (a frame slot typed by the closure's first field) is replaced by an empty closure.
+        if (expectedType is ByRefTypeAnalysisContext { ElementType: { IsValueType: true } closure }
+            && closure.Name.Contains("DisplayClass", StringComparison.Ordinal)
+            && !(operand is AddressOf { Target: LocalVariable { Type: { } addressed } } && addressed.FullName == closure.FullName))
+        {
+            var body = method.CilMethodBody!;
+            var empty = new CilLocalVariable(closure.ToTypeSignature());
+            body.LocalVariables.Add(empty);
+            body.Instructions.Add(CilOpCodes.Ldloca, empty);
+            body.Instructions.Add(CilOpCodes.Initobj, closure.ToTypeSignature().ToTypeDefOrRef());
+            body.Instructions.Add(CilOpCodes.Ldloca, empty);
+            return;
+        }
+
         LoadOperand(operand, method, locals, writeLine, expectedType);
     }
 

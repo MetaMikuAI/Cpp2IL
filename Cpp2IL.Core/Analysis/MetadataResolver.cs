@@ -89,10 +89,12 @@ public static class MetadataResolver
                 continue;
             }
 
+            // Metadata-usage slots live in data after the code, so a smaller constant is only a number
+            // (the low half of MOV/MOVK 0xDA3B57FD would otherwise decode as the ELF header's bytes).
             var address = instruction.Operands[1] switch
             {
                 MemoryOperand { Base: null, Index: null, Scale: 0 } memory => (ulong)memory.Addend,
-                Immediate immediate => immediate.UnsignedValue,
+                Immediate immediate when immediate.UnsignedValue > method.AppContext.ManagedCodeEnd => immediate.UnsignedValue,
                 _ => 0ul,
             };
 
