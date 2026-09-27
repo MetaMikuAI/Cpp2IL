@@ -29,7 +29,8 @@ public static class Simplifier
         private readonly Dictionary<Block, Dictionary<Instruction, OperandList>> _sourceCache = [];
         private readonly MethodAnalysisContext _method = method;
         private readonly ISILControlFlowGraph _graph = method.ControlFlowGraph!;
-        private readonly HashSet<int> _addressed = SsaSimplifier.AddressedRegisters(method.ControlFlowGraph!);
+        // Also slots whose address was taken before later rewrites folded it away.
+        private readonly HashSet<int> _addressed = [.. SsaSimplifier.AddressedRegisters(method.ControlFlowGraph!), .. method.AddressTakenRegisters ?? []];
 
         public void Process()
         {

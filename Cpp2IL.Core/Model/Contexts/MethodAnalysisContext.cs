@@ -56,6 +56,13 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
     internal readonly Dictionary<int, TypeAnalysisContext> StackAggregates = [];
 
     /// <summary>
+    /// Registers (frame slots above all) whose address was taken when SSA was built. Later rewrites can fold
+    /// the address into an argument that no longer shows it, but the callee may still write the slot through
+    /// it, so the slot's value must never be propagated past such a call.
+    /// </summary>
+    internal readonly HashSet<int> AddressTakenRegisters = [];
+
+    /// <summary>
     /// Operands used as parameters.
     /// </summary>
     public List<ISIL.IOperand> ParameterOperands = [];
@@ -386,6 +393,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         // Create locals
         SsaForm.Build(this);
+        foreach (var instruction in ControlFlowGraph!.Instructions)
+            foreach (var operand in instruction.Operands)
+                if (operand is AddressOf { Target: Register addressed })
+                    AddressTakenRegisters.Add(addressed.Number);
         LocalVariables.CreateAll(this);
 
         // Fold the explicit per-comparison flag arithmetic back into single relational comparisons,
