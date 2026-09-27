@@ -676,6 +676,15 @@ public static class LocalVariables
         return true;
     }
 
+    // Whether type is a proper subclass of ancestor (by name, as instances need not be shared).
+    private static bool DerivesFrom(TypeAnalysisContext type, TypeAnalysisContext ancestor)
+    {
+        for (var current = type.BaseType; current != null; current = current.BaseType)
+            if (current.FullName == ancestor.FullName)
+                return true;
+        return false;
+    }
+
     private static bool PropagateStaticFieldStorage(MethodAnalysisContext method)
     {
         var staticFieldsOffset = method.AppContext.Binary.is32Bit ? StaticFieldsOffset32 : StaticFieldsOffset64;
@@ -749,13 +758,15 @@ public static class LocalVariables
     private static bool PropagateTypesOnce(MethodAnalysisContext method)
     {
         var changed = false;
+        var multiplyDefined = method.ControlFlowGraph!.Instructions.Select(i => i.Destination).OfType<LocalVariable>()
+            .GroupBy(l => l).Where(g => g.Count() > 1).Select(g => g.Key).ToHashSet();
 
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
             switch (instruction.OpCode)
             {
                 case OpCode.Move:
-                    changed |= PropagateMove(instruction, method.AppContext.Binary.PointerSizeBytes);
+                    changed |= PropagateMove(instruction, method.AppContext.Binary.PointerSizeBytes, multiplyDefined);
                     break;
                 case OpCode.Phi:
                     changed |= PropagatePhi(instruction);
@@ -988,7 +999,7 @@ public static class LocalVariables
             _ => null,
         };
 
-    private static bool PropagateMove(Instruction move, int pointerSize)
+    private static bool PropagateMove(Instruction move, int pointerSize, HashSet<LocalVariable>? multiplyDefined = null)
     {
         var destination = move.Operands[0];
         var source = move.Operands[1];
@@ -998,9 +1009,23 @@ public static class LocalVariables
             return SetTypeIfUnknown(destLocal, sourceLocal.Type) || SetTypeIfUnknown(sourceLocal, destLocal.Type);
 
         // Move local, field: a field load types its result with the field's type. This is the edge
-        // that lets the loaded value go on to be the base of a further field access.
+        // that lets the loaded value go on to be the base of a further field access. The field's type
+        // also replaces a base class the value was typed with first as the receiver of an inherited
+        // method (Component for a state machine's <>4__this): types only ever narrow, so this settles.
         if (destination is LocalVariable loadDest && source is FieldReference loadField)
+        {
+            // Only a value this load alone defines: another definition may be what the base type came from.
+            if (multiplyDefined?.Contains(loadDest) == false
+                && loadDest.Type is { IsValueType: false } current and not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext)
+                && loadField.Field.FieldType is { IsValueType: false, IsInterface: false } narrower
+                && narrower is not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext or GenericParameterTypeAnalysisContext)
+                && current.FullName != narrower.FullName && DerivesFrom(narrower, current))
+            {
+                loadDest.Type = narrower;
+                return true;
+            }
             return SetTypeIfUnknown(loadDest, loadField.Field.FieldType);
+        }
 
         // Move field, local: a field store types the stored value with the field's type.
         if (destination is FieldReference storeField && source is LocalVariable storeSource)
