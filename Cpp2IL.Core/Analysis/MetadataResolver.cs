@@ -1475,13 +1475,15 @@ public static class MetadataResolver
     public static bool ResolveCallsViaMethodInfo(MethodAnalysisContext method)
     {
         var changed = false;
+        var definitions = method.ControlFlowGraph!.Instructions.Where(i => i.Destination is LocalVariable)
+            .GroupBy(i => (LocalVariable)i.Destination!).Where(g => g.Count() == 1).ToDictionary(g => g.Key, g => g.Single());
 
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
             if (!instruction.IsCall)
                 continue;
 
-            if (GetMethodInfoArgument(instruction, method) is not { RepresentedMethod: { } representedMethod })
+            if (GetMethodInfoArgument(instruction, method, definitions) is not { RepresentedMethod: { } representedMethod })
                 //No MethodInfo to work with
                 continue;
 
@@ -2021,7 +2023,8 @@ public static class MetadataResolver
 
     // The caller's own MethodInfo can linger in a later argument register after the call's real one
     // (a static callee taking only its MethodInfo in X0, with the caller's still in X1); skip it.
-    private static RuntimeMethodInfoAnalysisContext? GetMethodInfoArgument(Instruction call, MethodAnalysisContext? caller = null)
+    private static RuntimeMethodInfoAnalysisContext? GetMethodInfoArgument(Instruction call, MethodAnalysisContext? caller = null,
+        Dictionary<LocalVariable, Instruction>? definitions = null)
     {
         var firstArg = call.OpCode == OpCode.CallVoid ? 1 : 2;
 
@@ -2031,7 +2034,54 @@ public static class MetadataResolver
                 return methodInfo;
         }
 
+        if (definitions == null)
+            return null;
+
+        // An ELF GOT entry holds the address of a metadata-usage slot, which resolves as the usage itself; the
+        // MethodInfo passed is then read out of it: [usage]. Only a usage resolved from metadata counts - a
+        // MethodInfo read out of an RGCTX is the MethodInfo itself, and reading through that gives its
+        // methodPointer. Callers still demand that the call's target is a body of the method it names.
+        for (var i = call.Operands.Count - 1; i >= firstArg; i--)
+        {
+            var operand = call.Operands[i];
+            if (operand is LocalVariable argument && definitions.TryGetValue(argument, out var load)
+                && load is { OpCode: OpCode.Move, Operands: [_, MemoryOperand loaded] })
+                operand = loaded;
+            if (operand is MemoryOperand { Base: LocalVariable handle, Index: null, Addend: 0 }
+                && MetadataUsageHandle(handle, definitions, []) is { } usage
+                && !ReferenceEquals(usage.RepresentedMethod, caller))
+                return usage;
+        }
+
         return null;
+    }
+
+    // The usage a local holds when every definition reaching it (through phis: each path may load the GOT
+    // entry again) is that same usage resolved from metadata. Each resolution is a new context, so the
+    // methods are compared by what they are rather than by reference.
+    private static RuntimeMethodInfoAnalysisContext? MetadataUsageHandle(LocalVariable local, Dictionary<LocalVariable, Instruction> definitions,
+        HashSet<LocalVariable> seen)
+    {
+        if (!seen.Add(local) || !definitions.TryGetValue(local, out var definition))
+            return null;
+        if (definition is { OpCode: OpCode.Move, Operands: [_, RuntimeMethodInfoAnalysisContext usage] })
+            return usage;
+        if (definition.OpCode != OpCode.Phi)
+            return null;
+
+        RuntimeMethodInfoAnalysisContext? common = null;
+        foreach (var input in definition.Operands.Skip(1))
+        {
+            if (input is not LocalVariable incoming)
+                return null;
+            if (seen.Contains(incoming))
+                continue; // back to a phi already being followed
+            if (MetadataUsageHandle(incoming, definitions, seen) is not { } resolved
+                || common != null && common.RepresentedMethod.FullName != resolved.RepresentedMethod.FullName)
+                return null;
+            common = resolved;
+        }
+        return common;
     }
 
     private static RuntimeMethodInfoAnalysisContext? AsMethodInfo(IOperand operand) =>
