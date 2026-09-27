@@ -56,7 +56,23 @@ public class Arm64CallingConventionResolver : BaseCallingConventionResolver
         => IntegerArgumentSlots(parameter.ParameterType);
 
     internal static int IntegerArgumentSlots(TypeAnalysisContext type)
-        => IntegerCompositeRegisters(type) is { Length: 2 } ? 2 : 1;
+        => IntegerCompositeRegisters(type) is { Length: 2 } || IsTwoRegisterGenericComposite(type) ? 2 : 1;
+
+    // A constructed struct of 9 to 16 bytes (ArraySegment<T>, KeyValuePair<TKey, TValue>) travels in two X
+    // registers like any other such composite, unless its members are all one floating-point type (an HFA).
+    // Its members only need their instantiated types for that, not the flattened layout.
+    private static bool IsTwoRegisterGenericComposite(TypeAnalysisContext type)
+    {
+        if (type is not GenericInstanceTypeAnalysisContext { IsValueType: true, IsEnumType: false } generic
+            || TypeSizes.UnboxedSize(generic, PtrSize) is not (> 8 and <= 16))
+            return false;
+        var members = generic.GenericType.Fields.Where(f => !f.IsStatic)
+            .Select(f => new ConcreteGenericFieldAnalysisContext(f, generic).FieldType).ToList();
+        if (members.Count == 0)
+            return false;
+        var floating = members.All(m => m.FullName == "System.Single") || members.All(m => m.FullName == "System.Double");
+        return !floating;
+    }
 
     // AAPCS64 C.10/C.12: a composite of 9 to 16 bytes that is not an HFA occupies two consecutive
     // X registers, each holding the next 8 bytes of the value's memory image. Returns the members
