@@ -607,6 +607,11 @@ public static class MetadataResolver
     /// every instantiation when no static field's size depends on a type argument (a reference or a
     /// non-generic struct), which covers lambda caches such as &lt;&gt;c__8&lt;A, B&gt;.
     /// </summary>
+    private static bool IsReferenceTypeParameter(GenericParameterTypeAnalysisContext parameter)
+        => (parameter.Attributes & GenericParameterAttributes.ReferenceTypeConstraint) != 0
+           || parameter.ConstraintTypes.Any(c => c is not GenericParameterTypeAnalysisContext && !c.IsValueType && !c.IsInterface
+                                                 && c.FullName is not ("System.Object" or "System.ValueType" or "System.Enum"));
+
     private static FieldAnalysisContext? StaticFieldAtOffset(TypeAnalysisContext definition, long offset, int pointerSize)
     {
         var current = 0L;
@@ -617,9 +622,13 @@ public static class MetadataResolver
                 return null;
             var type = field.FieldType;
             long size, alignment;
-            if (type is GenericParameterTypeAnalysisContext or ByRefTypeAnalysisContext)
+            // A type argument constrained to a class is a reference in every instantiation (the shared
+            // SingletonMonoBehaviour<T>.instance, where T : SingletonMonoBehaviour<T>).
+            if (type is GenericParameterTypeAnalysisContext parameter && IsReferenceTypeParameter(parameter))
+                (size, alignment) = (pointerSize, pointerSize);
+            else if (type is GenericParameterTypeAnalysisContext or ByRefTypeAnalysisContext)
                 return null;
-            if (!type.IsValueType || type is PointerTypeAnalysisContext)
+            else if (!type.IsValueType || type is PointerTypeAnalysisContext)
                 (size, alignment) = (pointerSize, pointerSize);
             else if (type is not GenericInstanceTypeAnalysisContext && GenericInstanceFieldLayout.ValueTypeSizeAndAlignment(type) is var (valueSize, valueAlignment))
                 (size, alignment) = (valueSize, valueAlignment);
