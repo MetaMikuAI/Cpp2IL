@@ -265,6 +265,17 @@ public static class ArrayRecovery
                 store.SetOperand(0, new ArrayAccess(address.Array, index));
                 return;
             }
+            // A load of the whole element used as a value (not an address) is x = arr[i] - when it is used
+            // whole: copied, passed, returned or stored. Bits taken out of it (a tuple's fields masked out of
+            // one register) are the raw register, not the element.
+            if (operandIndex == 1 && store.Destination is LocalVariable wholeLoaded
+                && method.ControlFlowGraph!.Instructions.Where(i => i != store && DeadCodeEliminator.UsedLocals(i).Contains(wholeLoaded))
+                    .All(i => i.OpCode is OpCode.Move or OpCode.Phi or OpCode.Return or OpCode.Call or OpCode.CallVoid))
+            {
+                store.SetOperand(1, new ArrayAccess(address.Array, index));
+                wholeLoaded.Type = elementType;
+                return;
+            }
             // A constant for the whole element is split into its members below.
             if (operandIndex != 0 || ConstantBits(method, value, memory.AccessSize, definitions) == null)
                 return;
