@@ -1077,6 +1077,23 @@ public static class IlGenerator
             case OpCode.IndirectJump:
                 instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Indirect jump: {instruction.Operands[0]} (should have been resolved before IL gen)"));
                 instructions.Add(CilOpCodes.Call, writeLine);
+                // An unresolved tail call ends its path: return (a default value), so that the path does not run
+                // off the end of the method body when it happens to be laid out last (ILSpy fails on the
+                // whole assembly then).
+                if (!context.IsVoid)
+                {
+                    if (context.ReturnType.IsValueType)
+                    {
+                        var defaultValue = new CilLocalVariable(context.ReturnType.ToTypeSignature());
+                        method.CilMethodBody!.LocalVariables.Add(defaultValue);
+                        instructions.Add(CilOpCodes.Ldloca, defaultValue);
+                        instructions.Add(CilOpCodes.Initobj, context.ReturnType.ToTypeSignature().ToTypeDefOrRef());
+                        instructions.Add(CilOpCodes.Ldloc, defaultValue);
+                    }
+                    else
+                        instructions.Add(CilOpCodes.Ldnull);
+                }
+                instructions.Add(CilOpCodes.Ret);
                 break;
 
             case OpCode.Switch:
