@@ -147,10 +147,10 @@ public static class ArrayRecovery
 
     // The primitive members laid out one after another from member through member + size, each with its
     // part of the little-endian constant: a float member gets the float those bits are.
-    private static List<(long Offset, int Size, IOperand Value)>? SplitConstant(TypeAnalysisContext definition, long member, int size,
+    private static List<(long Offset, int Size, IOperand Value, FieldAnalysisContext Field)>? SplitConstant(TypeAnalysisContext definition, long member, int size,
         long value, int pointerSize)
     {
-        var parts = new List<(long, int, IOperand)>();
+        var parts = new List<(long, int, IOperand, FieldAnalysisContext)>();
         for (var offset = member; offset < member + size;)
         {
             if (GenericInstanceFieldLayout.FindFieldAtUnboxedOffset(definition, offset) is not { } part)
@@ -164,7 +164,7 @@ public static class ArrayRecovery
             IOperand operand = type.FullName == "System.Single"
                 ? new FloatLiteral(BitConverter.Int32BitsToSingle(unchecked((int)bits)))
                 : new Immediate(partSize == 4 && type.FullName == "System.Int32" ? unchecked((int)bits) : bits);
-            parts.Add((offset, partSize, operand));
+            parts.Add((offset, partSize, operand, part));
             offset += partSize;
         }
         return parts;
@@ -211,7 +211,16 @@ public static class ArrayRecovery
             if (stored is LocalVariable storedLocal && definitions.TryGetValue(storedLocal, out var storedDefinition)
                 && storedDefinition is { OpCode: OpCode.Move, Operands: [_, var storedSource] })
                 stored = storedSource;
-            memory.AccessSize = stored switch { DoubleLiteral => 8, FloatLiteral => 4, MemoryOperand { IsConstant: true, AccessSize: > 0 and var loadedSize } => loadedSize, _ => 0 };
+            memory.AccessSize = stored switch
+            {
+                DoubleLiteral => 8,
+                FloatLiteral => 4,
+                MemoryOperand { IsConstant: true, AccessSize: > 0 and var loadedSize } => loadedSize,
+                // A pre/post-indexed store records no width: the typed value it stores has one.
+                LocalVariable { Type: { IsValueType: false } storedType } when storedType is not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext) => pointerSize,
+                LocalVariable { Type: { IsValueType: true } storedType } => (int)ElementSize(storedType.IsEnumType && storedType.EnumUnderlyingType is { } underlying ? underlying : storedType, pointerSize),
+                _ => 0,
+            };
         }
         if (memory.AccessSize <= 0 || member + memory.AccessSize > elementSize)
             return;
@@ -239,8 +248,16 @@ public static class ArrayRecovery
             || GenericInstanceFieldLayout.FindFieldAtUnboxedOffset(definition, member) is not { } field
             || field.FieldType.IsValueType && !field.FieldType.IsEnumType && ElementSize(field.FieldType, pointerSize) == 0)
             return;
-        List<(long Offset, int Size, IOperand Value)>? parts = null;
-        if (TypeSizes.UnboxedSize(field.FieldType, pointerSize) != memory.AccessSize)
+        List<(long Offset, int Size, IOperand Value, FieldAnalysisContext Field)>? parts = null;
+        var fieldSize = ElementSize(field.FieldType.IsEnumType && field.FieldType.EnumUnderlyingType is { } fieldUnderlying ? fieldUnderlying : field.FieldType, pointerSize);
+        // A register store wider than a member whose value is of the member's width, the rest landing on
+        // padding (a short token stored from an X register), is a store of that member.
+        var paddedStore = operandIndex == 0 && fieldSize > 0 && fieldSize < memory.AccessSize
+            && value is LocalVariable { Type: { } storedValueType } && ElementSize(storedValueType, pointerSize) == fieldSize
+            && Enumerable.Range(1, memory.AccessSize - 1).All(o => o < fieldSize || GenericInstanceFieldLayout.FindFieldAtUnboxedOffset(definition, member + o) == null);
+        if (paddedStore)
+            memory.AccessSize = (int)fieldSize;
+        if (fieldSize != memory.AccessSize)
         {
             if (operandIndex != 0 || ConstantBits(method, value, memory.AccessSize, definitions) is not { } bits
                 || SplitConstant(definition, member, memory.AccessSize, bits, pointerSize) is not { } split)
@@ -256,13 +273,24 @@ public static class ArrayRecovery
         definitions[element] = reference;
         if (parts != null)
         {
-            store.SetOperands(new MemoryOperand(element, null, parts[0].Offset, 0, parts[0].Size), parts[0].Value);
-            block.Instructions.InsertRange(block.Instructions.IndexOf(store) + 1, parts.Skip(1).Select(part =>
-                new Instruction(store.Index, OpCode.Move, new MemoryOperand(element, null, part.Offset, 0, part.Size), part.Value)
-                    { NativeAddress = store.NativeAddress }));
+            // A reference per member store, so that each reads arr[i].member rather than through one ref local.
+            store.SetOperands(new FieldReference(parts[0].Field, element, (int)parts[0].Offset) { AccessSize = parts[0].Size }, parts[0].Value);
+            var following = new List<Instruction>();
+            foreach (var part in parts.Skip(1))
+            {
+                var partName = $"arrayElement{method.Locals.Count}";
+                var partElement = new LocalVariable(partName, new Register(null, partName), elementType.MakeByReferenceType());
+                method.Locals.Add(partElement);
+                following.Add(new Instruction(store.Index, OpCode.Move, partElement, new AddressOf(new ArrayAccess(address.Array, index)))
+                    { NativeAddress = store.NativeAddress });
+                following.Add(new Instruction(store.Index, OpCode.Move, new FieldReference(part.Field, partElement, (int)part.Offset) { AccessSize = part.Size }, part.Value)
+                    { NativeAddress = store.NativeAddress });
+            }
+            block.Instructions.InsertRange(block.Instructions.IndexOf(store) + 1, following);
             return;
         }
-        store.SetOperand(operandIndex, new MemoryOperand(element, null, member, 0, memory.AccessSize));
+        // The member is known exactly; an access at 0 left to field resolution would read as the whole element.
+        store.SetOperand(operandIndex, new FieldReference(field, element, (int)member) { AccessSize = memory.AccessSize });
         // A load was typed by guesswork from its uses (the element type); the member's type is what it reads.
         if (operandIndex == 1 && store.Destination is LocalVariable loaded && (loaded.Type == null || loaded.Type.FullName == elementType.FullName))
             loaded.Type = field.FieldType;
