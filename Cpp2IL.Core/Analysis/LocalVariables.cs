@@ -138,6 +138,20 @@ public static class LocalVariables
             var methodInfoOperand = (Register)method.ParameterOperands[methodInfoIndex];
             var methodInfoLocal = method.Locals.FirstOrDefault(l => l.Register.Number == methodInfoOperand.Number && l.Register.Version == -1);
 
+            // A fully shared body returning a type argument that may be a value type takes a buffer for the
+            // result before the MethodInfo*: the MethodInfo is then the next register, which the body reads
+            // as one (its rgctx_data or klass) while the register expected to hold it is the buffer.
+            if (method.ReturnType is GenericParameterTypeAnalysisContext returned
+                && (returned.Attributes & System.Reflection.GenericParameterAttributes.ReferenceTypeConstraint) == 0
+                && methodInfoOperand.Name is ['X', .. var number] && int.TryParse(number, out var registerNumber) && registerNumber < 7
+                && method.Locals.FirstOrDefault(l => l.Register.Name == $"X{registerNumber + 1}" && l.Register.Version == -1) is { } nextLocal
+                && method.ControlFlowGraph!.Instructions.Any(i => i.Operands.Any(o => o is MemoryOperand { Base: LocalVariable read, Index: null, Addend: 0x38 or 0x20 } && read == nextLocal)))
+            {
+                if (methodInfoLocal != null)
+                    methodInfoLocal.Name = "returnBuffer";
+                methodInfoLocal = nextLocal;
+            }
+
             if (methodInfoLocal != null)
             {
                 methodInfoLocal.Name = "methodInfo";
