@@ -1830,6 +1830,11 @@ public static class MetadataResolver
                     continue;
 
                 var slot = (int)(offset / invokeDataSize);
+                // A type argument's vtable starts with that of the class it is constrained to, so a slot the
+                // constraint has is the same virtual method (SingletonMonoBehaviour<T>'s, for T : SingletonMonoBehaviour<T>).
+                if (receiverType is GenericParameterTypeAnalysisContext parameter
+                    && parameter.ConstraintTypes.FirstOrDefault(c => c is not GenericParameterTypeAnalysisContext && !c.IsValueType && !c.IsInterface) is { } constraint)
+                    receiverType = constraint;
                 if ((ResolveVTableSlot(method.AppContext, receiverType, slot)
                      ?? ResolveVTableSlotOfProvenReceiver(method, klassLocal, receiverType, slot, loads)) is not { } resolved)
                     continue;
