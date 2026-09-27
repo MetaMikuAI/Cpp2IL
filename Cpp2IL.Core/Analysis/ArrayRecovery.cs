@@ -125,6 +125,51 @@ public static class ArrayRecovery
         }
     }
 
+    // The raw bits of a constant stored as a whole: an integer, or a 64-bit constant typed as a double
+    // (a literal-pool load or FMOV of two packed floats), directly or through the local it was moved to.
+    private static long? ConstantBits(MethodAnalysisContext method, IOperand value, int size, Dictionary<LocalVariable, Instruction?> definitions)
+    {
+        if (value is LocalVariable local && definitions.TryGetValue(local, out var definition)
+            && definition is { OpCode: OpCode.Move, Operands: [_, var source] })
+            value = source;
+        var binary = method.AppContext.Binary;
+        return value switch
+        {
+            Immediate immediate => immediate.Value,
+            DoubleLiteral literal => BitConverter.DoubleToInt64Bits(literal.Value),
+            // Still the literal-pool load the value comes from: read its bytes.
+            MemoryOperand { IsConstant: true, Addend: > 0 and var address } when size == 8 && binary.TryMapVirtualAddressToRaw((ulong)address, out var raw)
+                && raw >= 0 && raw + 8 <= binary.RawLength
+                => BitConverter.ToInt64(binary.GetRawBinaryContent().Slice((int)raw, 8)),
+            _ => null,
+        };
+    }
+
+    // The primitive members laid out one after another from member through member + size, each with its
+    // part of the little-endian constant: a float member gets the float those bits are.
+    private static List<(long Offset, int Size, IOperand Value)>? SplitConstant(TypeAnalysisContext definition, long member, int size,
+        long value, int pointerSize)
+    {
+        var parts = new List<(long, int, IOperand)>();
+        for (var offset = member; offset < member + size;)
+        {
+            if (GenericInstanceFieldLayout.FindFieldAtUnboxedOffset(definition, offset) is not { } part)
+                return null;
+            var type = part.FieldType.IsEnumType && part.FieldType.EnumUnderlyingType is { } underlying ? underlying : part.FieldType;
+            var partSize = (int)ElementSize(type, pointerSize);
+            if (partSize is not (1 or 2 or 4) || offset + partSize > member + size || type.FullName == "System.IntPtr" || type.FullName == "System.UIntPtr")
+                return null;
+            var shift = (int)(offset - member) * 8;
+            var bits = (value >> shift) & ((1L << (partSize * 8)) - 1);
+            IOperand operand = type.FullName == "System.Single"
+                ? new FloatLiteral(BitConverter.Int32BitsToSingle(unchecked((int)bits)))
+                : new Immediate(partSize == 4 && type.FullName == "System.Int32" ? unchecked((int)bits) : bits);
+            parts.Add((offset, partSize, operand));
+            offset += partSize;
+        }
+        return parts;
+    }
+
     // A move from memory is a load, not a lifted lea, once its value is used other than as an address.
     private static bool IsValueLoad(Instruction load, Dictionary<LocalVariable, List<(Instruction Instruction, int OperandIndex)>> uses)
         => load.Destination is LocalVariable destination && uses.TryGetValue(destination, out var destinationUses)
@@ -159,6 +204,15 @@ public static class ArrayRecovery
             index = address.Offset.Root;
             member = offset;
         }
+        // A store of a floating-point constant is as wide as the literal, when the store itself did not say.
+        if (memory.AccessSize <= 0 && operandIndex == 0)
+        {
+            var stored = store.Operands[1];
+            if (stored is LocalVariable storedLocal && definitions.TryGetValue(storedLocal, out var storedDefinition)
+                && storedDefinition is { OpCode: OpCode.Move, Operands: [_, var storedSource] })
+                stored = storedSource;
+            memory.AccessSize = stored switch { DoubleLiteral => 8, FloatLiteral => 4, MemoryOperand { IsConstant: true, AccessSize: > 0 and var loadedSize } => loadedSize, _ => 0 };
+        }
         if (memory.AccessSize <= 0 || member + memory.AccessSize > elementSize)
             return;
 
@@ -168,18 +222,31 @@ public static class ArrayRecovery
         if (member == 0 && memory.AccessSize == elementSize)
         {
             if (operandIndex == 0 && value is LocalVariable { Type: { } valueType } && valueType.FullName == elementType.FullName)
+            {
                 store.SetOperand(0, new ArrayAccess(address.Array, index));
-            return;
+                return;
+            }
+            // A constant for the whole element is split into its members below.
+            if (operandIndex != 0 || ConstantBits(method, value, memory.AccessSize, definitions) == null)
+                return;
         }
 
         // Otherwise it must be exactly one member: a wider store spans several (x and y of a Vector2 as one
-        // 64-bit constant), which the member alone would misread.
+        // 64-bit constant), which the member alone would misread. A constant spanning whole primitive
+        // members is split into a store of each member's part.
         var definition = elementType is GenericInstanceTypeAnalysisContext generic ? generic.GenericType : elementType;
         if (elementType is GenericInstanceTypeAnalysisContext
             || GenericInstanceFieldLayout.FindFieldAtUnboxedOffset(definition, member) is not { } field
-            || field.FieldType.IsValueType && !field.FieldType.IsEnumType && ElementSize(field.FieldType, pointerSize) == 0
-            || TypeSizes.UnboxedSize(field.FieldType, pointerSize) != memory.AccessSize)
+            || field.FieldType.IsValueType && !field.FieldType.IsEnumType && ElementSize(field.FieldType, pointerSize) == 0)
             return;
+        List<(long Offset, int Size, IOperand Value)>? parts = null;
+        if (TypeSizes.UnboxedSize(field.FieldType, pointerSize) != memory.AccessSize)
+        {
+            if (operandIndex != 0 || ConstantBits(method, value, memory.AccessSize, definitions) is not { } bits
+                || SplitConstant(definition, member, memory.AccessSize, bits, pointerSize) is not { } split)
+                return;
+            parts = split;
+        }
 
         var name = $"arrayElement{method.Locals.Count}";
         var element = new LocalVariable(name, new Register(null, name), elementType.MakeByReferenceType());
@@ -187,6 +254,14 @@ public static class ArrayRecovery
         var reference = new Instruction(store.Index, OpCode.Move, element, new AddressOf(new ArrayAccess(address.Array, index)));
         block.Instructions.Insert(block.Instructions.IndexOf(store), reference);
         definitions[element] = reference;
+        if (parts != null)
+        {
+            store.SetOperands(new MemoryOperand(element, null, parts[0].Offset, 0, parts[0].Size), parts[0].Value);
+            block.Instructions.InsertRange(block.Instructions.IndexOf(store) + 1, parts.Skip(1).Select(part =>
+                new Instruction(store.Index, OpCode.Move, new MemoryOperand(element, null, part.Offset, 0, part.Size), part.Value)
+                    { NativeAddress = store.NativeAddress }));
+            return;
+        }
         store.SetOperand(operandIndex, new MemoryOperand(element, null, member, 0, memory.AccessSize));
         // A load was typed by guesswork from its uses (the element type); the member's type is what it reads.
         if (operandIndex == 1 && store.Destination is LocalVariable loaded && (loaded.Type == null || loaded.Type.FullName == elementType.FullName))
