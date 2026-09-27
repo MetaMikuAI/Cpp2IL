@@ -49,14 +49,36 @@ internal static class Arm64SwitchRecognizer
         // A table base hoisted out of the dispatch block is proven over the whole method, with the
         // case entries of every table found so far counted as branch targets.
         var caseTargets = result.Values.SelectMany(d => d.Targets).ToHashSet();
-        ulong? InvariantTable(int register, int _) => ProveInvariantTable(instructions, words, register, caseTargets);
+        // Decoding cannot know the dispatch's own case entries yet, so positions reached only through a jump
+        // table are passed over here; the check below repeats the search knowing every table.
+        ulong? InvariantTable(int register, int loadIndex) => ProveInvariantTable(instructions, words, register, caseTargets)
+            ?? ReachingTable(instructions, words, loadIndex, register, null);
         for (var i = 3; i + 2 < words.Length; i++)
             if (!result.ContainsKey(i) && Decode(words, instructions[0].Address, i, ReadTable, InvariantTable) is { } dispatch)
                 result.Add(i, dispatch with { HoistedTable = true });
         caseTargets.UnionWith(result.Values.SelectMany(d => d.Targets));
+        // A case entry is reached from the register branch of the dispatch whose table names it.
+        var caseEntries = new Dictionary<int, List<int>>();
+        foreach (var dispatch in result.Values)
+            foreach (var target in dispatch.Targets)
+            {
+                var targetIndex = (int)((target - instructions[0].Address) / 4);
+                if (!caseEntries.TryGetValue(targetIndex, out var from))
+                    caseEntries[targetIndex] = from = [];
+                from.Add(dispatch.BranchIndex);
+            }
         foreach (var (index, dispatch) in result.ToArray())
-            if (dispatch.HoistedTable && ProveInvariantTable(instructions, words, (int)((words[index] >> 5) & 31), caseTargets) == null)
+        {
+            if (!dispatch.HoistedTable)
+                continue;
+            var tableRegister = (int)((words[index] >> 5) & 31);
+            var proven = ProveInvariantTable(instructions, words, tableRegister, caseTargets)
+                ?? ReachingTable(instructions, words, index, tableRegister, caseEntries);
+            // The table now proven must be the one the dispatch was decoded from.
+            if (proven is not { } table || Decode(words, instructions[0].Address, index, ReadTable, (_, _) => table) is not { } recheck
+                || !recheck.Targets.SequenceEqual(dispatch.Targets))
                 result.Remove(index);
+        }
         RemoveGuardBypasses(result, instructions[0].Address);
         return result;
     }
@@ -225,6 +247,78 @@ internal static class Arm64SwitchRecognizer
             }
             if (IsFrameRestore(instructions[i], register) && LeavesMethod(instructions, words, i, start, end)) continue;
             return null;
+        }
+        return address;
+    }
+
+    /// <summary>
+    /// The address a jump-table register holds at one dispatch, when every definition reaching it is the same
+    /// ADRP/ADD materialization: a register reused for other values elsewhere in the method (another table,
+    /// say) still names one table here. Paths are followed back through direct branches and fallthrough; a
+    /// call clobbering the register, any other write, the method entry or a case entry of a jump table (whose
+    /// predecessors are not direct) leave the value unknown.
+    /// </summary>
+    internal static ulong? ReachingTable(IReadOnlyList<Arm64Instruction> instructions, uint[] words, int useIndex, int register,
+        Dictionary<int, List<int>>? caseEntries)
+    {
+        if (register is < 0 or > 30 || instructions.Count != words.Length || useIndex <= 0 || useIndex >= words.Length) return null;
+        var start = instructions[0].Address;
+        var count = words.Length;
+        var predecessors = new List<int>[count];
+        var branchTargets = new HashSet<int>();
+        for (var i = 0; i < count; i++) predecessors[i] = [];
+        for (var i = 0; i < count; i++)
+        {
+            var insn = instructions[i];
+            var unconditional = insn.Mnemonic is Arm64Mnemonic.RET or Arm64Mnemonic.RETAA or Arm64Mnemonic.RETAB or Arm64Mnemonic.BR
+                || insn.Mnemonic == Arm64Mnemonic.B && insn.MnemonicConditionCode is Arm64ConditionCode.NONE or Arm64ConditionCode.AL;
+            if (insn.Mnemonic != Arm64Mnemonic.BL && DirectTarget(words[i], start + (ulong)i * 4) is { } target
+                && target >= start && target < start + (ulong)count * 4)
+            {
+                var targetIndex = (int)((target - start) / 4);
+                predecessors[targetIndex].Add(i);
+                branchTargets.Add(targetIndex);
+            }
+            if (!unconditional && i + 1 < count)
+                predecessors[i + 1].Add(i);
+        }
+
+        ulong? address = null;
+        var visited = new HashSet<int>();
+        var pending = new Stack<int>(predecessors[useIndex]);
+        if (pending.Count == 0) return null;
+        var extraEntries = caseEntries?.GetValueOrDefault(useIndex);
+        if (extraEntries != null) foreach (var entry in extraEntries) pending.Push(entry);
+        while (pending.TryPop(out var k))
+        {
+            if (!visited.Add(k)) continue;
+            if (MayWrite(instructions[k], register))
+            {
+                // ADD Xd,Xd,#imm12 completing an ADRP of Xd, reached straight from it: no write to the register,
+                // branch or branch target in between (other instructions may be scheduled there).
+                if ((words[k] & 0xFFC00000) != 0x91000000 || (words[k] & 31) != register || ((words[k] >> 5) & 31) != register)
+                    return null;
+                var page = k - 1;
+                while (page >= 0 && !MayWrite(instructions[page], register) && !IsBranch(instructions[page]) && !branchTargets.Contains(page + 1))
+                    page--;
+                if (page < 0 || branchTargets.Contains(page + 1) || (words[page] & 0x9F000000) != 0x90000000 || (words[page] & 31) != register)
+                    return null;
+                var value = unchecked((ulong)((long)(instructions[page].Address & ~0xFFFUL) + (AdrImmediate(words[page]) << 12)
+                    + ((words[k] >> 10) & 0xFFF)));
+                if (address != null && address != value) return null;
+                address = value;
+                continue;
+            }
+            if (k == 0) return null;
+            // A case entry continues from its dispatch; without the tables (null) it is passed over for now.
+            var from = caseEntries == null ? null : caseEntries.GetValueOrDefault(k);
+            if (predecessors[k].Count == 0 && from == null)
+            {
+                if (caseEntries != null) return null;
+                continue;
+            }
+            foreach (var predecessor in predecessors[k].Concat(from ?? []))
+                pending.Push(predecessor);
         }
         return address;
     }
