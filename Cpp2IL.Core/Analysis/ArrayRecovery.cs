@@ -39,6 +39,7 @@ public static class ArrayRecovery
         foreach (var instruction in cfg.Instructions) RecoverAllocation(instruction);
         var definitions = SingleDefinitions(cfg);
         Dictionary<LocalVariable, List<(Instruction Instruction, int OperandIndex)>>? uses = null;
+        var adjustedIndices = new Dictionary<(Block, LocalVariable, long), LocalVariable>();
         var peers = new Dictionary<LocalVariable, List<Instruction>>();
         foreach (var block in cfg.Blocks)
         {
@@ -70,7 +71,7 @@ public static class ArrayRecovery
                 if (stride == 0)
                 {
                     if (instruction.OpCode == OpCode.Move && (i == 0 || i == 1 && IsValueLoad(instruction, uses ??= CollectUses(cfg))))
-                        RecoverStructMemberAccess(method, block, instruction, i, memory, address, pointerSize, definitions);
+                        RecoverStructMemberAccess(method, block, instruction, i, memory, address, pointerSize, definitions, adjustedIndices);
                     continue;
                 }
                 if (memory.AccessSize != 0 && memory.AccessSize != stride)
@@ -179,7 +180,8 @@ public static class ArrayRecovery
     // [array + header + i * size + member]. Point a reference at the element (ldelema) and access through
     // it, so that the member is resolved like one of a ref parameter's.
     private static void RecoverStructMemberAccess(MethodAnalysisContext method, Block block, Instruction store, int operandIndex,
-        MemoryOperand memory, (LocalVariable Array, Affine Offset) address, int pointerSize, Dictionary<LocalVariable, Instruction?> definitions)
+        MemoryOperand memory, (LocalVariable Array, Affine Offset) address, int pointerSize, Dictionary<LocalVariable, Instruction?> definitions,
+        Dictionary<(Block, LocalVariable, long), LocalVariable> adjustedIndices)
     {
         var elementType = ((SzArrayTypeAnalysisContext)address.Array.Type!).ElementType;
         var elementSize = MetadataElementSize(elementType, pointerSize);
@@ -198,11 +200,39 @@ public static class ArrayRecovery
         }
         else
         {
-            if (address.Offset.Multiplier != elementSize || offset < 0 || offset >= elementSize || !IsNativeIndex(address.Offset.Root))
+            var root = address.Offset.Root;
+            var multiplier = address.Offset.Multiplier;
+            // An Int32 byte offset kept whole across its SXTW is index * size computed in 32 bits, which is how
+            // IL2CPP addresses a struct element: take the index out of it.
+            if (multiplier == 1 && definitions.TryGetValue(root, out var scaled) && scaled != null
+                && (scaled is { OpCode: OpCode.Multiply, Operands: [_, LocalVariable factorOf, Immediate factor] } && factor.Value == elementSize
+                    || scaled is { OpCode: OpCode.ShiftLeft, Operands: [_, LocalVariable shiftOf, Immediate { Value: >= 0 and < 32 } shift] } && 1L << (int)shift.Value == elementSize))
+            {
+                root = scaled.Operands[1] as LocalVariable ?? root;
+                multiplier = elementSize;
+            }
+            if (multiplier != elementSize || !IsNativeIndex(root))
                 return;
-            TypeIndex(address.Offset.Root, method, definitions, new HashSet<LocalVariable>());
-            index = address.Offset.Root;
-            member = offset;
+            TypeIndex(root, method, definitions, new HashSet<LocalVariable>());
+            // Whole elements in the constant part are a shift of the index (arr[i + 1].x as i * 12 + 12).
+            var elements = offset >= 0 ? offset / elementSize : -((-offset + elementSize - 1) / elementSize);
+            member = offset - elements * elementSize;
+            index = root;
+            if (elements != 0 && adjustedIndices.TryGetValue((block, root, elements), out var shared))
+                index = shared; // the same element as an earlier store in this block
+            else if (elements != 0)
+            {
+                if (elements is < int.MinValue or > int.MaxValue)
+                    return;
+                var adjustedName = $"arrayIndex{method.Locals.Count}";
+                var adjusted = new LocalVariable(adjustedName, new Register(null, adjustedName), root.Type);
+                method.Locals.Add(adjusted);
+                var adjustment = new Instruction(store.Index, OpCode.Add, adjusted, root, new Immediate(elements)) { NativeAddress = store.NativeAddress };
+                block.Instructions.Insert(block.Instructions.IndexOf(store), adjustment);
+                definitions[adjusted] = adjustment;
+                adjustedIndices[(block, root, elements)] = adjusted;
+                index = adjusted;
+            }
         }
         // A store of a floating-point constant is as wide as the literal, when the store itself did not say.
         if (memory.AccessSize <= 0 && operandIndex == 0)
