@@ -29,8 +29,9 @@ public static class MergedBaseSplitRecovery
             if (predecessors.Count < 2 || predecessors.Distinct().Count() != predecessors.Count)
                 continue;
 
-            // Merged addresses: phi of one class's static storage plus a constant per incoming path. Each path
-            // may load the storage itself; a class's static storage is the same wherever it is loaded.
+            // Merged addresses: a phi whose every input is a typed base plus a constant (or the base itself):
+            // one class's static storage, loaded on each path, or objects' fields. Reading on each path is the
+            // same read the merged address makes; a null input is left alone rather than dereferenced.
             var merged = new Dictionary<LocalVariable, (LocalVariable[] Storages, long[] Offsets)>();
             foreach (var phi in block.Instructions.TakeWhile(i => i.OpCode is OpCode.Phi or OpCode.Nop).Where(i => i.OpCode == OpCode.Phi))
             {
@@ -38,22 +39,34 @@ public static class MergedBaseSplitRecovery
                     continue;
                 var storages = new LocalVariable[predecessors.Count];
                 var offsets = new long[predecessors.Count];
-                string? owner = null;
                 var usable = true;
                 for (var i = 0; i < offsets.Length; i++)
                 {
-                    if (phi.Operands[i + 1] is not LocalVariable input || !definitions.TryGetValue(input, out var definition)
-                        || definition is not { OpCode: OpCode.Add, Operands: [_, LocalVariable { Type: StaticFieldStorageTypeAnalysisContext storageType } baseLocal, Immediate offset] }
-                        || owner != null && owner != storageType.OwnerType.FullName)
+                    if (phi.Operands[i + 1] is not LocalVariable input)
                     {
                         usable = false;
                         break;
                     }
-                    owner = storageType.OwnerType.FullName;
-                    storages[i] = baseLocal;
-                    offsets[i] = offset.Value;
+                    if (definitions.TryGetValue(input, out var definition)
+                        && definition is { OpCode: OpCode.Add, Operands: [_, LocalVariable { Type: { } baseType } baseLocal, Immediate offset] }
+                        && IsBase(baseType))
+                    {
+                        storages[i] = baseLocal;
+                        offsets[i] = offset.Value;
+                    }
+                    else if (input.Type is StaticFieldStorageTypeAnalysisContext)
+                    {
+                        storages[i] = input;
+                        offsets[i] = 0;
+                    }
+                    else
+                    {
+                        usable = false;
+                        break;
+                    }
                 }
-                if (usable && offsets.Distinct().Count() > 1)
+                // Only a genuine merge of different addresses; one address throughout resolves already.
+                if (usable && storages.Select((b, i) => (b, offsets[i])).Distinct().Count() > 1)
                     merged[address] = (storages, offsets);
             }
             if (merged.Count == 0)
@@ -95,6 +108,13 @@ public static class MergedBaseSplitRecovery
 
         return changed;
     }
+
+    // A class's static storage, or an object whose fields are read (not a value type, pointer or array).
+    // An object typed only as Object has no fields to read it as.
+    private static bool IsBase(TypeAnalysisContext type) => type is StaticFieldStorageTypeAnalysisContext
+        || type is { IsValueType: false, IsInterface: false } and not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext or SzArrayTypeAnalysisContext
+            or GenericParameterTypeAnalysisContext or RuntimeClassTypeAnalysisContext or RuntimeMethodInfoAnalysisContext)
+        && type.FullName != "System.Object";
 
     private static void InsertBeforeTerminator(Block block, Instruction instruction)
     {
