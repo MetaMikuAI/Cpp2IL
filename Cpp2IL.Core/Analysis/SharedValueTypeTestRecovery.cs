@@ -47,12 +47,21 @@ public static class SharedValueTypeTestRecovery
             load.OpCode = OpCode.Call;
             load.SetOperands(isValueType, bits, typeArgument);
             bits.Type = method.AppContext.SystemTypes.SystemBooleanType;
-            // The masked bit is set exactly when the type is a value type, which the flag now says.
-            foreach (var mask in bitUses)
+            // The masked bit, or the word being negative, is set exactly when the type is a value type, which the
+            // flag now says; the word not being negative is the opposite.
+            foreach (var use in bitUses)
             {
-                var result = (LocalVariable)mask.Operands[0];
-                mask.OpCode = OpCode.Move;
-                mask.SetOperands(result, bits);
+                var result = (LocalVariable)use.Operands[0];
+                if (use.OpCode == OpCode.CheckGreaterOrEqual)
+                {
+                    use.OpCode = OpCode.CheckEqual;
+                    use.SetOperands(result, bits, new Immediate(0));
+                }
+                else
+                {
+                    use.OpCode = OpCode.Move;
+                    use.SetOperands(result, bits);
+                }
                 result.Type = bits.Type;
             }
             changed = true;
@@ -60,6 +69,8 @@ public static class SharedValueTypeTestRecovery
         return changed;
 
         bool IsValueTypeBitMask(Instruction use) => use is { OpCode: OpCode.And, Operands: [LocalVariable, var left, var right] }
-            && (left is Immediate { Value: ValueTypeBit } || right is Immediate { Value: ValueTypeBit });
+            && (left is Immediate { Value: ValueTypeBit } || right is Immediate { Value: ValueTypeBit })
+            // A signed test of the word against zero reads its top bit: word < 0, word >= 0.
+            || use is { OpCode: OpCode.CheckLess or OpCode.CheckGreaterOrEqual, Operands: [LocalVariable, LocalVariable, Immediate { Value: 0 }] };
     }
 }
