@@ -15,6 +15,8 @@ public static class SharedValueTypeTestRecovery
     // Il2CppClass::byval_arg's bit field word in the 64-bit v29-v31 layout, and its valuetype bit.
     private const long ByvalArgBitsOffset = 0x28;
     private const long ValueTypeBit = 0x80000000;
+    // Il2CppClass::stack_slot_size
+    private const long StackSlotSizeOffset = 0xFC;
 
     public static bool Run(MethodAnalysisContext method)
     {
@@ -33,6 +35,34 @@ public static class SharedValueTypeTestRecovery
             }
 
         var changed = false;
+        // The size a type argument takes where shared code keeps a value of it (its stack_slot_size, which
+        // sizes the buffers holding one): Unsafe.SizeOf<T>().
+        var sizeOf = method.AppContext.GetAssemblyByName("System.Runtime.CompilerServices.Unsafe")
+            ?.GetTypeByFullName("System.Runtime.CompilerServices.Unsafe")
+            ?.Methods.FirstOrDefault(m => m is { Name: "SizeOf", IsStatic: true, Parameters.Count: 0 } && m.GenericParameters.Count == 1);
+        var types = method.AppContext.SystemTypes;
+        if (sizeOf != null)
+            foreach (var block in graph.Blocks)
+            foreach (var load in block.Instructions.ToList())
+            {
+                if (load is not { OpCode: OpCode.Move, Operands: [LocalVariable size, MemoryOperand
+                    {
+                        Base: LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: GenericParameterTypeAnalysisContext typeArgument } },
+                        Index: null, Scale: 0, Addend: StackSlotSizeOffset
+                    }] })
+                    continue;
+                // The 32-bit field goes on in 64-bit size arithmetic (rounding a buffer up), so widen the Int32.
+                var name = $"sizeOf{method.Locals.Count}";
+                var narrow = new LocalVariable(name, new Register(null, name), types.SystemInt32Type);
+                method.Locals.Add(narrow);
+                load.OpCode = OpCode.Call;
+                load.SetOperands(sizeOf.MakeGenericInstanceMethod(typeArgument), narrow);
+                block.Instructions.Insert(block.Instructions.IndexOf(load) + 1, new Instruction(load.Index, OpCode.ZeroExtend, size, narrow,
+                    new Immediate(32)) { NativeAddress = load.NativeAddress });
+                size.Type = types.SystemInt64Type;
+                changed = true;
+            }
+
         foreach (var load in graph.Instructions.ToList())
         {
             if (load is not { OpCode: OpCode.Move, Operands: [LocalVariable bits, MemoryOperand
