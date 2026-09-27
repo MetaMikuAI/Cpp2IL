@@ -44,7 +44,8 @@ public static class TypeHierarchyRecovery
                 target = resolver.Value(left) as TypeAnalysisContext;
                 entry = resolver.Value(right) as MemoryOperand?;
             }
-            if (target == null || target is ReferencedTypeAnalysisContext || target.IsInterface || target.IsValueType)
+            // A constructed class (List<int>) has its own class and hierarchy entry like any other.
+            if (target == null || target is ReferencedTypeAnalysisContext and not GenericInstanceTypeAnalysisContext || target.IsInterface || target.IsValueType)
                 continue;
 
             // The entry is typeHierarchy + depth * 8 - 8, or typeHierarchy indexed by depth - 1.
@@ -59,7 +60,7 @@ public static class TypeHierarchyRecovery
                 || !resolver.MatchIndexedAddress(hierarchy, index, target, out klass))
                 continue;
             if (resolver.Value(klass!) is not MemoryOperand { Base: LocalVariable receiver, Addend: 0, Index: null, Scale: 0 }
-                || receiver.Type == null || receiver.Type.IsValueType || receiver.Type is ReferencedTypeAnalysisContext)
+                || receiver.Type == null || receiver.Type.IsValueType || receiver.Type is ReferencedTypeAnalysisContext and not GenericInstanceTypeAnalysisContext)
                 continue;
 
             // Only bypass a guard when its failure is the same as the hierarchy check's failure.

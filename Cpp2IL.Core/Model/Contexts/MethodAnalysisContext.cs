@@ -505,6 +505,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         retryInterfaceCleanup?.Invoke();
         retryResolvedInterfaceCleanup?.Invoke();
 
+        // Type-check and field recovery above leave the metadata reads they replaced (a class's
+        // typeHierarchyDepth, say) unused. Out of SSA, coalesced locals would make them look live.
+        DeadCodeEliminator.Run(this);
+
         SsaForm.Remove(this);
 
         // Phi removal leaves a copy per merged version, most of which can share one local
@@ -544,6 +548,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         // Every type is final: a struct held in a register moved into a scalar is its first member.
         AggregatePieceRecovery.Run(this);
+
+        // Metadata reads whose consumers the recoveries out of SSA replaced, in locals reused since.
+        DeadCodeEliminator.RemoveDeadMetadataReads(ControlFlowGraph!);
 
         LocalVariables.RemoveUnused(this);
     }

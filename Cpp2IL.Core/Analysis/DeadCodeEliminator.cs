@@ -177,6 +177,81 @@ public static class DeadCodeEliminator
     /// Opcodes with no side effects, so removing a never-read result is safe. Calls, stores,
     /// returns and branches are intentionally excluded.
     /// </summary>
+    /// <summary>
+    /// Out of SSA a local is reused, so a use count no longer proves a definition dead. Recoveries that
+    /// run there (runtime check folding, say) leave the metadata reads they replaced behind, e.g. a target
+    /// class's typeHierarchyDepth, in a local that is redefined before any read. Find those with liveness.
+    /// Only reads of runtime metadata (class and MethodInfo fields, type and method handles) are removed:
+    /// they have no effect, so no path the graph does not model (an exception handler) can depend on one.
+    /// </summary>
+    public static void RemoveDeadMetadataReads(ISILControlFlowGraph cfg)
+    {
+        var addressTaken = cfg.Instructions.SelectMany(i => i.Operands).OfType<AddressOf>()
+            .Select(a => a.Target).OfType<LocalVariable>().ToHashSet();
+        for (var changed = true; changed;)
+        {
+            changed = false;
+            var liveIn = cfg.Blocks.ToDictionary(b => b, _ => new HashSet<LocalVariable>());
+            for (var grown = true; grown;)
+            {
+                grown = false;
+                foreach (var block in cfg.Blocks.AsEnumerable().Reverse())
+                {
+                    var live = LiveOut(block, liveIn);
+                    for (var i = block.Instructions.Count - 1; i >= 0; i--)
+                        Step(block.Instructions[i], live);
+                    if (!live.IsSubsetOf(liveIn[block]))
+                    {
+                        liveIn[block].UnionWith(live);
+                        grown = true;
+                    }
+                }
+            }
+
+            foreach (var block in cfg.Blocks)
+            {
+                var live = LiveOut(block, liveIn);
+                for (var i = block.Instructions.Count - 1; i >= 0; i--)
+                {
+                    var instruction = block.Instructions[i];
+                    if (instruction.Destination is LocalVariable destination && !live.Contains(destination)
+                        && !addressTaken.Contains(destination) && IsMetadataRead(instruction))
+                    {
+                        instruction.OpCode = OpCode.Nop;
+                        instruction.SetOperands();
+                        changed = true;
+                        continue;
+                    }
+                    Step(instruction, live);
+                }
+            }
+        }
+
+        static HashSet<LocalVariable> LiveOut(Block block, Dictionary<Block, HashSet<LocalVariable>> liveIn)
+        {
+            var live = new HashSet<LocalVariable>();
+            foreach (var successor in block.Successors)
+                if (liveIn.TryGetValue(successor, out var successorLive))
+                    live.UnionWith(successorLive);
+            return live;
+        }
+
+        static void Step(Instruction instruction, HashSet<LocalVariable> live)
+        {
+            if (instruction.Destination is LocalVariable defined)
+                live.Remove(defined);
+            foreach (var used in UsedLocals(instruction))
+                live.Add(used);
+        }
+    }
+
+    private static bool IsMetadataRead(Instruction instruction) => instruction is
+    {
+        OpCode: OpCode.Move,
+        Operands: [LocalVariable, MemoryOperand { Base: LocalVariable { Type: RuntimeClassTypeAnalysisContext or RuntimeMethodInfoAnalysisContext } }
+            or TypeAnalysisContext]
+    };
+
     private static bool IsRemovable(OpCode opCode) =>
         opCode switch
         {
