@@ -569,6 +569,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Metadata reads whose consumers the recoveries out of SSA replaced, in locals reused since.
         DeadCodeEliminator.RemoveDeadMetadataReads(ControlFlowGraph!);
 
+        // A capture-free lambda's delegate reads its <>c singleton where it is built, as compiled.
+        CachedDelegateTargetInlining.Run(this);
+
         LocalVariables.RemoveUnused(this);
     }
 
