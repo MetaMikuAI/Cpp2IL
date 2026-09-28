@@ -5,17 +5,18 @@ using Cpp2IL.Core.Model.Contexts;
 
 namespace Cpp2IL.Core.Analysis;
 
-// These Mono collection getters return the backing field directly. Recover reads
+// These Mono framework getters return the backing field directly. Recover reads
 // in inlined caller code without changing field writes or managed addresses.
 public static class CollectionFieldReadRecovery
 {
     public static MethodAnalysisContext? TryGetGetter(FieldAnalysisContext field, MethodDefinition caller)
     {
-        if (field is not ConcreteGenericFieldAnalysisContext { IsStatic: false } concrete
-            || concrete.DeclaringType is not GenericInstanceTypeAnalysisContext instance)
+        if (field.IsStatic)
             return null;
 
-        var definition = concrete.BaseFieldContext;
+        var concrete = field as ConcreteGenericFieldAnalysisContext;
+        var instance = concrete?.DeclaringType as GenericInstanceTypeAnalysisContext;
+        var definition = concrete?.BaseFieldContext ?? field;
         var owner = definition.DeclaringType;
         if (owner.DeclaringAssembly != owner.AppContext.SystemTypes.SystemObjectType.DeclaringAssembly
             || owner.DeclaringAssembly.Name != "mscorlib"
@@ -26,9 +27,11 @@ public static class CollectionFieldReadRecovery
         {
             ("System.Collections.Generic.List`1", "_size") => "Count",
             ("System.Collections.Generic.List`1+Enumerator", "_current") => "Current",
+            ("System.String", "_stringLength") => "Length",
+            ("System.Nullable`1", "hasValue") => "HasValue",
             _ => null,
         };
-        if (propertyName == null || instance.GenericType != owner)
+        if (propertyName == null || owner.GenericParameters.Count != 0 && instance?.GenericType != owner)
             return null;
 
         var getter = owner.Properties.SingleOrDefault(p => p.Name == propertyName)?.Getter;
@@ -37,6 +40,6 @@ public static class CollectionFieldReadRecovery
             || getter.GetExtraData<MethodDefinition>("AsmResolverMethod") == caller)
             return null;
 
-        return new ConcreteGenericMethodAnalysisContext(getter, instance.GenericArguments, []);
+        return instance == null ? getter : new ConcreteGenericMethodAnalysisContext(getter, instance.GenericArguments, []);
     }
 }

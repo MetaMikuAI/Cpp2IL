@@ -13,6 +13,67 @@ namespace Cpp2IL.Core.Tests;
 
 public class CollectionFieldReadRecoveryTests
 {
+    [TestCase(false, "read")]
+    [TestCase(false, "write")]
+    [TestCase(false, "address")]
+    [TestCase(true, "read")]
+    [TestCase(true, "write")]
+    [TestCase(true, "address")]
+    public void StringAndNullable_OnlyReadTheirPureProperty(bool nullable, string operation)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = nullable ? app.AllTypes.Single(t => t.FullName == "System.Nullable`1") : app.SystemTypes.SystemStringType;
+        var field = owner.Fields.Single(f => f.Name == (nullable ? "hasValue" : "_stringLength"));
+        var getter = owner.Properties.Single(p => p.Name == (nullable ? "HasValue" : "Length")).Getter!;
+        TypeAnalysisContext receiverType = nullable ? new GenericInstanceTypeAnalysisContext(owner, [app.SystemTypes.SystemInt32Type]) : owner;
+        FieldAnalysisContext referenced = nullable ? new ConcreteGenericFieldAnalysisContext(field, (GenericInstanceTypeAnalysisContext)receiverType) : field;
+        var receiver = new LocalVariable("receiver", new Register(null, "receiver"), receiverType);
+        var access = new FieldReference(referenced, receiver, field.Offset);
+        var result = new LocalVariable("result", new Register(null, "result"),
+            operation == "address" ? new ByRefTypeAnalysisContext(field.FieldType) : field.FieldType);
+        var move = operation == "write" ? new Instruction(0, OpCode.Move, access, new Immediate(1))
+            : new Instruction(0, OpCode.Move, result, operation == "address" ? new AddressOf(access) : access);
+        var caller = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Caller", app.SystemTypes.SystemVoidType,
+            System.Reflection.MethodAttributes.Public | System.Reflection.MethodAttributes.Static, [])
+        {
+            Locals = [receiver, result], ParameterLocals = [],
+            ControlFlowGraph = new ISILControlFlowGraph([move, new Instruction(1, OpCode.Return)]),
+        };
+        var module = new ModuleDefinition("PureRead.dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        foreach (var context in new[] { owner, app.SystemTypes.SystemInt32Type, app.SystemTypes.SystemBooleanType }.Distinct())
+        {
+            var definition = new TypeDefinition(context.Namespace, context.Name, TypeAttributes.Public,
+                context.IsValueType ? module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", "ValueType") : module.CorLibTypeFactory.Object.Type);
+            module.TopLevelTypes.Add(definition);
+            context.PutExtraData("AsmResolverType", definition);
+        }
+        var ownerDefinition = owner.GetExtraData<TypeDefinition>("AsmResolverType")!;
+        if (nullable)
+            ownerDefinition.GenericParameters.Add(new GenericParameter("T"));
+        var fieldDefinition = new FieldDefinition(field.Name, FieldAttributes.Private, new FieldSignature(field.FieldType.ToTypeSignature()));
+        ownerDefinition.Fields.Add(fieldDefinition);
+        field.PutExtraData("AsmResolverField", fieldDefinition);
+        var getterDefinition = new MethodDefinition(getter.Name, MethodAttributes.Public, MethodSignature.CreateInstance(getter.ReturnType.ToTypeSignature()));
+        ownerDefinition.Methods.Add(getterDefinition);
+        getter.PutExtraData("AsmResolverMethod", getterDefinition);
+        var generated = new MethodDefinition("Caller", MethodAttributes.Public | MethodAttributes.Static, MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        ownerDefinition.Methods.Add(generated);
+
+        IlGenerator.GenerateIl(caller, generated);
+
+        var il = generated.CilMethodBody!.Instructions;
+        Assert.That(il.Count(i => i.OpCode == CilOpCodes.Call || i.OpCode == CilOpCodes.Callvirt), Is.EqualTo(operation == "read" ? 1 : 0));
+        if (operation == "read")
+        {
+            var call = il.Single(i => i.OpCode == CilOpCodes.Call || i.OpCode == CilOpCodes.Callvirt);
+            Assert.That(call.OpCode, Is.EqualTo(nullable ? CilOpCodes.Call : CilOpCodes.Callvirt));
+            Assert.That(((IMethodDescriptor)call.Operand!).Name!.Value, Is.EqualTo(getter.Name));
+            Assert.That(il.Any(i => i.OpCode == CilOpCodes.Ldloca), Is.EqualTo(nullable));
+        }
+        else
+            Assert.That(il.Any(i => i.OpCode == (operation == "write" ? CilOpCodes.Stfld : CilOpCodes.Ldflda)), Is.True);
+    }
+
     [SetUp]
     public void Setup()
     {
