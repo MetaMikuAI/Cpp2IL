@@ -23,6 +23,11 @@ public static class UniTaskAwaiterRecovery
     public static bool Run(MethodAnalysisContext method)
     {
         var graph = method.ControlFlowGraph!;
+        if (!graph.Instructions.Any(i => i.IsCall && i.Operands[0] is MethodAnalysisContext { Name: "GetStatus" or "GetResult" } m && IsSource(m, m.DeclaringType?.FullName ?? "")
+                                         && m.DeclaringType?.Namespace == "Cysharp.Threading.Tasks"))
+            return false;
+        // A status or source register only carried round a loop in phis would keep the checks alive.
+        DeadCodeEliminator.RemoveDeadCopyCycles(graph);
         var changed = false;
         foreach (var block in graph.Blocks.ToList())
             changed |= graph.Blocks.Contains(block) && (TryIsCompleted(graph, block) || TryGetResult(graph, block));

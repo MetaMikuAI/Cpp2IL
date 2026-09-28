@@ -596,6 +596,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // A member store the whole field's store right after overwrites.
         if (OverwrittenMemberStoreElimination.Run(this))
             DeadCodeEliminator.Run(this);
+        // An awaiter stored from the pieces of a UniTask returned in registers.
+        if (UniTaskAwaiterStorageRecovery.Run(this))
+            DeadCodeEliminator.Run(this);
 
         LocalVariables.RemoveUnused(this);
     }
