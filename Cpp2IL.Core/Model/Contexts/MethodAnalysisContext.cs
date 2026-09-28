@@ -527,6 +527,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         InlinedListClearRecovery.Run(this);
         // Inlined UniTask awaiter members of async methods.
         UniTaskAwaiterRecovery.Run(this);
+        UniTaskBuilderRecovery.Run(this);
 
         // Type-check and field recovery above leave the metadata reads they replaced (a class's
         // typeHierarchyDepth, say) unused. Out of SSA, coalesced locals would make them look live.

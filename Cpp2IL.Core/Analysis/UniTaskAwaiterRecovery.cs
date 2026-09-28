@@ -181,7 +181,7 @@ public static class UniTaskAwaiterRecovery
     }
 
     // The first block from start that does more than jump on, and the jump-only blocks passed on the way.
-    private static (Block Target, List<Block> Passed) Through(Block start)
+    internal static (Block Target, List<Block> Passed) Through(Block start)
     {
         var passed = new List<Block>();
         var current = start;
