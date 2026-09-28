@@ -571,6 +571,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         // A capture-free lambda's delegate reads its <>c singleton where it is built, as compiled.
         CachedDelegateTargetInlining.Run(this);
+        // A direct call to a method that ignores this was left the previous call's X0 as its receiver.
+        // The stale value's copies are dead now.
+        if (StaleReceiverRecovery.Run(this))
+            DeadCodeEliminator.Run(this);
 
         LocalVariables.RemoveUnused(this);
     }
