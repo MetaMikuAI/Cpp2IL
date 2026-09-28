@@ -22,7 +22,7 @@ public static class CollectionFieldReadRecovery
             ? "System.Core" : "mscorlib";
         if (!owner.AppContext.AssembliesByName.TryGetValue(assemblyName, out var frameworkAssembly)
             || owner.DeclaringAssembly != frameworkAssembly
-            || (definition.Attributes & FieldAttributes.FieldAccessMask) != FieldAttributes.Private)
+            || (definition.Attributes & FieldAttributes.FieldAccessMask) is not (FieldAttributes.Private or FieldAttributes.Assembly))
             return null;
 
         var propertyName = (owner.FullName, definition.Name) switch
@@ -31,6 +31,8 @@ public static class CollectionFieldReadRecovery
             ("System.Collections.Generic.List`1+Enumerator", "_current") => "Current",
             ("System.String", "_stringLength") => "Length",
             ("System.Nullable`1", "hasValue") => "HasValue",
+            // Reads the value without checking hasValue, as the field read does.
+            ("System.Nullable`1", "value") => "GetValueOrDefault()",
             ("System.Collections.Generic.KeyValuePair`2", "key") => "Key",
             ("System.Collections.Generic.KeyValuePair`2", "value") => "Value",
             ("System.Collections.Generic.Dictionary`2+Enumerator", "_current") => "Current",
@@ -45,7 +47,9 @@ public static class CollectionFieldReadRecovery
         if (propertyName == null || owner.GenericParameters.Count != 0 && instance?.GenericType != owner)
             return null;
 
-        var getter = owner.Properties.SingleOrDefault(p => p.Name == propertyName)?.Getter;
+        var getter = propertyName?.EndsWith("()") == true
+            ? owner.Methods.SingleOrDefault(m => m.Name == propertyName[..^2] && m.Parameters.Count == 0 && !m.IsStatic)
+            : owner.Properties.SingleOrDefault(p => p.Name == propertyName)?.Getter;
         if (getter is not { IsStatic: false, Parameters.Count: 0, GenericParameters.Count: 0 }
             || getter.Visibility != MethodAttributes.Public || !SameType(getter.ReturnType, definition.FieldType)
             || getter.GetExtraData<MethodDefinition>("AsmResolverMethod") == caller)

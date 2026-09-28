@@ -49,6 +49,20 @@ public class CollectionFieldReadRecoveryTests
     }
 
     [Test]
+    public void NullableValue_ReadsThroughGetValueOrDefault()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = app.AllTypes.Single(t => t.FullName == "System.Nullable`1");
+        var instance = new GenericInstanceTypeAnalysisContext(owner, [app.SystemTypes.SystemInt32Type]);
+        var field = new ConcreteGenericFieldAnalysisContext(owner.Fields.Single(f => f.Name == "value"), instance);
+        var getter = Cpp2IL.Core.Analysis.CollectionFieldReadRecovery.TryGetGetter(field, new MethodDefinition("Caller", MethodAttributes.Static, null));
+
+        Assert.That(getter, Is.TypeOf<ConcreteGenericMethodAnalysisContext>());
+        Assert.That(getter!.Name, Is.EqualTo("GetValueOrDefault"));
+        Assert.That(getter.Parameters, Is.Empty);
+    }
+
+    [Test]
     public void DictionaryCurrent_DifferentGenericArguments_IsNotRecovered()
     {
         var app = Cpp2IlApi.CurrentAppContext!;
