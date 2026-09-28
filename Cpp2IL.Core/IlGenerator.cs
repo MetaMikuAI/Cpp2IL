@@ -1491,6 +1491,11 @@ public static class IlGenerator
                     instructions.Add(CilOpCodes.Call, factory.ToMethodDescriptor());
                     break;
                 }
+                if (!field.IsNested && UnityFieldReadRecovery.TryGetStaticGetter(field.Field, method) is { } staticGetter)
+                {
+                    instructions.Add(CilOpCodes.Call, staticGetter.ToMethodDescriptor());
+                    break;
+                }
                 LoadFieldOwner(field, method, locals);
                 if (PrimitiveFieldReadRecovery.IsWholeValueField(field.Field))
                     instructions.Add(CilOpCodes.Ldobj, field.Field.FieldType.ToTypeSignature().ToTypeDefOrRef());
