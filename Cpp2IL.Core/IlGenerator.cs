@@ -1483,7 +1483,10 @@ public static class IlGenerator
                 break;
             case FieldReference field:
                 LoadFieldOwner(field, method, locals);
-                instructions.Add(field.Field.IsStatic ? CilOpCodes.Ldsfld : CilOpCodes.Ldfld, field.Field.ToFieldDescriptor());
+                if (CollectionFieldReadRecovery.TryGetGetter(field.Field, method) is { } getter)
+                    instructions.Add(getter.DeclaringType!.IsValueType ? CilOpCodes.Call : CilOpCodes.Callvirt, getter.ToMethodDescriptor());
+                else
+                    instructions.Add(field.Field.IsStatic ? CilOpCodes.Ldsfld : CilOpCodes.Ldfld, field.Field.ToFieldDescriptor());
                 break;
             case MemoryOperand memory:
                 if (memory.Index == null && memory.Addend == 0 && memory.Scale == 0
