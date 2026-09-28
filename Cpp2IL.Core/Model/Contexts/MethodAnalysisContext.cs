@@ -522,6 +522,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         retryInterfaceCleanup?.Invoke(final: true);
         retryResolvedInterfaceCleanup?.Invoke(final: true);
 
+        // Inlined List<T>.Add, once its fields are resolved.
+        InlinedListAddRecovery.Run(this);
+
         // Type-check and field recovery above leave the metadata reads they replaced (a class's
         // typeHierarchyDepth, say) unused. Out of SSA, coalesced locals would make them look live.
         DeadCodeEliminator.Run(this);
