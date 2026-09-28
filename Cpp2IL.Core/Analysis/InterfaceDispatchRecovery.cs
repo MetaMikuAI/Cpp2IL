@@ -677,10 +677,11 @@ public static class InterfaceDispatchRecovery
                     continue;
                 }
                 // Only once nothing recovers such calls from their arguments any more (an array accessor, a
-                // class-init helper, a shared generic method at a managed address; an indirect call may still
-                // turn out to be a delegate's invoke_impl).
-                if (managedMethods == null || use is not { OpCode: OpCode.Call or OpCode.CallVoid, Operands: [Immediate target, ..] }
-                    || managedMethods.ContainsKey(target.UnsignedValue))
+                // class-init helper, a delegate's invoke_impl behind an indirect call); a call at a managed
+                // method's address may still be specialized.
+                if (managedMethods == null
+                    || use is not ({ OpCode: OpCode.Call or OpCode.CallVoid, Operands: [Immediate, ..] } or { OpCode: OpCode.IndirectCall or OpCode.IndirectJump })
+                    || use.Operands[0] is Immediate address && managedMethods.ContainsKey(address.UnsignedValue))
                     return false;
                 // Only the value itself as an argument; one nested in another operand (a field or element
                 // of it, its address) is really read.
