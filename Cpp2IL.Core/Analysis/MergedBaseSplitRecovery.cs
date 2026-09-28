@@ -106,7 +106,116 @@ public static class MergedBaseSplitRecovery
             }
         }
 
+        return SplitPickedOffsets(method) | changed;
+    }
+
+    // A field picked by a condition (a CSEL of two field offsets) is an offset merged in a phi and added to one
+    // base: [base + phi(48, 56)], or a member of the picked field at phi + 4. Several such selects in a row put
+    // the read a few blocks below the phi. Read on each path into the phi's block instead, when nothing between
+    // the phi and the read can store or call, and the base is there before the phi.
+    private static bool SplitPickedOffsets(MethodAnalysisContext method)
+    {
+        var graph = method.ControlFlowGraph!;
+        var definitions = graph.Instructions.Where(i => i.Destination is LocalVariable)
+            .GroupBy(i => (LocalVariable)i.Destination!).Where(g => g.Count() == 1).ToDictionary(g => g.Key, g => g.Single());
+        var home = new Dictionary<Instruction, Block>();
+        foreach (var block in graph.Blocks)
+            foreach (var instruction in block.Instructions)
+                home[instruction] = block;
+
+        var picked = new Dictionary<LocalVariable, (Block Merge, long[] Offsets)>();
+        foreach (var block in graph.Blocks)
+        {
+            if (block.Predecessors.Count < 2 || block.Predecessors.Distinct().Count() != block.Predecessors.Count)
+                continue;
+            foreach (var phi in block.Instructions.TakeWhile(i => i.OpCode is OpCode.Phi or OpCode.Nop).Where(i => i.OpCode == OpCode.Phi))
+            {
+                if (phi.Operands[0] is not LocalVariable offset || phi.Operands.Count - 1 != block.Predecessors.Count)
+                    continue;
+                var constants = phi.Operands.Skip(1).Select(o => Constant(o, definitions)).ToArray();
+                if (constants.All(c => c is >= 0 and < 0x10000) && constants.Distinct().Count() > 1)
+                    picked[offset] = (block, constants.Select(c => c!.Value).ToArray());
+            }
+        }
+        if (picked.Count == 0)
+            return false;
+        foreach (var instruction in graph.Instructions)
+            if (instruction is { OpCode: OpCode.Add, Operands: [LocalVariable member, LocalVariable field, Immediate { Value: > 0 and < 0x100 } memberOffset] }
+                && picked.TryGetValue(field, out var fieldOffsets))
+                picked[member] = (fieldOffsets.Merge, fieldOffsets.Offsets.Select(o => o + memberOffset.Value).ToArray());
+
+        DominatorInfo? dominators = null;
+        var changed = false;
+        foreach (var block in graph.Blocks.ToList())
+        for (var index = 0; index < block.Instructions.Count; index++)
+        {
+            var load = block.Instructions[index];
+            if (load is not { OpCode: OpCode.Move, Operands: [LocalVariable loaded, MemoryOperand { Base: LocalVariable { Type: { } baseType } baseLocal, Index: LocalVariable offsetLocal, Scale: 0 or 1 } memory] }
+                || !IsBase(baseType) || !picked.TryGetValue(offsetLocal, out var pick))
+                continue;
+            var merge = pick.Merge;
+            dominators ??= new DominatorInfo(graph);
+            // The base must be available on every path into the merge.
+            if (definitions.TryGetValue(baseLocal, out var baseDefinition)
+                && (!home.TryGetValue(baseDefinition, out var baseBlock) || baseBlock == merge || !dominators.Dominates(baseBlock, merge)))
+                continue;
+            if (!dominators.Dominates(merge, block) || !Quiet(merge, block, load))
+                continue;
+
+            var values = new List<IOperand>();
+            for (var i = 0; i < merge.Predecessors.Count; i++)
+            {
+                var name = $"splitRead{method.Locals.Count}";
+                var value = new LocalVariable(name, new Register(null, name), loaded.Type);
+                method.Locals.Add(value);
+                var read = new Instruction(load.Index, OpCode.Move, value,
+                    new MemoryOperand(baseLocal, null, pick.Offsets[i] + memory.Addend, 0, memory.AccessSize)) { NativeAddress = load.NativeAddress };
+                InsertBeforeTerminator(merge.Predecessors[i], read);
+                home[read] = merge.Predecessors[i];
+                values.Add(value);
+            }
+            var phiName = $"splitPhi{method.Locals.Count}";
+            var joined = new LocalVariable(phiName, new Register(null, phiName), loaded.Type);
+            method.Locals.Add(joined);
+            var join = new Instruction(-1, OpCode.Phi, [joined, .. values]);
+            merge.Instructions.Insert(merge.Instructions.FindLastIndex(i => i.OpCode == OpCode.Phi) + 1, join);
+            home[join] = merge;
+            if (merge == block) index++;
+            load.SetOperands(loaded, joined);
+            changed = true;
+        }
         return changed;
+
+        // Nothing from the merge's phis to the read, on any path between them, stores or calls.
+        static bool Quiet(Block merge, Block block, Instruction load)
+        {
+            static bool Effect(Instruction i) => i.IsCall || i.OpCode is OpCode.IndirectCall or OpCode.IndirectJump or OpCode.Return
+                || i.Destination is MemoryOperand or FieldReference or ArrayAccess;
+            if (merge == block)
+                return !block.Instructions.TakeWhile(i => i != load).Any(Effect);
+            if (merge.Instructions.Any(Effect) || block.Instructions.TakeWhile(i => i != load).Any(Effect))
+                return false;
+            var seen = new HashSet<Block> { merge, block };
+            var pending = new Queue<Block>(merge.Successors);
+            while (pending.TryDequeue(out var current))
+            {
+                if (!seen.Add(current))
+                    continue;
+                if (seen.Count > 24 || current.Instructions.Any(Effect))
+                    return false;
+                foreach (var successor in current.Successors)
+                    pending.Enqueue(successor);
+            }
+            return true;
+        }
+    }
+
+    private static long? Constant(IOperand operand, Dictionary<LocalVariable, Instruction> definitions)
+    {
+        for (var depth = 0; depth < 4 && operand is LocalVariable local && definitions.TryGetValue(local, out var definition)
+             && definition is { OpCode: OpCode.Move, Operands: [_, var source] }; depth++)
+            operand = source;
+        return operand is Immediate immediate ? immediate.Value : null;
     }
 
     // A class's static storage, or an object whose fields are read (not a value type, pointer or array).
