@@ -56,18 +56,46 @@ public static class UnityFieldReadRecovery
         return getter;
     }
 
+    // Public members that return exactly this private field in the official sources of the installed packages
+    // (UnityEngine.CoreModule, UGUI 1.0.0, Timeline, TextMeshPro); a name ending in () is a method.
+    private static string? Accessor(string assembly, string type, string field) => (assembly, type, field) switch
+    {
+        ("UnityEngine.UI", "UnityEngine.UI.Button", "m_OnClick") => "onClick",
+        ("UnityEngine.UI", "UnityEngine.UI.ScrollRect", "m_Content") => "content",
+        ("UnityEngine.UI", "UnityEngine.UI.ScrollRect", "m_Velocity") => "velocity",
+        ("UnityEngine.UI", "UnityEngine.UI.RawImage", "m_Texture") => "texture",
+        ("UnityEngine.UI", "UnityEngine.UI.Image", "m_Sprite") => "sprite",
+        ("UnityEngine.CoreModule", "UnityEngine.Rect", "m_XMin") => "x",
+        ("UnityEngine.CoreModule", "UnityEngine.Rect", "m_YMin") => "y",
+        ("UnityEngine.CoreModule", "UnityEngine.Rect", "m_Width") => "width",
+        ("UnityEngine.CoreModule", "UnityEngine.Rect", "m_Height") => "height",
+        ("UnityEngine.CoreModule", "UnityEngine.Vector2Int" or "UnityEngine.Vector3Int", "m_X") => "x",
+        ("UnityEngine.CoreModule", "UnityEngine.Vector2Int" or "UnityEngine.Vector3Int", "m_Y") => "y",
+        ("UnityEngine.CoreModule", "UnityEngine.Vector3Int", "m_Z") => "z",
+        ("UnityEngine.CoreModule", "UnityEngine.Ray", "m_Origin") => "origin",
+        ("UnityEngine.CoreModule", "UnityEngine.Ray", "m_Direction") => "direction",
+        ("UnityEngine.CoreModule", "UnityEngine.Bounds", "m_Center") => "center",
+        ("UnityEngine.CoreModule", "UnityEngine.Bounds", "m_Extents") => "extents",
+        ("UnityEngine.CoreModule", "UnityEngine.Playables.Playable", "m_Handle") => "GetHandle()",
+        ("UnityEngine.CoreModule", "UnityEngine.Playables.FrameData", "m_FrameID") => "frameId",
+        ("Unity.Timeline", "UnityEngine.Timeline.TimelineClip", "m_Asset") => "asset",
+        ("Unity.Timeline", "UnityEngine.Timeline.TimelineClip", "m_Start") => "start",
+        ("Unity.TextMeshPro", "TMPro.TMP_InputField", "m_OnEndEdit") => "onEndEdit",
+        ("Unity.TextMeshPro", "TMPro.TMP_Dropdown", "m_OnValueChanged") => "onValueChanged",
+        _ => null,
+    };
+
     public static MethodAnalysisContext? TryGetGetter(FieldAnalysisContext field, MethodDefinition caller)
     {
         var owner = field.DeclaringType;
-        // UGUI 1.0.0 Button.onClick directly returns m_OnClick.
-        if (field.IsStatic || owner.DeclaringAssembly.Name != "UnityEngine.UI"
-            || owner.FullName != "UnityEngine.UI.Button" || field.Name != "m_OnClick"
-            || field.FieldType.FullName != "UnityEngine.UI.Button+ButtonClickedEvent"
-            || field.FieldType.DeclaringAssembly != owner.DeclaringAssembly
-            || (field.Attributes & FieldAttributes.FieldAccessMask) != FieldAttributes.Private)
+        if (field.IsStatic || owner.GenericParameters.Count != 0
+            || (field.Attributes & FieldAttributes.FieldAccessMask) is not (FieldAttributes.Private or FieldAttributes.Assembly)
+            || Accessor(owner.DeclaringAssembly.Name, owner.FullName, field.Name) is not { } name)
             return null;
 
-        var getter = owner.Properties.SingleOrDefault(p => p.Name == "onClick")?.Getter;
+        var getter = name.EndsWith("()")
+            ? owner.Methods.SingleOrDefault(m => m.Name == name[..^2] && m.Parameters.Count == 0)
+            : owner.Properties.SingleOrDefault(p => p.Name == name)?.Getter;
         if (getter is not { IsStatic: false, Parameters.Count: 0, GenericParameters.Count: 0 }
             || getter.Visibility != MethodAttributes.Public || getter.ReturnType != field.FieldType
             || getter.GetExtraData<MethodDefinition>("AsmResolverMethod") == caller)

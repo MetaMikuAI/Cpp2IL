@@ -1511,7 +1511,7 @@ public static class IlGenerator
                 else if (CollectionFieldReadRecovery.TryGetGetter(field.Field, method) is { } getter)
                     instructions.Add(getter.DeclaringType!.IsValueType ? CilOpCodes.Call : CilOpCodes.Callvirt, getter.ToMethodDescriptor());
                 else if (UnityFieldReadRecovery.TryGetGetter(field.Field, method) is { } unityGetter)
-                    instructions.Add(CilOpCodes.Callvirt, unityGetter.ToMethodDescriptor());
+                    instructions.Add(unityGetter.DeclaringType!.IsValueType ? CilOpCodes.Call : CilOpCodes.Callvirt, unityGetter.ToMethodDescriptor());
                 else
                     instructions.Add(field.Field.IsStatic ? CilOpCodes.Ldsfld : CilOpCodes.Ldfld, field.Field.ToFieldDescriptor());
                 break;
