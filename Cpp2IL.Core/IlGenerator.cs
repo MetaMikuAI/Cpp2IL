@@ -1482,6 +1482,11 @@ public static class IlGenerator
                     ((SzArrayTypeAnalysisContext)arrayAccess.Array.Type!).ElementType.ToTypeSignature().ToTypeDefOrRef());
                 break;
             case FieldReference field:
+                if (!field.IsNested && EmptyArrayReadRecovery.TryGetFactory(field.Field, method) is { } factory)
+                {
+                    instructions.Add(CilOpCodes.Call, factory.ToMethodDescriptor());
+                    break;
+                }
                 LoadFieldOwner(field, method, locals);
                 if (PrimitiveFieldReadRecovery.IsWholeValueRead(field.Field))
                     instructions.Add(CilOpCodes.Ldobj, field.Field.FieldType.ToTypeSignature().ToTypeDefOrRef());
