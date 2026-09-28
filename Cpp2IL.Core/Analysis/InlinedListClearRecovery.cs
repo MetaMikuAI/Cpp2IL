@@ -39,12 +39,7 @@ public static class InlinedListClearRecovery
             return false;
 
         // The straight-line code ending in this block.
-        var straight = new List<Instruction>(block.Instructions);
-        for (var current = block; current.Predecessors is [var previous] && previous.Successors is [_] && previous != block && straight.Count < 512;)
-        {
-            straight.InsertRange(0, previous.Instructions);
-            current = previous;
-        }
+        var straight = StraightLine(block);
 
         // list._version = list._version + 1, next to the size store.
         var versionStore = straight.FirstOrDefault(i => i is { OpCode: OpCode.Move, Operands: [FieldReference f, LocalVariable v] }
