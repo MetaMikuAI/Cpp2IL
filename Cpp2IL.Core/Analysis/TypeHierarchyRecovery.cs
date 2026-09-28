@@ -261,6 +261,10 @@ public static class TypeHierarchyRecovery
                         next = condition.Value != 0 ? taken : block.Successors.First(s => s != taken);
                         break;
                     }
+                    // A plain read has no effect on the arm (the bypassed guard only kept the hierarchy entry read in
+                    // bounds, and that read is dead now); its value stays unknown, so nothing that depends on it matches.
+                    if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable, MemoryOperand] })
+                        continue;
                     if (instruction.Destination is not LocalVariable destination
                         || instruction.Operands.Any(o => o is MemoryOperand)
                         || !walk.Compute(instruction, destination, edge, target, receiver))
