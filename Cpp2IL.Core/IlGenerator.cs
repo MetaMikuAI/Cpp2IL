@@ -1483,7 +1483,9 @@ public static class IlGenerator
                 break;
             case FieldReference field:
                 LoadFieldOwner(field, method, locals);
-                if (CollectionFieldReadRecovery.TryGetGetter(field.Field, method) is { } getter)
+                if (PrimitiveFieldReadRecovery.IsWholeValueRead(field.Field))
+                    instructions.Add(CilOpCodes.Ldobj, field.Field.FieldType.ToTypeSignature().ToTypeDefOrRef());
+                else if (CollectionFieldReadRecovery.TryGetGetter(field.Field, method) is { } getter)
                     instructions.Add(getter.DeclaringType!.IsValueType ? CilOpCodes.Call : CilOpCodes.Callvirt, getter.ToMethodDescriptor());
                 else
                     instructions.Add(field.Field.IsStatic ? CilOpCodes.Ldsfld : CilOpCodes.Ldfld, field.Field.ToFieldDescriptor());
