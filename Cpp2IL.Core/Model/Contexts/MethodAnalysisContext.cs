@@ -569,6 +569,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Metadata reads whose consumers the recoveries out of SSA replaced, in locals reused since.
         DeadCodeEliminator.RemoveDeadMetadataReads(ControlFlowGraph!);
 
+        // Closures and iterators are built with their own (inlined) constructors again.
+        if (CompilerGeneratedConstructorRecovery.Run(this))
+            DeadCodeEliminator.Run(this);
         // A capture-free lambda's delegate reads its <>c singleton where it is built, as compiled.
         CachedDelegateTargetInlining.Run(this);
         // A direct call to a method that ignores this was left the previous call's X0 as its receiver.
