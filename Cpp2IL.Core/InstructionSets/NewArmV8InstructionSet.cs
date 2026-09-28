@@ -23,6 +23,10 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
     [ThreadStatic]
     private static Dictionary<string, ulong>? integerConstants;
 
+    // The operands of the last FCMP, for the flag consumer right after it.
+    [ThreadStatic]
+    private static (ulong Address, IOperand Left, IOperand Right)? floatCompare;
+
     private static readonly Arm64CallingConventionResolver CallingConventions = new();
 
     // GetIsilFromMethod runs in parallel, so cache resolved intrinsics concurrently.
@@ -425,6 +429,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             integerConstants = new();
         else
             integerConstants.Clear();
+        floatCompare = null;
 
         var instructions = new List<Instruction>();
         var addresses = new List<ulong>();
@@ -1247,6 +1252,30 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             var temp = new Register(null, "TEMPCOND");
             var temp2 = new Register(null, "TEMPCOND2");
 
+            // Right after an FCMP the flags order two floats, not an integer subtraction. Conditions that
+            // also hold when unordered (a NaN) are the negation of the ordered comparison.
+            if (floatCompare is var (compareAddress, left, right) && compareAddress + 4 == address
+                && condition switch
+                {
+                    Arm64ConditionCode.EQ => (OpCode.CheckEqual, false),
+                    Arm64ConditionCode.NE => (OpCode.CheckEqual, true),
+                    Arm64ConditionCode.GE => (OpCode.CheckGreaterOrEqual, false),
+                    Arm64ConditionCode.LT => (OpCode.CheckGreaterOrEqual, true),
+                    Arm64ConditionCode.GT => (OpCode.CheckGreater, false),
+                    Arm64ConditionCode.LE => (OpCode.CheckGreater, true),
+                    Arm64ConditionCode.MI or Arm64ConditionCode.CC => (OpCode.CheckLess, false),
+                    Arm64ConditionCode.PL or Arm64ConditionCode.CS => (OpCode.CheckLess, true),
+                    Arm64ConditionCode.LS => (OpCode.CheckLessOrEqual, false),
+                    Arm64ConditionCode.HI => (OpCode.CheckLessOrEqual, true),
+                    _ => ((OpCode, bool)?)null,
+                } is var (comparison, negated))
+            {
+                Add(address, comparison, temp, left, right);
+                if (negated)
+                    Add(address, OpCode.Not, temp, temp);
+                return temp;
+            }
+
             switch (condition)
             {
                 case Arm64ConditionCode.EQ:
@@ -1604,6 +1633,7 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
             case Arm64Mnemonic.FCMP:
             case Arm64Mnemonic.FCMPE:
                 EmitCompareFlags(ScalarOperand(0), ScalarOperand(1));
+                floatCompare = (address, ScalarOperand(0), ScalarOperand(1));
                 break;
             case Arm64Mnemonic.CMN:
                 // cmp against the negated operand
