@@ -801,7 +801,10 @@ public static class IlGenerator
 
                     LoadFieldOwner(field, method, locals);
                     LoadOperand(instruction.Operands[1], method, locals, writeLine, field.Field.FieldType);
-                    instructions.Add(field.Field.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld, field.Field.ToFieldDescriptor());
+                    if (PrimitiveFieldReadRecovery.IsWholeValueField(field.Field))
+                        instructions.Add(CilOpCodes.Stobj, field.Field.FieldType.ToTypeSignature().ToTypeDefOrRef());
+                    else
+                        instructions.Add(field.Field.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld, field.Field.ToFieldDescriptor());
                     break;
                 }
 
@@ -1467,7 +1470,8 @@ public static class IlGenerator
                 break;
             case AddressOf { Target: FieldReference fieldAddress }:
                 LoadFieldOwner(fieldAddress, method, locals);
-                instructions.Add(fieldAddress.Field.IsStatic ? CilOpCodes.Ldsflda : CilOpCodes.Ldflda, fieldAddress.Field.ToFieldDescriptor());
+                if (!PrimitiveFieldReadRecovery.IsWholeValueField(fieldAddress.Field))
+                    instructions.Add(fieldAddress.Field.IsStatic ? CilOpCodes.Ldsflda : CilOpCodes.Ldflda, fieldAddress.Field.ToFieldDescriptor());
                 break;
             case AddressOf { Target: ArrayAccess elementAddress }:
                 LoadLocal(elementAddress.Array, method, locals);
@@ -1488,7 +1492,7 @@ public static class IlGenerator
                     break;
                 }
                 LoadFieldOwner(field, method, locals);
-                if (PrimitiveFieldReadRecovery.IsWholeValueRead(field.Field))
+                if (PrimitiveFieldReadRecovery.IsWholeValueField(field.Field))
                     instructions.Add(CilOpCodes.Ldobj, field.Field.FieldType.ToTypeSignature().ToTypeDefOrRef());
                 else if (CollectionFieldReadRecovery.TryGetGetter(field.Field, method) is { } getter)
                     instructions.Add(getter.DeclaringType!.IsValueType ? CilOpCodes.Call : CilOpCodes.Callvirt, getter.ToMethodDescriptor());
@@ -1909,7 +1913,10 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Stloc, scratch);
                 LoadFieldOwner(field, method, locals);
                 instructions.Add(CilOpCodes.Ldloc, scratch);
-                instructions.Add(CilOpCodes.Stfld, fieldDescriptor);
+                if (PrimitiveFieldReadRecovery.IsWholeValueField(field.Field))
+                    instructions.Add(CilOpCodes.Stobj, field.Field.FieldType.ToTypeSignature().ToTypeDefOrRef());
+                else
+                    instructions.Add(CilOpCodes.Stfld, fieldDescriptor);
                 break;
 
             case ArrayAccess arrayAccess:
