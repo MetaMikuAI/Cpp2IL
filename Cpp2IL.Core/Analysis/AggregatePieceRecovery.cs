@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System.Linq;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
@@ -14,7 +15,11 @@ public static class AggregatePieceRecovery
 {
     public static void Run(MethodAnalysisContext method)
     {
-        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        var instructions = method.ControlFlowGraph!.Instructions;
+        foreach (var instruction in instructions)
+            RecoverMaskedOrShiftedMember(instruction, instructions);
+
+        foreach (var instruction in instructions)
         {
             if (instruction is not { OpCode: OpCode.Move, Operands: [var destination, LocalVariable { Type: { } sourceType } source] })
                 continue;
@@ -35,6 +40,32 @@ public static class AggregatePieceRecovery
 
             instruction.SetOperand(1, new FieldReference(first, source, 0));
         }
+    }
+
+    // A small struct held whole in a register (a bool? passed in one) whose member is picked out by masking
+    // the low bytes (value & 0xFF is hasValue) or shifting the last member down (option >> 32) reads that member.
+    private static void RecoverMaskedOrShiftedMember(Instruction instruction, List<Instruction> instructions)
+    {
+        if (instruction is not { OpCode: OpCode.And or OpCode.ShiftRight, Operands: [LocalVariable destination, LocalVariable { Type: { } type } source, Immediate amount, ..] }
+            || type is not { IsValueType: true, IsEnumType: false } || IsScalar(type)
+            || GenericInstanceFieldLayout.ValueTypeSizeAndAlignment(type) is not ({ } size and <= 8, _)
+            || GenericInstanceFieldLayout.ComputeLayout(type) is not { Complete: true, Slots: var slots })
+            return;
+
+        var slot = instruction.OpCode == OpCode.And
+            ? slots.FirstOrDefault(s => s.Offset == 0 && s.Size < 8 && amount.Value == (1L << (int)(8 * s.Size)) - 1)
+            : slots.FirstOrDefault(s => amount.Value == 8 * s.Offset && s.Offset > 0 && s.Offset + s.Size == size);
+        // Into a value of the struct itself, a mask truncates the struct rather than reading a member.
+        if (slot == null || !IsScalar(slot.Field.FieldType) && slot.Field.FieldType.IsValueType
+            || destination.Type is { } destinationType && destinationType != type.AppContext.SystemTypes.SystemObjectType && !IsScalar(destinationType))
+            return;
+
+        instruction.OpCode = OpCode.Move;
+        instruction.SetOperands(destination, new FieldReference(slot.Field, source, (int)slot.Offset));
+        // The untyped temporary the bits went into is the member now.
+        if ((destination.Type is null || destination.Type == type.AppContext.SystemTypes.SystemObjectType)
+            && instructions.Count(i => i.Destination == destination) == 1)
+            destination.Type = slot.Field.FieldType;
     }
 
     private static bool IsScalar(TypeAnalysisContext type) => type.FullName is "System.Single" or "System.Double"
