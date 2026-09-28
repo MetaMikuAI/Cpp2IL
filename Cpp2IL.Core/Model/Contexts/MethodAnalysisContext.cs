@@ -582,6 +582,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         if (StaleReceiverRecovery.Run(this))
             DeadCodeEliminator.Run(this);
 
+        // Member-wise clearing of a stack struct that the zero-initialized IL local already holds.
+        InitialZeroStoreElimination.Run(this);
+
         LocalVariables.RemoveUnused(this);
     }
 
