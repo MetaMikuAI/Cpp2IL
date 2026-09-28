@@ -451,6 +451,8 @@ public class NewArmV8InstructionSet : Cpp2IlInstructionSet
         {
             if (switches.TryGetValue(nativeIndex, out var dispatch))
             {
+                if (dispatch.ScheduledFloat)
+                    ConvertInstructionStatement(insns[dispatch.LoadIndex + 2], instructions, addresses, context, twoSLaneRegisters);
                 var operands = new List<IOperand> { new Register(null, $"X{dispatch.Selector}"), Imm(0), Imm(4), Imm(dispatch.DefaultTarget) };
                 for (var caseIndex = 0; caseIndex < dispatch.Targets.Length; caseIndex++)
                 {

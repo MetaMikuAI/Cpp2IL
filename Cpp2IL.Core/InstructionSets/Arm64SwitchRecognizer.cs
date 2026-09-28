@@ -10,10 +10,10 @@ namespace Cpp2IL.Core.InstructionSets;
 
 internal sealed record Arm64SwitchDispatch(int LoadIndex, int GuardIndex, int Selector, int OffsetRegister,
     int TargetRegister, ulong DefaultTarget, uint[] Offsets, ulong[] Targets, int? ProofStartIndex = null, bool HoistedTable = false,
-    int? ScheduledRegister = null, ulong ScheduledValue = 0)
+    int? ScheduledRegister = null, ulong ScheduledValue = 0, bool ScheduledFloat = false)
 {
     // A constant move the compiler scheduled between the target computation and the BR runs before every case.
-    public int BranchIndex => LoadIndex + (ScheduledRegister == null ? 2 : 3);
+    public int BranchIndex => LoadIndex + (ScheduledRegister == null && !ScheduledFloat ? 2 : 3);
 }
 
 // Clang's compact unsigned byte/halfword jump table, guarded by an unsigned W
@@ -112,9 +112,13 @@ internal static class Arm64SwitchRecognizer
         var branchIndex = loadIndex + 2;
         int? scheduledRegister = null;
         ulong scheduledValue = 0;
+        var scheduledFloat = false;
         if (ImmediateMove(words[branchIndex]) is var (movedRegister, movedValue) && movedRegister != targetReg
             && movedRegister != offsetReg && branchIndex + 1 < words.Length)
             (scheduledRegister, scheduledValue, branchIndex) = (movedRegister, movedValue, branchIndex + 1);
+        // FMOV Sd/Dd,#imm touches no general register; it is lifted as it is, before the switch.
+        else if ((words[branchIndex] & 0xFF201FE0) == 0x1E201000 && ((words[branchIndex] >> 22) & 3) is 0 or 1 && branchIndex + 1 < words.Length)
+            (scheduledFloat, branchIndex) = (true, branchIndex + 1);
         if ((add & 0xFFE0FC00) != 0x8B000800 // ADD Xd,Xn,Xm,LSL #2
             || ((add >> 5) & 31) != targetReg || ((add >> 16) & 31) != offsetReg
             || (words[branchIndex] & 0xFFFFFC1F) != 0xD61F0000
@@ -173,10 +177,11 @@ internal static class Arm64SwitchRecognizer
         var condition = guard & 15;
         if ((guard & 0xFF000010) != 0x54000000 || condition is not (8 or 2)) return null; // HI / HS
         // Flag-preserving loads, stores and moves may sit between the compare and its branch (the compiler
-        // sinks an unrelated increment there), as long as they leave the compared and index registers alone.
+        // sinks an unrelated increment there), as long as they leave the compared and index registers alone
+        // (a masked index is only computed after the branch, so an earlier write to its register is harmless).
         var compareIndex = guardIndex - 1;
         while (compareIndex > 1 && guardIndex - compareIndex < 4 && (words[compareIndex] & 0xFFC0001F) != 0x7100001F
-            && IsIndependent(words[compareIndex]) && (words[compareIndex] & 31) != selector && (words[compareIndex] & 31) != comparedRegister)
+            && IsIndependent(words[compareIndex]) && (maskedCopy != null || (words[compareIndex] & 31) != selector) && (words[compareIndex] & 31) != comparedRegister)
             compareIndex--;
         var compare = words[compareIndex];
         int? maskedDefinition = null;
@@ -218,7 +223,7 @@ internal static class Arm64SwitchRecognizer
             targets[i] = targetBase + offsets[i] * 4UL;
         }
         var candidate = new Arm64SwitchDispatch(loadIndex, guardIndex, selector, offsetReg, targetReg, defaultTarget, offsets, targets,
-            proofStartIndex, ScheduledRegister: scheduledRegister, ScheduledValue: scheduledValue);
+            proofStartIndex, ScheduledRegister: scheduledRegister, ScheduledValue: scheduledValue, ScheduledFloat: scheduledFloat);
         if (targets.Append(defaultTarget).Any(t => t < start || (t - start) % 4 != 0 || (t - start) / 4 >= (ulong)words.Length
             || InsideGuard(t, candidate, start))) return null;
         for (var i = 0; i < words.Length; i++)
