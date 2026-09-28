@@ -1,12 +1,30 @@
 using System.Linq;
 using System.Reflection;
 using AsmResolver.DotNet;
+using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 
 namespace Cpp2IL.Core.Analysis;
 
 public static class UnityFieldReadRecovery
 {
+    public static MethodAnalysisContext? TryGetComponentGetter(FieldReference reference, MethodDefinition caller)
+    {
+        if (reference.ContainingFields.Count != 1)
+            return null;
+        var container = reference.ContainingFields[0];
+        var field = reference.Field;
+        if (field.IsStatic || field.DeclaringType != container.FieldType
+            || field.FieldType != field.AppContext.SystemTypes.SystemSingleType
+            || (field.Attributes & FieldAttributes.FieldAccessMask) != FieldAttributes.Public
+            || (field.DeclaringType.FullName, field.Name) is not
+                (("UnityEngine.Vector2", "x" or "y")
+                or ("UnityEngine.Vector3", "x" or "y" or "z")
+                or ("UnityEngine.Quaternion", "x" or "y" or "z" or "w")))
+            return null;
+        return TryGetStaticGetter(container, caller);
+    }
+
     public static MethodAnalysisContext? TryGetStaticGetter(FieldAnalysisContext field, MethodDefinition caller)
     {
         var owner = field.DeclaringType;

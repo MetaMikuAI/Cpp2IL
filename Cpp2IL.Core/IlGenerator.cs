@@ -1496,7 +1496,16 @@ public static class IlGenerator
                     instructions.Add(CilOpCodes.Call, staticGetter.ToMethodDescriptor());
                     break;
                 }
-                LoadFieldOwner(field, method, locals);
+                if (UnityFieldReadRecovery.TryGetComponentGetter(field, method) is { } componentGetter)
+                {
+                    var constantValue = new CilLocalVariable(componentGetter.ReturnType.ToTypeSignature());
+                    method.CilMethodBody!.LocalVariables.Add(constantValue);
+                    instructions.Add(CilOpCodes.Call, componentGetter.ToMethodDescriptor());
+                    instructions.Add(CilOpCodes.Stloc, constantValue);
+                    instructions.Add(CilOpCodes.Ldloca, constantValue);
+                }
+                else
+                    LoadFieldOwner(field, method, locals);
                 if (PrimitiveFieldReadRecovery.IsWholeValueField(field.Field))
                     instructions.Add(CilOpCodes.Ldobj, field.Field.FieldType.ToTypeSignature().ToTypeDefOrRef());
                 else if (CollectionFieldReadRecovery.TryGetGetter(field.Field, method) is { } getter)
