@@ -126,6 +126,7 @@ internal static class Arm64SwitchRecognizer
         var tableAdd = words[loadIndex - 2];
         int pageIndex;
         bool copiedSelector;
+        uint? maskedCopy = null;
         int comparedRegister;
         ulong tableAddress;
         if (loadIndex >= 6 && (tableAdd & 0xFFC00000) == 0x91000000 && (tableAdd & 31) == table && ((tableAdd >> 5) & 31) == table)
@@ -135,6 +136,14 @@ internal static class Arm64SwitchRecognizer
             comparedRegister = copiedSelector ? (int)((copy >> 16) & 31) : selector;
             // ADRP executes before the copy, so it must not overwrite the compared value.
             if (copiedSelector && (comparedRegister == table || comparedRegister == 31)) return null;
+            // The index masked again from the value the guard's register was masked from (AND X8,X0,#0xFF
+            // after AND W9,W0,#0xFF; CMP W9,#3): the compared register is known once the compare is found.
+            if (!copiedSelector && IsMaskedIndex(copy, selector))
+            {
+                copiedSelector = true;
+                maskedCopy = copy;
+                comparedRegister = -1;
+            }
             pageIndex = loadIndex - (copiedSelector ? 4 : 3);
             var page = words[pageIndex];
             if ((page & 0x9F000000) != 0x90000000 || (page & 31) != table) return null;
@@ -163,11 +172,24 @@ internal static class Arm64SwitchRecognizer
         var guard = words[guardIndex];
         var condition = guard & 15;
         if ((guard & 0xFF000010) != 0x54000000 || condition is not (8 or 2)) return null; // HI / HS
-        var compare = words[guardIndex - 1];
-        if ((compare & 0xFFC0001F) != 0x7100001F || ((compare >> 5) & 31) != comparedRegister) return null;
+        // Flag-preserving loads, stores and moves may sit between the compare and its branch (the compiler
+        // sinks an unrelated increment there), as long as they leave the compared and index registers alone.
+        var compareIndex = guardIndex - 1;
+        while (compareIndex > 1 && guardIndex - compareIndex < 4 && (words[compareIndex] & 0xFFC0001F) != 0x7100001F
+            && IsIndependent(words[compareIndex]) && (words[compareIndex] & 31) != selector && (words[compareIndex] & 31) != comparedRegister)
+            compareIndex--;
+        var compare = words[compareIndex];
+        int? maskedDefinition = null;
+        if (maskedCopy is { } masked)
+        {
+            if ((compare & 0xFFC0001F) != 0x7100001F
+                || (maskedDefinition = MaskedFromSameValue(words, compareIndex, loadIndex - 3, (int)((compare >> 5) & 31), masked)) == null)
+                return null;
+        }
+        else if ((compare & 0xFFC0001F) != 0x7100001F || ((compare >> 5) & 31) != comparedRegister) return null;
         // The X-index form requires proven zero upper bits, not just a W compare.
         // W ADD/SUB also proves this when normalizing a nonzero first case.
-        var proofStartIndex = guardIndex - 1;
+        var proofStartIndex = compareIndex;
         if (!copiedSelector)
         {
             proofStartIndex--;
@@ -181,6 +203,8 @@ internal static class Arm64SwitchRecognizer
             if ((definition & 31) != selector || (definition & 0xFFC00000) is not (0xB9400000 or 0x39400000 or 0x79400000)
                 && (definition & 0xFF800000) is not (0x11000000 or 0x51000000)) return null;
         }
+        // Nothing may branch in between the two masks either.
+        if (maskedDefinition is { } maskStart) proofStartIndex = maskStart;
         var count = (int)((compare >> 10) & 0xFFF) + (condition == 8 ? 1 : 0);
         if (count is < 2 or > 4096) return null;
         var defaultTarget = unchecked((ulong)((long)start + guardIndex * 4 + ConditionalOffset(guard)));
@@ -203,6 +227,32 @@ internal static class Arm64SwitchRecognizer
         }
         return candidate;
     }
+
+    // AND Xd,Xn,#(2^k - 1): the low k bits of Xn, k < 32, so the upper half is zero.
+    private static bool IsMaskedIndex(uint word, int selector) => (word & 0xFFC00000) == 0x92400000 && (word & 31) == selector
+        && ((word >> 16) & 63) == 0 && ((word >> 10) & 63) < 31 && ((word >> 5) & 31) != 31;
+
+    // The compared W register is AND Wc,Wn,#mask of the same Xn and mask as the index, defined shortly before the
+    // compare, and nothing up to the index's AND writes Xn or Wc (loads, stores and moves of other registers only).
+    private static int? MaskedFromSameValue(uint[] words, int compareIndex, int indexAnd, int compared, uint masked)
+    {
+        var source = (int)((masked >> 5) & 31);
+        var fields = (masked >> 10) & 0xFFF; // immr:imms
+        var definition = compareIndex - 1;
+        while (definition > 0 && compareIndex - definition < 8 && (words[definition] & 31) != compared && IsIndependent(words[definition]))
+            definition--;
+        var word = words[definition];
+        if ((word & 0xFFC00000) != 0x12000000 || (word & 31) != compared || ((word >> 5) & 31) != source
+            || ((word >> 10) & 0xFFF) != fields || compared == source)
+            return null;
+        for (var i = definition + 1; i < indexAnd; i++)
+            if ((words[i] & 31) == source && !IsStoreOrBranch(words[i]))
+                return null;
+        return definition;
+    }
+
+    // STR/STRB/STRH (unsigned offset) and B.cond: their low five bits name a register they read, or a condition.
+    private static bool IsStoreOrBranch(uint word) => (word & 0x3FC00000) == 0x39000000 || (word & 0xFF000010) == 0x54000000;
 
     private static bool IsSelectorCopy(uint word, int selector) => (word & 0xFFE0FFE0) == 0x2A0003E0 && (word & 31) == selector; // MOV Wd,Wm
 
