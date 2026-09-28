@@ -166,17 +166,17 @@ public static class InlinedListAddRecovery
     }
 
     // Register arithmetic left over from the inlined body, such as the element's address.
-    private static bool IsArithmetic(Instruction instruction)
+    internal static bool IsArithmetic(Instruction instruction)
         => instruction is { OpCode: OpCode.Move or OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.ShiftLeft
                or OpCode.ShiftRight or OpCode.ConvertNumeric or OpCode.ZeroExtend or OpCode.SignExtend, Destination: LocalVariable }
            && instruction.Operands.Skip(1).All(o => o is LocalVariable or Immediate);
 
-    private static Instruction? Definition(List<Instruction> instructions, LocalVariable local) => instructions.LastOrDefault(i => i.Destination == local);
+    internal static Instruction? Definition(List<Instruction> instructions, LocalVariable local) => instructions.LastOrDefault(i => i.Destination == local);
 
-    private static bool Loads(List<Instruction> instructions, LocalVariable local, LocalVariable list, string field)
+    internal static bool Loads(List<Instruction> instructions, LocalVariable local, LocalVariable list, string field)
         => Definition(instructions, local) is { OpCode: OpCode.Move, Operands: [_, FieldReference f] } && IsListField(f, list, field);
 
-    private static bool IsListField(FieldReference reference, LocalVariable list, string name)
+    internal static bool IsListField(FieldReference reference, LocalVariable list, string name)
     {
         if (reference.IsNested || reference.Local != list)
             return false;
@@ -191,6 +191,6 @@ public static class InlinedListAddRecovery
         => type is { FullName: "System.Collections.Generic.List`1" }
            && type.DeclaringAssembly == type.AppContext.SystemTypes.SystemObjectType.DeclaringAssembly;
 
-    private static bool Same(IOperand left, IOperand right) => ReferenceEquals(left, right)
+    internal static bool Same(IOperand left, IOperand right) => ReferenceEquals(left, right)
         || left is Immediate l && right is Immediate r && Equals(l.Value, r.Value);
 }
