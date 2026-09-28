@@ -1050,7 +1050,10 @@ public static class IlGenerator
                 if (!targetMethod.IsVoid)
                 {
                     if (instruction.OpCode == OpCode.Call)
+                    {
+                        ConvertUniTaskToAwaiter(targetMethod.ReturnType, instruction.Operands[1], method);
                         StoreToOperand(instruction.Operands[1], method, locals, writeLine);
+                    }
                     else
                         instructions.Add(CilOpCodes.Pop);
                 }
@@ -1826,6 +1829,33 @@ public static class IlGenerator
         && DestinationType(address.Target) is { } actual
         && actual.FullName == expected.FullName && actual.DeclaringAssembly == expected.DeclaringAssembly
             ? address.Target : operand;
+
+    /// <summary>
+    /// A UniTask stored where native code keeps its awaiter, as an async method does with the task an awaited
+    /// call returns, is task.GetAwaiter(): the awaiter's only field is the task. Converts the value on the stack.
+    /// </summary>
+    private static void ConvertUniTaskToAwaiter(TypeAnalysisContext? value, IOperand destination, MethodDefinition method)
+    {
+        var target = destination is AddressOf { Target: LocalVariable buffer } ? buffer.Type : DestinationType(destination);
+        var task = (value as GenericInstanceTypeAnalysisContext)?.GenericType ?? value;
+        var awaiter = (target as GenericInstanceTypeAnalysisContext)?.GenericType ?? target;
+        if (value == null || target == null || task is not { FullName: "Cysharp.Threading.Tasks.UniTask" or "Cysharp.Threading.Tasks.UniTask`1" }
+            || awaiter is not { Name: "Awaiter" } || awaiter.DeclaringType != task
+            || (value is GenericInstanceTypeAnalysisContext) != (target is GenericInstanceTypeAnalysisContext)
+            || value is GenericInstanceTypeAnalysisContext v && target is GenericInstanceTypeAnalysisContext t
+               && !v.GenericArguments.Select(a => a.FullName).SequenceEqual(t.GenericArguments.Select(a => a.FullName))
+            || task.Methods.SingleOrDefault(m => m is { Name: "GetAwaiter", IsStatic: false, Parameters.Count: 0 }) is not { } getAwaiter)
+            return;
+
+        var call = value is GenericInstanceTypeAnalysisContext instance
+            ? new ConcreteGenericMethodAnalysisContext(getAwaiter, instance.GenericArguments, [])
+            : getAwaiter;
+        var temporary = new CilLocalVariable(value.ToTypeSignature());
+        method.CilMethodBody!.LocalVariables.Add(temporary);
+        method.CilMethodBody.Instructions.Add(CilOpCodes.Stloc, temporary);
+        method.CilMethodBody.Instructions.Add(CilOpCodes.Ldloca, temporary);
+        method.CilMethodBody.Instructions.Add(CilOpCodes.Call, call.ToMethodDescriptor());
+    }
 
     private static TypeAnalysisContext? DestinationType(IOperand destination) =>
         destination switch
