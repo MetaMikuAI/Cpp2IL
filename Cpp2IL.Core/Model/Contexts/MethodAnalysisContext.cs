@@ -589,6 +589,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         InitialZeroStoreElimination.Run(this);
         // And a struct field cleared member by member elsewhere.
         MemberwiseZeroStoreMerging.Run(this);
+        // A member store the whole field's store right after overwrites.
+        if (OverwrittenMemberStoreElimination.Run(this))
+            DeadCodeEliminator.Run(this);
 
         LocalVariables.RemoveUnused(this);
     }
