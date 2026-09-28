@@ -1571,6 +1571,10 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Ldc_I4_0);
                 instructions.Add(CilOpCodes.Conv_I);
                 break;
+            // A type's handle, e.g. the one GetTypeFromHandle takes: the token itself, not typeof(T) again.
+            case TypeAnalysisContext handleType when expectedType?.FullName == "System.RuntimeTypeHandle":
+                instructions.Add(CilOpCodes.Ldtoken, handleType.ToTypeSignature().ToTypeDefOrRef());
+                break;
             case TypeAnalysisContext type:
                 //typeof(T)
                 var corLibScope = module.CorLibTypeFactory.CorLibScope;

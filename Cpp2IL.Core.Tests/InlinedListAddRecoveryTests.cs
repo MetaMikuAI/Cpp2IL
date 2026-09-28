@@ -20,6 +20,8 @@ public class InlinedListAddRecoveryTests
     [TestCase("return", true)]
     [TestCase("splitHead", true)]
     [TestCase("lengthLocal", true)]
+    [TestCase("phi", true)]
+    [TestCase("phiDiffers", false)]
     [TestCase("otherItem", false)]
     [TestCase("sizeUsedLater", false)]
     [TestCase("foreignList", false)]
@@ -87,6 +89,15 @@ public class InlinedListAddRecoveryTests
 
         // As by metadata resolution, before this runs.
         method.ControlFlowGraph.MergeCallBlocks();
+        var merged = Local("merged", app.SystemTypes.SystemStringType);
+        if (shape is "phi" or "phiDiffers")
+        {
+            // A loop-carried value at the join, as at a loop header.
+            var join = method.ControlFlowGraph.Blocks.Single(b => b.Instructions.Contains(end));
+            var inputs = join.Predecessors.Select(p => (IOperand)(shape == "phiDiffers" && p.Instructions.Contains(slowCall) ? other : item)).ToList();
+            join.Instructions.Insert(0, new Instruction(12, OpCode.Phi, [merged, .. inputs]));
+            end.SetOperands(merged);
+        }
 
         Assert.That(InlinedListAddRecovery.Run(method), Is.EqualTo(recovered));
 
@@ -103,5 +114,9 @@ public class InlinedListAddRecoveryTests
         Assert.That(((ConcreteGenericMethodAnalysisContext)add.Operands[0]).TypeGenericParameters, Is.EqualTo(new[] { app.SystemTypes.SystemStringType }));
         Assert.That(remaining.Any(i => i.Operands.Any(o => o is FieldReference or ArrayAccess)), Is.False, "the inlined body and its loads are gone");
         Assert.That(remaining.Count(i => i.OpCode == OpCode.Return), Is.EqualTo(1));
+        foreach (var block in method.ControlFlowGraph.Blocks)
+            Assert.That(block.Instructions.Where(i => i.OpCode == OpCode.Phi).All(i => i.Operands.Count == block.Predecessors.Count + 1), "phis stay aligned with predecessors");
+        if (shape == "phi")
+            Assert.That(remaining.Single(i => i.OpCode == OpCode.Phi).Operands.Skip(1), Is.EqualTo(new IOperand[] { item }));
     }
 }

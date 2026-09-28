@@ -101,23 +101,21 @@ public static class InlinedListAddRecovery
 
         // Both arms continue alike: to one block, or by returning the same value.
         Instruction continuation;
-        List<Block> next;
         if (fast.Successors is [var join] && slow.Successors is [var slowJoin] && join == slowJoin && join != graph.ExitBlock
-            && fastRest.All(i => i.OpCode == OpCode.Jump) && slowRest.All(i => i.OpCode == OpCode.Jump)
-            && !join.Instructions.Any(i => i.OpCode == OpCode.Phi))
-        {
+            && fastRest.All(i => i.OpCode == OpCode.Jump) && slowRest.All(i => i.OpCode == OpCode.Jump))
             continuation = new Instruction(-1, OpCode.Jump, join);
-            next = [join];
-        }
         else if (fastRest is [{ OpCode: OpCode.Return } fastReturn] && slowRest is [{ OpCode: OpCode.Return } slowReturn]
                  && fastReturn.Operands.Count == slowReturn.Operands.Count
                  && fastReturn.Operands.Zip(slowReturn.Operands).All(p => Same(p.First, p.Second))
                  && fast.Successors.SequenceEqual(slow.Successors))
-        {
             continuation = new Instruction(-1, OpCode.Return, fastReturn.Operands.ToList());
-            next = fast.Successors.ToList();
-        }
         else
+            return false;
+
+        // A join's phis, as at a loop header, take the same value from either arm.
+        var next = fast.Successors.ToList();
+        if (next.Any(s => s.Instructions.Any(i => i.OpCode == OpCode.Phi
+                && !Same(i.Operands[s.Predecessors.IndexOf(fast) + 1], i.Operands[s.Predecessors.IndexOf(slow) + 1]))))
             return false;
 
         var add = Add(resize);
@@ -132,20 +130,23 @@ public static class InlinedListAddRecovery
         branch.NativeAddress = call.NativeAddress;
         head.Instructions.Add(continuation);
 
+        // The head takes the fast arm's place at the join; the slow arm's edge goes.
+        foreach (var successor in next)
+        {
+            successor.Predecessors[successor.Predecessors.IndexOf(fast)] = head;
+            var slowIndex = successor.Predecessors.IndexOf(slow);
+            foreach (var phi in successor.Instructions.Where(i => i.OpCode == OpCode.Phi))
+                phi.RemoveOperandAt(slowIndex + 1);
+            successor.Predecessors.RemoveAt(slowIndex);
+        }
         foreach (var arm in new[] { fast, slow })
         {
-            foreach (var successor in arm.Successors)
-                successor.Predecessors.Remove(arm);
             arm.Successors.Clear();
             arm.Predecessors.Clear();
             graph.Blocks.Remove(arm);
         }
         head.Successors.Clear();
-        foreach (var successor in next)
-        {
-            head.Successors.Add(successor);
-            successor.Predecessors.Add(head);
-        }
+        head.Successors.AddRange(next);
         head.CalculateBlockType();
         return true;
     }
