@@ -522,6 +522,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         retryInterfaceCleanup?.Invoke(final: true);
         retryResolvedInterfaceCleanup?.Invoke(final: true);
 
+        // Reads of a floating-point aggregate's registers after the call returning it.
+        HfaArgumentRecovery.Run(this);
+
         // Inlined List<T>.Add, once its fields are resolved.
         InlinedListAddRecovery.Run(this);
         InlinedListClearRecovery.Run(this);

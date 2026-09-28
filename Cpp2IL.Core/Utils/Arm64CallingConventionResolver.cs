@@ -55,6 +55,9 @@ public class Arm64CallingConventionResolver : BaseCallingConventionResolver
     protected override int IntegerArgumentSlots(ParameterAnalysisContext parameter)
         => IntegerArgumentSlots(parameter.ParameterType);
 
+    protected override int FloatArgumentRegisters(ParameterAnalysisContext parameter)
+        => FloatingAggregateFields(parameter.ParameterType) is { Length: > 0 } fields ? fields.Length : base.FloatArgumentRegisters(parameter);
+
     internal static int IntegerArgumentSlots(TypeAnalysisContext type)
         => IntegerCompositeRegisters(type) is { Length: 2 } || IsTwoRegisterGenericComposite(type) ? 2 : 1;
 

@@ -34,6 +34,10 @@ public abstract class BaseCallingConventionResolver
 
     protected virtual int IntegerArgumentSlots(ParameterAnalysisContext parameter) => 1;
 
+    // The floating-point registers a parameter takes: one for a float or double, or one per member of a
+    // homogeneous floating-point aggregate where the convention passes those in them.
+    protected virtual int FloatArgumentRegisters(ParameterAnalysisContext parameter) => IsFloatingPoint(parameter) ? 1 : 0;
+
     public IOperand[] ResolveForUnmanaged(ApplicationAnalysisContext app, ulong target)
     {
         var (integerRegisters, floatRegisters) = RawRegisters(app);
@@ -82,7 +86,9 @@ public abstract class BaseCallingConventionResolver
         if (!resolved.IsStatic)
             slots.Add((false, true, 1));
         foreach (var parameter in resolved.Parameters)
-            slots.Add((IsFloatingPoint(parameter), true, IntegerArgumentSlots(parameter)));
+            slots.Add(FloatArgumentRegisters(parameter) is > 0 and var registers
+                ? (true, true, registers)
+                : (false, true, IntegerArgumentSlots(parameter)));
         slots.Add((false, true, 1)); // the MethodInfo argument
 
         var operands = new List<IOperand>(argBase + slots.Count);
@@ -102,11 +108,13 @@ public abstract class BaseCallingConventionResolver
 
             foreach (var (isFloat, emit, count) in slots)
             {
-                if (isFloat ? floating >= floatRegisters.Length : integer + count > integerRegisters.Length)
+                if (isFloat ? floating + count > floatRegisters.Length : integer + count > integerRegisters.Length)
                     break;
 
+                // An aggregate spanning several registers is passed as its first; HfaArgumentRecovery
+                // replaces it with the aggregate it comes from.
                 var operand = call.Operands[argBase + (isFloat ? integerRegisters.Length + floating : integer)];
-                if (isFloat) floating++;
+                if (isFloat) floating += count;
                 else integer += count;
                 if (emit)
                     operands.Add(operand);
