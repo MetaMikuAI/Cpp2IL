@@ -40,6 +40,7 @@ public static class IlGenerator
 
     public static void GenerateIl(MethodAnalysisContext context, MethodDefinition definition)
     {
+        BindGenericCallResults(context);
         SingleFieldConstructorRecovery.Run(context);
         RedundantFieldStoreElimination.Run(context);
         IteratorCurrentStoreOrdering.Run(context);
@@ -841,6 +842,7 @@ public static class IlGenerator
                     // Operands run [ctor, newObject, arguments..., methodInfo], so take only as many as
                     // the constructor declares (i.e. drop methodInfo)
                     var constructorArgs = constructorCall.Operands.Skip(ConstructorReceiverIndex(constructorCall) + 1).Take(constructor.Parameters.Count).ToList();
+                    BindDelegateTarget(constructor, constructorArgs);
                     for (var i = 0; i < constructorArgs.Count; i++)
                         LoadArgument(ManagedValueArgument(constructorArgs[i], constructor.Parameters[i].ParameterType),
                             method, locals, writeLine, constructor.Parameters[i].ParameterType);
@@ -990,6 +992,9 @@ public static class IlGenerator
                 if (context is { Name: ".ctor", IsStatic: false, DeclaringType: { } constructed } && targetMethod.Name == ".ctor"
                     && thisParamIndex < instruction.Operands.Count && instruction.Operands[thisParamIndex] is LocalVariable { IsThis: true })
                     targetMethod = ForwardingConstructorRecovery.ResolveBaseCall(constructed, targetMethod) ?? targetMethod;
+
+                if (!targetMethod.IsStatic && thisParamIndex < instruction.Operands.Count)
+                    targetMethod = BindReceiverType(targetMethod, DestinationType(instruction.Operands[thisParamIndex]));
 
                 var importedMethod = targetMethod.ToMethodDescriptor();
 
@@ -1693,6 +1698,83 @@ public static class IlGenerator
             case "System.Double": instructions.Add(CilOpCodes.Ldc_R8, 0d); break;
             case "System.Int64" or "System.UInt64": instructions.Add(CilOpCodes.Ldc_I8, 0L); break;
             default: instructions.Add(CilOpCodes.Ldc_I4_0); break;
+        }
+    }
+
+    private static void BindDelegateTarget(MethodAnalysisContext constructor, List<IOperand> arguments)
+    {
+        if (constructor is not { Name: ".ctor", IsStatic: false, DeclaringType.IsDelegate: true }
+            || constructor.Parameters is not [{ ParameterType.FullName: "System.Object" }, { ParameterType.FullName: "System.IntPtr" }]
+            || arguments is not [var receiver, RuntimeMethodInfoAnalysisContext { RepresentedMethod.IsStatic: false } methodInfo])
+            return;
+
+        var bound = BindReceiverType(methodInfo.RepresentedMethod, DestinationType(receiver));
+        if (bound != methodInfo.RepresentedMethod)
+            arguments[1] = new RuntimeMethodInfoAnalysisContext(bound, methodInfo.DeclaringAssembly);
+    }
+
+    private static MethodAnalysisContext BindReceiverType(MethodAnalysisContext target, TypeAnalysisContext? receiver)
+    {
+        // A resolved native entry point can name the generic definition even when the
+        // receiver carries its type arguments. Keep those arguments on the managed call.
+        if (target is ConcreteGenericMethodAnalysisContext || target.GenericParameters.Count != 0
+            || target.DeclaringType is not { GenericParameters.Count: > 0 } declaringType)
+            return target;
+
+        if (receiver is ByRefTypeAnalysisContext byRef)
+            receiver = byRef.ElementType;
+
+        HashSet<TypeAnalysisContext> visited = [];
+        Stack<TypeAnalysisContext> pending = [];
+        if (receiver != null)
+            pending.Push(receiver);
+        GenericInstanceTypeAnalysisContext? matched = null;
+        while (pending.Count != 0)
+        {
+            var candidate = pending.Pop();
+            if (!visited.Add(candidate))
+                continue;
+            if (candidate is GenericInstanceTypeAnalysisContext instance && instance.GenericType == declaringType
+                && instance.GenericArguments.Count == declaringType.GenericParameters.Count)
+            {
+                if (matched != null && !matched.GenericArguments.SequenceEqual(instance.GenericArguments))
+                    return target;
+                matched = instance;
+            }
+            // A constrained receiver's declared bounds carry the same type arguments
+            // as an ordinary receiver. Conflicting instantiations remain unresolved.
+            if (candidate is GenericParameterTypeAnalysisContext parameter)
+                foreach (var constraint in parameter.ConstraintTypes)
+                    pending.Push(constraint);
+            if (candidate.BaseType is { } baseType)
+                pending.Push(baseType);
+        }
+
+        return matched == null ? target : new ConcreteGenericMethodAnalysisContext(target, matched.GenericArguments, []);
+    }
+
+    private static void BindGenericCallResults(MethodAnalysisContext context)
+    {
+        var instructions = context.ControlFlowGraph!.Instructions.ToList();
+        foreach (var instruction in instructions)
+        {
+            if (!instruction.IsCall || instruction.Operands[0] is not MethodAnalysisContext { IsStatic: false } target)
+                continue;
+            var receiverIndex = instruction.OpCode == OpCode.Call ? 2 : 1;
+            if (instruction.Operands.Count <= receiverIndex)
+                continue;
+            var bound = BindReceiverType(target, DestinationType(instruction.Operands[receiverIndex]));
+            if (bound == target)
+                continue;
+
+            instruction.SetOperand(0, bound);
+            // A merged local may hold values from several paths. Only specialize a
+            // single-definition result whose type still is the callee's open return type.
+            if (instruction.OpCode == OpCode.Call && instruction.Operands[1] is LocalVariable result
+                && !result.IsThis && !context.ParameterLocals.Contains(result)
+                && result.Type == target.ReturnType && bound.ReturnType != target.ReturnType
+                && instructions.Count(i => i.Destination == result) == 1)
+                result.Type = bound.ReturnType;
         }
     }
 

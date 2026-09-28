@@ -15,6 +15,88 @@ namespace Cpp2IL.Core.Tests;
 
 public class IlGeneratorTests
 {
+    [TestCase("exact", true, true)]
+    [TestCase("inherited", true, true)]
+    [TestCase("unrelated", false, false)]
+    [TestCase("multiple", true, false)]
+    [TestCase("resultMismatch", true, false)]
+    [TestCase("constraint", true, true)]
+    [TestCase("ambiguousConstraint", false, false)]
+    public void GenericReceiverCall_BindsOnlyProvenResult(string kind, bool boundCall, bool boundResult)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var generic = new InjectedTypeAnalysisContext(app.SystemTypes.SystemObjectType.DeclaringAssembly,
+            "Tests", "Pool`1", app.SystemTypes.SystemObjectType, System.Reflection.TypeAttributes.Public);
+        var parameter = new GenericParameterTypeAnalysisContext("T", 0,
+            LibCpp2IL.BinaryStructures.Il2CppTypeEnum.IL2CPP_TYPE_VAR, System.Reflection.GenericParameterAttributes.None, generic);
+        generic.GenericParameters.Add(parameter);
+        var instance = new GenericInstanceTypeAnalysisContext(generic, [app.SystemTypes.SystemInt32Type]);
+        TypeAnalysisContext receiverType = kind switch
+        {
+            "unrelated" => app.SystemTypes.SystemObjectType,
+            "inherited" => new InjectedTypeAnalysisContext(generic.DeclaringAssembly, "Tests", "Derived", instance, System.Reflection.TypeAttributes.Public),
+            _ => instance,
+        };
+        var target = generic.InjectMethodContext("Get", parameter, ReflectionMethodAttributes.Public);
+        var receiver = new LocalVariable("receiver", new Register(null, "receiver"), receiverType);
+        var resultType = kind == "resultMismatch" ? app.SystemTypes.SystemObjectType : parameter;
+        var result = new LocalVariable("result", new Register(null, "result"), resultType);
+        var instructions = new List<Instruction> { new(0, OpCode.Call, target, result, receiver) };
+        if (kind == "multiple")
+            instructions.Add(new Instruction(1, OpCode.Move, result, Imm(0)));
+        instructions.Add(new Instruction(2, OpCode.Return));
+        var caller = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Caller", app.SystemTypes.SystemVoidType,
+            ReflectionMethodAttributes.Public | ReflectionMethodAttributes.Static, [])
+        {
+            Locals = [receiver, result], ParameterLocals = [],
+            ControlFlowGraph = new ISILControlFlowGraph(instructions),
+        };
+        if (kind is "constraint" or "ambiguousConstraint")
+        {
+            var receiverParameter = new GenericParameterTypeAnalysisContext("TReceiver", 0,
+                LibCpp2IL.BinaryStructures.Il2CppTypeEnum.IL2CPP_TYPE_MVAR, System.Reflection.GenericParameterAttributes.None, caller);
+            receiverParameter.ConstraintTypes.Add(instance);
+            if (kind == "ambiguousConstraint")
+                receiverParameter.ConstraintTypes.Add(new GenericInstanceTypeAnalysisContext(generic, [app.SystemTypes.SystemObjectType]));
+            caller.GenericParameters.Add(receiverParameter);
+            receiver.Type = receiverType = receiverParameter;
+        }
+        var module = new ModuleDefinition("GenericReceiver.dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        foreach (var context in new[] { app.SystemTypes.SystemObjectType, app.SystemTypes.SystemInt32Type, generic, receiverType }.Distinct())
+        {
+            var typeDefinition = new TypeDefinition(context.Namespace, context.Name, TypeAttributes.Public);
+            module.TopLevelTypes.Add(typeDefinition);
+            context.PutExtraData("AsmResolverType", typeDefinition);
+        }
+        var genericDefinition = generic.GetExtraData<TypeDefinition>("AsmResolverType")!;
+        genericDefinition.GenericParameters.Add(new GenericParameter("T"));
+        var targetDefinition = new MethodDefinition("Get", MethodAttributes.Public,
+            MethodSignature.CreateInstance(new GenericParameterSignature(GenericParameterType.Type, 0)));
+        genericDefinition.Methods.Add(targetDefinition);
+        target.PutExtraData("AsmResolverMethod", targetDefinition);
+        var generated = new MethodDefinition("Caller", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void));
+        if (caller.GenericParameters.Count != 0)
+            generated.GenericParameters.Add(new GenericParameter("TReceiver"));
+        app.SystemTypes.SystemObjectType.GetExtraData<TypeDefinition>("AsmResolverType")!.Methods.Add(generated);
+
+        IlGenerator.GenerateIl(caller, generated);
+
+        var call = generated.CilMethodBody!.Instructions.Single(i => i.OpCode == CilOpCodes.Call || i.OpCode == CilOpCodes.Callvirt);
+        Assert.That(generated.CilMethodBody.Instructions.Any(i => i.OpCode == CilOpCodes.Constrained),
+            Is.EqualTo(kind is "constraint" or "ambiguousConstraint"));
+        Assert.That(call.Operand is MemberReference, Is.EqualTo(boundCall));
+        if (boundCall)
+        {
+            var declaring = ((IMethodDescriptor)call.Operand!).DeclaringType!.ToTypeSignature(null);
+            Assert.That(declaring, Is.TypeOf<GenericInstanceTypeSignature>());
+            Assert.That(((GenericInstanceTypeSignature)declaring).TypeArguments[0].FullName, Is.EqualTo("System.Int32"));
+        }
+        Assert.That(result.Type, Is.SameAs(boundResult ? app.SystemTypes.SystemInt32Type : resultType));
+        Assert.That(generated.CilMethodBody.LocalVariables[1].VariableType.FullName,
+            Is.EqualTo(boundResult ? "System.Int32" : kind == "resultMismatch" ? "System.Object" : "!0"));
+    }
+
     [SetUp]
     public void Setup()
     {
@@ -508,6 +590,67 @@ public class IlGeneratorTests
 
         Assert.That(il.Count(i => i.OpCode == CilOpCodes.Newobj && i.Operand == fixture.ConstructorDefinition), Is.EqualTo(1));
         Assert.That(il.Count(i => i.OpCode == CilOpCodes.Call && i.Operand == otherDefinition), Is.EqualTo(1));
+    }
+
+    [TestCase("exact", true)]
+    [TestCase("unrelated", false)]
+    [TestCase("nonDelegate", false)]
+    [TestCase("badShape", false)]
+    [TestCase("static", false)]
+    [TestCase("null", false)]
+    public void DelegateMethodPointer_BindsOnlyMatchingInstanceConstructor(string kind, bool expectBound)
+    {
+        var fixture = new AllocationFixture();
+        var app = Cpp2IlApi.CurrentAppContext!;
+        if (kind != "nonDelegate")
+        {
+            fixture.Allocated.OverrideBaseType = app.AllTypes.Single(t => t.FullName == "System.MulticastDelegate");
+            fixture.Type.BaseType = fixture.Module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", "MulticastDelegate");
+        }
+        var generic = new InjectedTypeAnalysisContext(fixture.Allocated.DeclaringAssembly, "Tests", "Owner`1",
+            app.SystemTypes.SystemObjectType, System.Reflection.TypeAttributes.Public);
+        var parameter = new GenericParameterTypeAnalysisContext("T", 0,
+            LibCpp2IL.BinaryStructures.Il2CppTypeEnum.IL2CPP_TYPE_VAR, System.Reflection.GenericParameterAttributes.None, generic);
+        generic.GenericParameters.Add(parameter);
+        var instance = new GenericInstanceTypeAnalysisContext(generic, [app.SystemTypes.SystemInt32Type]);
+        var target = generic.InjectMethodContext("Get", parameter,
+            ReflectionMethodAttributes.Public | (kind == "static" ? ReflectionMethodAttributes.Static : 0));
+        var genericDefinition = new TypeDefinition("Tests", "Owner`1", TypeAttributes.Public);
+        fixture.Module.TopLevelTypes.Add(genericDefinition);
+        genericDefinition.GenericParameters.Add(new GenericParameter("T"));
+        generic.PutExtraData("AsmResolverType", genericDefinition);
+        var targetDefinition = new MethodDefinition("Get", MethodAttributes.Public | (kind == "static" ? MethodAttributes.Static : 0),
+            kind == "static" ? MethodSignature.CreateStatic(new GenericParameterSignature(GenericParameterType.Type, 0))
+                : MethodSignature.CreateInstance(new GenericParameterSignature(GenericParameterType.Type, 0)));
+        genericDefinition.Methods.Add(targetDefinition);
+        target.PutExtraData("AsmResolverMethod", targetDefinition);
+        var objectDefinition = new TypeDefinition("System", "Object", TypeAttributes.Public);
+        fixture.Module.TopLevelTypes.Add(objectDefinition);
+        app.SystemTypes.SystemObjectType.PutExtraData("AsmResolverType", objectDefinition);
+        var (constructor, constructorDefinition) = fixture.AddConstructor(
+            (kind == "badShape" ? app.SystemTypes.SystemInt32Type : app.SystemTypes.SystemObjectType,
+                kind == "badShape" ? fixture.Module.CorLibTypeFactory.Int32 : fixture.Module.CorLibTypeFactory.Object),
+            (app.SystemTypes.SystemIntPtrType, fixture.Module.CorLibTypeFactory.IntPtr));
+        var receiver = new LocalVariable("receiver", new Register(null, "receiver"),
+            kind == "unrelated" ? app.SystemTypes.SystemObjectType : instance);
+        var created = new LocalVariable("created", new Register(null, "created"), fixture.Allocated);
+        var methodInfo = new RuntimeMethodInfoAnalysisContext(target, fixture.Allocated.DeclaringAssembly);
+        var il = fixture.Generate([
+            new Instruction(0, OpCode.Newobj, created, fixture.Allocated),
+            new Instruction(1, OpCode.CallVoid, constructor, created, kind == "null" ? Imm(0) : receiver, methodInfo),
+            new Instruction(2, OpCode.Return, created)], created, receiver);
+
+        var pointer = il.Single(i => i.OpCode == CilOpCodes.Ldftn);
+        Assert.That(pointer.Operand is MemberReference, Is.EqualTo(expectBound));
+        if (expectBound)
+        {
+            var declaring = ((IMethodDescriptor)pointer.Operand!).DeclaringType!.ToTypeSignature(null);
+            Assert.That(declaring, Is.TypeOf<GenericInstanceTypeSignature>());
+            Assert.That(((GenericInstanceTypeSignature)declaring).TypeArguments[0].FullName, Is.EqualTo("System.Int32"));
+        }
+        else
+            Assert.That(pointer.Operand, Is.SameAs(targetDefinition));
+        Assert.That(il.Count(i => i.OpCode == CilOpCodes.Newobj && i.Operand == constructorDefinition), Is.EqualTo(1));
     }
 
     private sealed class AllocationFixture
