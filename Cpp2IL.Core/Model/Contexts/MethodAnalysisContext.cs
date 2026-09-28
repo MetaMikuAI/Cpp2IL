@@ -585,6 +585,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         // Member-wise clearing of a stack struct that the zero-initialized IL local already holds.
         InitialZeroStoreElimination.Run(this);
+        // And a struct field cleared member by member elsewhere.
+        MemberwiseZeroStoreMerging.Run(this);
 
         LocalVariables.RemoveUnused(this);
     }
