@@ -8,6 +8,7 @@ using AsmResolver.DotNet;
 using AsmResolver.DotNet.Signatures;
 using AsmResolver.PE.DotNet.Cil;
 using AssetRipper.CIL;
+using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Extensions;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.Logging;
@@ -32,7 +33,17 @@ public class AsmResolverDllOutputFormatIlRecovery : AsmResolverDllOutputFormat
 
         IlGenerator.InjectHelpersType(context);
 
-        return base.BuildAssemblies(context);
+        var assemblies = base.BuildAssemblies(context);
+        // All bodies must exist before using a recovered getter as evidence.
+        foreach (var assembly in assemblies.Where(a => a.Name == "Assembly-CSharp"))
+        {
+            foreach (var module in assembly.Modules)
+            {
+                var recovered = ProvenGetterReadRecovery.Recover(module);
+                Logger.InfoNewline($"{module.Name}: {recovered.Getters} proven getters, {recovered.Reads} field reads recovered", "DllOutput");
+            }
+        }
+        return assemblies;
     }
 
     protected override void FillMethodBody(MethodDefinition methodDefinition, MethodAnalysisContext methodContext)
