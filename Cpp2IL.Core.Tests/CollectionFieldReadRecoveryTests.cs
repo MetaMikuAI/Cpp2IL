@@ -13,6 +13,66 @@ namespace Cpp2IL.Core.Tests;
 
 public class CollectionFieldReadRecoveryTests
 {
+    [TestCase("System.Collections.Generic.KeyValuePair`2", "key", "Key")]
+    [TestCase("System.Collections.Generic.KeyValuePair`2", "value", "Value")]
+    [TestCase("System.Collections.Generic.Dictionary`2+Enumerator", "_current", "Current")]
+    [TestCase("System.Collections.Generic.Dictionary`2+KeyCollection+Enumerator", "_currentKey", "Current")]
+    [TestCase("System.Collections.Generic.Dictionary`2+ValueCollection+Enumerator", "_currentValue", "Current")]
+    [TestCase("System.Collections.Generic.Queue`1", "_size", "Count")]
+    [TestCase("System.Collections.Generic.Stack`1", "_size", "Count")]
+    [TestCase("System.Collections.Generic.HashSet`1", "_count", "Count")]
+    [TestCase("System.Collections.Generic.HashSet`1+Enumerator", "_current", "Current")]
+    public void FrameworkGetter_BindsActualMetadata(string typeName, string fieldName, string propertyName)
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        TypeAnalysisContext owner;
+        if (typeName is "System.Collections.Generic.Queue`1" or "System.Collections.Generic.Stack`1")
+        {
+            // These types are stripped from the fixture; use their verified Mono member shape.
+            owner = new InjectedTypeAnalysisContext(app.SystemTypes.SystemObjectType.DeclaringAssembly, "System.Collections.Generic", typeName.Split('.').Last(), app.SystemTypes.SystemObjectType, System.Reflection.TypeAttributes.Public);
+            owner.GenericParameters.Add(new GenericParameterTypeAnalysisContext("T", 0, LibCpp2IL.BinaryStructures.Il2CppTypeEnum.IL2CPP_TYPE_VAR, System.Reflection.GenericParameterAttributes.None, owner));
+            owner.Fields.Add(new InjectedFieldAnalysisContext(fieldName, app.SystemTypes.SystemInt32Type, System.Reflection.FieldAttributes.Private, owner));
+            var injectedGetter = new InjectedMethodAnalysisContext(owner, "get_Count", app.SystemTypes.SystemInt32Type, System.Reflection.MethodAttributes.Public, []);
+            owner.Properties.Add(new InjectedPropertyAnalysisContext("Count", app.SystemTypes.SystemInt32Type, injectedGetter, null, System.Reflection.PropertyAttributes.None, owner));
+        }
+        else
+            owner = app.AllTypes.Single(t => t.FullName == typeName);
+        var arguments = owner.GenericParameters.Select(_ => (TypeAnalysisContext)app.SystemTypes.SystemInt32Type).ToArray();
+        var instance = new GenericInstanceTypeAnalysisContext(owner, arguments);
+        var field = new ConcreteGenericFieldAnalysisContext(owner.Fields.Single(f => f.Name == fieldName), instance);
+        var getter = Cpp2IL.Core.Analysis.CollectionFieldReadRecovery.TryGetGetter(field, new MethodDefinition("Caller", MethodAttributes.Static, null));
+
+        Assert.That(getter, Is.TypeOf<ConcreteGenericMethodAnalysisContext>());
+        Assert.That(getter!.Name, Is.EqualTo("get_" + propertyName));
+        Assert.That(getter.ReturnType.FullName, Is.EqualTo(field.FieldType.FullName));
+        Assert.That(((ConcreteGenericMethodAnalysisContext)getter).TypeGenericParameters, Is.EqualTo(arguments));
+    }
+
+    [Test]
+    public void DictionaryCurrent_DifferentGenericArguments_IsNotRecovered()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var owner = app.AllTypes.Single(t => t.FullName == "System.Collections.Generic.Dictionary`2+Enumerator");
+        var getter = owner.Properties.Single(p => p.Name == "Current").Getter!;
+        var returnType = (GenericInstanceTypeAnalysisContext)getter.ReturnType;
+        var wrongArguments = returnType.GenericArguments.ToArray();
+        wrongArguments[0] = app.SystemTypes.SystemStringType;
+        getter.OverrideReturnType = new GenericInstanceTypeAnalysisContext(returnType.GenericType, wrongArguments);
+        var field = new ConcreteGenericFieldAnalysisContext(owner.Fields.Single(f => f.Name == "_current"),
+            new GenericInstanceTypeAnalysisContext(owner, [app.SystemTypes.SystemInt32Type, app.SystemTypes.SystemInt32Type]));
+        Assert.That(Cpp2IL.Core.Analysis.CollectionFieldReadRecovery.TryGetGetter(field, new MethodDefinition("Caller", MethodAttributes.Static, null)), Is.Null);
+    }
+
+    [Test]
+    public void HashSet_SameAssemblyNameWithoutIdentity_IsNotRecovered()
+    {
+        var app = Cpp2IlApi.CurrentAppContext!;
+        var other = new InjectedAssemblyAnalysisContext("System.Core", app);
+        var owner = new InjectedTypeAnalysisContext(other, "System.Collections.Generic", "HashSet`1", app.SystemTypes.SystemObjectType, System.Reflection.TypeAttributes.Public);
+        var field = new InjectedFieldAnalysisContext("_count", app.SystemTypes.SystemInt32Type, System.Reflection.FieldAttributes.Private, owner);
+        Assert.That(Cpp2IL.Core.Analysis.CollectionFieldReadRecovery.TryGetGetter(field, new MethodDefinition("Caller", MethodAttributes.Static, null)), Is.Null);
+    }
+
     [TestCase(false, "read")]
     [TestCase(false, "write")]
     [TestCase(false, "address")]
