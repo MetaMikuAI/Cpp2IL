@@ -1555,6 +1555,15 @@ public static class IlGenerator
                     instructions.Add(field.Field.IsStatic ? CilOpCodes.Ldsfld : CilOpCodes.Ldfld, field.Field.ToFieldDescriptor());
                 break;
             case MemoryOperand memory:
+                // A read of a class's static field storage left unresolved, e.g. string.Empty read straight into
+                // the return register: the static field at that offset.
+                if (memory is { Index: null, Scale: 0, Base: LocalVariable { Type: StaticFieldStorageTypeAnalysisContext { IsThreadStatic: false, OwnerType: { } staticOwner } } }
+                    && staticOwner is not GenericInstanceTypeAnalysisContext
+                    && staticOwner.Fields.Where(f => f.IsStatic && f.Offset == memory.Addend && (f.Attributes & System.Reflection.FieldAttributes.Literal) == 0).ToList() is [var staticField])
+                {
+                    instructions.Add(CilOpCodes.Ldsfld, staticField.ToFieldDescriptor());
+                    break;
+                }
                 if (memory.Index == null && memory.Addend == 0 && memory.Scale == 0
                     && memory.Base is LocalVariable local2)
                 {
