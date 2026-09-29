@@ -1196,7 +1196,7 @@ public static class IlGenerator
                         || IsAddress(instruction.Operands[1]) && instruction.Operands[2] is not Immediate
                         || IsAddress(instruction.Operands[2]) && instruction.Operands[1] is not Immediate);
                 // A class pointer against an integer, e.g. a klass read or its null check: the type's handle value.
-                bool IsInteger(IOperand operand) => operand is Immediate
+                bool IsInteger(IOperand operand) => operand is Immediate or MemoryOperand
                     || operand is LocalVariable integer && locals.TryGetValue(integer, out var cil)
                     && cil.VariableType.ElementType is ElementType.I or ElementType.U or ElementType.Ptr;
                 bool IsClassPointer(int index) => instruction.Operands[index] is TypeAnalysisContext type && IsPlainType(type)
