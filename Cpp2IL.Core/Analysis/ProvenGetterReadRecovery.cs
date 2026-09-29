@@ -24,7 +24,10 @@ public static class ProvenGetterReadRecovery
                 || body.ExceptionHandlers.Count != 0)
                 continue;
 
-            var il = body.Instructions;
+            // The generator leaves nops where analysis removed instructions, and branches bridging to the next block.
+            var il = body.Instructions.Where(i => i.OpCode != CilOpCodes.Nop).ToList();
+            il = il.Where((i, index) => !(i.OpCode == CilOpCodes.Br && i.Operand is CilInstructionLabel { Instruction: { } to }
+                                          && index + 1 < il.Count && to == il[index + 1])).ToList();
             var fieldIndex = getter.IsStatic ? 0 : 1;
             if (il.Count != fieldIndex + 2 || il[^1].OpCode != CilOpCodes.Ret
                 || !getter.IsStatic && il[0].OpCode != CilOpCodes.Ldarg_0

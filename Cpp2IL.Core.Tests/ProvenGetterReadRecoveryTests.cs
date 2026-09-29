@@ -129,7 +129,11 @@ public class ProvenGetterReadRecoveryTests
             case "wrongReturn": getter.Signature!.ReturnType = module.CorLibTypeFactory.Int64; break;
             case "byrefReturn": getter.Signature!.ReturnType = new ByReferenceTypeSignature(module.CorLibTypeFactory.Int32); break;
             case "generic": getter.DeclaringType!.GenericParameters.Add(new GenericParameter("T")); break;
-            case "nontrivial": getter.CilMethodBody!.Instructions.Insert(0, new CilInstruction(CilOpCodes.Nop)); break;
+            // Anything beyond the field read, but for nops, makes the getter more than the field.
+            case "nontrivial":
+                getter.CilMethodBody!.Instructions.Insert(0, new CilInstruction(CilOpCodes.Ldnull));
+                getter.CilMethodBody!.Instructions.Insert(1, new CilInstruction(CilOpCodes.Pop));
+                break;
             case "volatile": reader.CilMethodBody!.Instructions.Insert(1, new CilInstruction(CilOpCodes.Volatile)); break;
             case "unaligned": reader.CilMethodBody!.Instructions.Insert(1, new CilInstruction(CilOpCodes.Unaligned, (byte)1)); break;
             case "address": read.OpCode = CilOpCodes.Ldflda; break;
