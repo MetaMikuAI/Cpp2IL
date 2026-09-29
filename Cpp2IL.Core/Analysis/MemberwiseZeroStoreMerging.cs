@@ -32,7 +32,9 @@ public static class MemberwiseZeroStoreMerging
                 if (instruction is { OpCode: OpCode.Move, Operands: [FieldReference { IsNested: true, IsStatic: false } member, Immediate { Value: 0 }] }
                     && Cleared(member, pointerSize) is { } leaves)
                 {
-                    var key = (member.Local, member.ContainingFields[0]);
+                    // Fields of a generic instance are bound anew at each reference: key on their definition.
+                    var outer = member.ContainingFields[0];
+                    var key = (member.Local, (outer as ConcreteGenericFieldAnalysisContext)?.BaseFieldContext ?? outer);
                     if (!runs.TryGetValue(key, out var run))
                         runs[key] = run = [];
                     run.Add((instruction, leaves));
@@ -51,12 +53,14 @@ public static class MemberwiseZeroStoreMerging
         foreach (var ((owner, field), run) in runs)
         {
             var cleared = run.SelectMany(s => s.Leaves).ToList();
-            var all = Leaves(field.FieldType, "", 0).ToList();
-            var size = TypeSizes.UnboxedSize(field.FieldType, pointerSize);
+            var fieldType = ((FieldReference)run[0].Store.Operands[0]).ContainingFields[0].FieldType;
+            var all = Leaves(fieldType, "", 0).ToList();
+            var size = TypeSizes.UnboxedSize(fieldType, pointerSize);
             if (cleared.Count != all.Count || !cleared.ToHashSet().SetEquals(all) || size <= 0)
                 continue;
 
-            run[0].Store.SetOperands(new FieldReference(field, owner, field.Offset) { AccessSize = (int)size }, new Immediate(0));
+            var whole = ((FieldReference)run[0].Store.Operands[0]).ContainingFields[0];
+            run[0].Store.SetOperands(new FieldReference(whole, owner, whole.Offset) { AccessSize = (int)size }, new Immediate(0));
             foreach (var (store, _) in run.Skip(1))
             {
                 store.OpCode = OpCode.Nop;

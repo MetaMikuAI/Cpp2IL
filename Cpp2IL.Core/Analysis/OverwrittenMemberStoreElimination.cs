@@ -12,6 +12,13 @@ namespace Cpp2IL.Core.Analysis;
 /// </summary>
 public static class OverwrittenMemberStoreElimination
 {
+    // Fields of a generic instance are bound anew at each reference: compare their definitions.
+    internal static bool SameField(FieldAnalysisContext left, FieldAnalysisContext right)
+        => left == right || Definition(left) == Definition(right);
+
+    private static FieldAnalysisContext Definition(FieldAnalysisContext field)
+        => (field as ConcreteGenericFieldAnalysisContext)?.BaseFieldContext ?? field;
+
     public static bool Run(MethodAnalysisContext method)
     {
         var changed = false;
@@ -28,7 +35,7 @@ public static class OverwrittenMemberStoreElimination
                 {
                     var next = instructions[j];
                     if (next is { OpCode: OpCode.Move, Operands: [FieldReference { IsNested: false, IsStatic: false } whole, var value] }
-                        && whole.Local == owner && whole.Field == field && value is LocalVariable or Immediate)
+                        && whole.Local == owner && SameField(whole.Field, field) && value is LocalVariable or Immediate)
                     {
                         store.OpCode = OpCode.Nop;
                         store.SetOperands();

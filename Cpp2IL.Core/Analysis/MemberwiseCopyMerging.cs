@@ -58,7 +58,9 @@ public static class MemberwiseCopyMerging
         public bool SameWhole(Copy other) => Value == other.Value && Target switch
         {
             ArrayAccess a => other.Target is ArrayAccess b && a.Array == b.Array && Equals(a.Index, b.Index),
-            FieldReference f => other.Target is FieldReference g && f.Local == g.Local && f.Field == g.Field && f.ContainingFields.SequenceEqual(g.ContainingFields),
+            FieldReference f => other.Target is FieldReference g && f.Local == g.Local && OverwrittenMemberStoreElimination.SameField(f.Field, g.Field)
+                                && f.ContainingFields.Count == g.ContainingFields.Count
+                                && f.ContainingFields.Zip(g.ContainingFields).All(p => OverwrittenMemberStoreElimination.SameField(p.First, p.Second)),
             _ => false,
         };
     }
