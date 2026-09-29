@@ -43,6 +43,37 @@ public static class UniTaskAwaiterRecovery
         return changed;
     }
 
+    /// <summary>
+    /// What <see cref="Run"/> could not fold leaves <c>source.GetResult(token)</c> on the path where the source
+    /// is not null, the source read from a whole awaiter the decompiler keeps as one local. There the awaiter's
+    /// own GetResult does exactly that, so call it instead. Runs out of SSA, where the awaiter local is addressable.
+    /// </summary>
+    public static bool RetargetSourceCalls(MethodAnalysisContext method)
+    {
+        var changed = false;
+        foreach (var call in method.ControlFlowGraph!.Instructions)
+        {
+            var receiverIndex = call.OpCode == OpCode.Call ? 2 : 1;
+            if (call is not { OpCode: OpCode.Call or OpCode.CallVoid } || call.Operands.Count != receiverIndex + 2
+                || call.Operands[0] is not MethodAnalysisContext { Name: "GetResult" } getResult
+                || !IsSource(getResult, call.OpCode == OpCode.Call ? "Cysharp.Threading.Tasks.IUniTaskSource`1" : "Cysharp.Threading.Tasks.IUniTaskSource")
+                || call.Operands[receiverIndex] is not LocalVariable { IsThis: false, Type: { } type } local || !IsAwaiter(type)
+                || Member(new AwaiterValue(local, local, type), "GetResult") is not { } memberGetResult
+                || memberGetResult.IsVoid != (call.OpCode == OpCode.CallVoid)
+                || call.OpCode == OpCode.Call && !SameResult(getResult, type))
+                continue;
+            call.SetOperands(call.OpCode == OpCode.Call ? [memberGetResult, call.Operands[1], new AddressOf(local)] : [memberGetResult, new AddressOf(local)]);
+            call.DeclaredArguments = 1;
+            changed = true;
+        }
+        return changed;
+    }
+
+    // IUniTaskSource<T>.GetResult and UniTask<T>.Awaiter.GetResult return the same T.
+    private static bool SameResult(MethodAnalysisContext getResult, TypeAnalysisContext awaiter)
+        => getResult.DeclaringType is GenericInstanceTypeAnalysisContext source && awaiter is GenericInstanceTypeAnalysisContext instance
+           && source.GenericArguments.Select(a => a.FullName).SequenceEqual(instance.GenericArguments.Select(a => a.FullName));
+
     // head: if (a == null) goto join;  check: st = a.GetStatus(token); if (st == Pending) goto suspend; goto join
     private static bool TryIsCompleted(ISILControlFlowGraph graph, Block head, HashSet<LocalVariable> defined)
     {

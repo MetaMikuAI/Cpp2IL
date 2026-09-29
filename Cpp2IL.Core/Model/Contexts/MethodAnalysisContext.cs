@@ -599,6 +599,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // An awaiter stored from the pieces of a UniTask returned in registers.
         if (UniTaskAwaiterStorageRecovery.Run(this))
             DeadCodeEliminator.Run(this);
+        // An awaiter's source called on the path where it is set: the awaiter's own GetResult.
+        UniTaskAwaiterRecovery.RetargetSourceCalls(this);
         // A struct copied member by member from another's pieces.
         if (MemberwiseCopyMerging.Run(this))
             DeadCodeEliminator.Run(this);

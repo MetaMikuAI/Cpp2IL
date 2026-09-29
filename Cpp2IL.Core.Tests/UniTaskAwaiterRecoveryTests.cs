@@ -105,4 +105,24 @@ public class UniTaskAwaiterRecoveryTests
         Assert.That(calls.Select(c => ((MethodAnalysisContext)c.Operands[0]).DeclaringType), Is.EqualTo(new[] { awaiter }));
         Assert.That(method.ControlFlowGraph.Blocks.Single(b => b.Instructions.Contains(join)).Predecessors, Has.Count.EqualTo(1));
     }
+
+    [TestCase(true)]
+    [TestCase(false)]
+    public void LeftoverSourceGetResult_OnAWholeAwaiter_CallsItsGetResult(bool awaiterReceiver)
+    {
+        var a = Local("a", awaiterReceiver ? awaiter : app.SystemTypes.SystemObjectType);
+        var token = Local("token", app.SystemTypes.SystemInt16Type);
+        var call = new Instruction(0, OpCode.CallVoid, sourceGetResult, a, token);
+        var method = Method([call, new(1, OpCode.Return)], a, token);
+
+        Assert.That(UniTaskAwaiterRecovery.RetargetSourceCalls(method), Is.EqualTo(awaiterReceiver));
+        if (awaiterReceiver)
+        {
+            Assert.That(((MethodAnalysisContext)call.Operands[0]).DeclaringType, Is.EqualTo(awaiter));
+            Assert.That(call.Operands, Has.Count.EqualTo(2), "the token is the awaiter's own");
+            Assert.That(call.Operands[1] is AddressOf { Target: var target } && target == a, "called through the awaiter's address");
+        }
+        else
+            Assert.That(call.Operands[0], Is.SameAs(sourceGetResult));
+    }
 }
