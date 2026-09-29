@@ -803,6 +803,9 @@ public static class IlGenerator
                     LoadOperand(instruction.Operands[1], method, locals, writeLine, field.Field.FieldType);
                     if (PrimitiveFieldReadRecovery.IsWholeValueField(field.Field))
                         instructions.Add(CilOpCodes.Stobj, field.Field.FieldType.ToTypeSignature().ToTypeDefOrRef());
+                    // Unity setters that only store the value, taking the same stack as stfld.
+                    else if (UnityFieldReadRecovery.TryGetSetter(field.Field, method) is { } unitySetter)
+                        instructions.Add(unitySetter.DeclaringType!.IsValueType ? CilOpCodes.Call : CilOpCodes.Callvirt, unitySetter.ToMethodDescriptor());
                     else
                         instructions.Add(field.Field.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld, field.Field.ToFieldDescriptor());
                     break;

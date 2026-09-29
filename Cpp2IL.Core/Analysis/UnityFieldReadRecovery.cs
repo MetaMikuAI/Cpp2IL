@@ -82,8 +82,40 @@ public static class UnityFieldReadRecovery
         ("Unity.Timeline", "UnityEngine.Timeline.TimelineClip", "m_Start") => "start",
         ("Unity.TextMeshPro", "TMPro.TMP_InputField", "m_OnEndEdit") => "onEndEdit",
         ("Unity.TextMeshPro", "TMPro.TMP_Dropdown", "m_OnValueChanged") => "onValueChanged",
+        ("Unity.TextMeshPro", "TMPro.TMP_InputField", "m_Text") => "text",
         _ => null,
     };
+
+    // Of those accessors, the ones whose setter does nothing but store the value into the field.
+    private static bool TrivialSetter(string type, string field) => (type, field) switch
+    {
+        ("UnityEngine.Rect", "m_XMin" or "m_YMin" or "m_Width" or "m_Height") => true,
+        ("UnityEngine.Vector2Int" or "UnityEngine.Vector3Int", "m_X" or "m_Y" or "m_Z") => true,
+        ("UnityEngine.Ray", "m_Origin") => true,
+        ("UnityEngine.Bounds", "m_Center" or "m_Extents") => true,
+        ("UnityEngine.UI.ScrollRect", "m_Content" or "m_Velocity") => true,
+        ("UnityEngine.UI.Button", "m_OnClick") => true,
+        ("TMPro.TMP_InputField", "m_OnEndEdit") => true,
+        ("TMPro.TMP_Dropdown", "m_OnValueChanged") => true,
+        _ => false,
+    };
+
+    public static MethodAnalysisContext? TryGetSetter(FieldAnalysisContext field, MethodDefinition caller)
+    {
+        var owner = field.DeclaringType;
+        if (field.IsStatic || owner.GenericParameters.Count != 0 || !TrivialSetter(owner.FullName, field.Name)
+            || (field.Attributes & FieldAttributes.FieldAccessMask) is not (FieldAttributes.Private or FieldAttributes.Assembly)
+            || Accessor(owner.DeclaringAssembly.Name, owner.FullName, field.Name) is not { } name || name.EndsWith("()"))
+            return null;
+
+        var setter = owner.Properties.SingleOrDefault(p => p.Name == name)?.Setter;
+        if (setter is not { IsStatic: false, Parameters.Count: 1, GenericParameters.Count: 0, IsVoid: true }
+            || setter.Visibility != MethodAttributes.Public || setter.Parameters[0].ParameterType != field.FieldType
+            || setter.GetExtraData<MethodDefinition>("AsmResolverMethod") == caller)
+            return null;
+
+        return setter;
+    }
 
     public static MethodAnalysisContext? TryGetGetter(FieldAnalysisContext field, MethodDefinition caller)
     {
