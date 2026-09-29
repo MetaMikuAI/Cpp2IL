@@ -630,8 +630,7 @@ public static class IlGenerator
         bool Reference(IOperand operand) => operand is LocalVariable local
             && (Untyped(local) ? !result.Contains(local) && !context.ParameterLocals.Contains(local) : IsObjectReference(local));
         // A struct packed in one register, which arithmetic reads as an integer of its size (see LoadPackedStruct).
-        bool PackedStruct(object operand) => operand is LocalVariable { IsThis: false, Type: { IsValueType: true, IsEnumType: false } packed } local
-            && !context.ParameterLocals.Contains(local)
+        bool PackedStruct(object operand) => operand is LocalVariable { IsThis: false, Type: { IsValueType: true, IsEnumType: false } packed }
             && packed.Type is Il2CppTypeEnum.IL2CPP_TYPE_VALUETYPE or Il2CppTypeEnum.IL2CPP_TYPE_GENERICINST
             && TypeSizes.UnboxedSize(packed, context.AppContext.Binary.PointerSizeBytes) is 1 or 2 or 4 or 8;
         bool ArithmeticValue(Instruction definition, object operand)
@@ -1971,9 +1970,10 @@ public static class IlGenerator
     private static bool LoadPackedStruct(IOperand operand, MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals,
         IMethodDescriptor writeLine, int pointerSize)
     {
+        var parameter = operand is LocalVariable { IsThis: false } named ? method.Parameters.FirstOrDefault(p => p.Name == named.Name) : null;
         var type = operand switch
         {
-            LocalVariable { IsThis: false } local when locals.ContainsKey(local) => local.Type,
+            LocalVariable { IsThis: false } local when parameter != null || locals.ContainsKey(local) => local.Type,
             FieldReference field => field.Field.FieldType,
             _ => null,
         };
@@ -1983,7 +1983,10 @@ public static class IlGenerator
         if (size is not (1 or 2 or 4 or 8))
             return false;
 
-        LoadOperand(new AddressOf(operand), method, locals, writeLine);
+        if (parameter != null)
+            method.CilMethodBody!.Instructions.Add(CilOpCodes.Ldarga, parameter);
+        else
+            LoadOperand(new AddressOf(operand), method, locals, writeLine);
         method.CilMethodBody!.Instructions.Add(size switch
         {
             1 => CilOpCodes.Ldind_U1,
