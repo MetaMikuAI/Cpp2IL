@@ -28,10 +28,19 @@ public static class InlinedListAddRecovery
         // other round a loop; those would keep the arms apart.
         DeadCodeEliminator.RemoveDeadCopyCycles(graph);
         var changed = false;
-        foreach (var block in graph.Blocks.ToList())
-            changed |= graph.Blocks.Contains(block) && TryRecover(graph, block);
-        if (changed)
+        // Consecutive Adds fuse: the next one's loads are duplicated into both arms of the one before, which then
+        // only continue alike once the next Add is recovered and those loads die. So go again until nothing changes.
+        for (var round = true; round;)
+        {
+            round = false;
+            foreach (var block in graph.Blocks.ToList())
+                round |= graph.Blocks.Contains(block) && TryRecover(graph, block);
+            if (!round)
+                break;
+            changed = true;
             DeadCodeEliminator.Run(method);
+            DeadCodeEliminator.RemoveDeadCopyCycles(graph);
+        }
         return changed;
     }
 
@@ -100,8 +109,16 @@ public static class InlinedListAddRecovery
         if (increment == null || sizeStore == null)
             return false;
         // A struct item is written member by member: into items[size], or into the argument AddWithResize takes.
-        List<Instruction> fastWrites = elementStore == null ? [] : [elementStore], slowBuild = [];
-        if (elementStore == null && !StructItem(graph, straight, body, slow, call, items, sizeLocal, item, resize, out fastWrites, out slowBuild))
+        List<Instruction> fastWrites = elementStore == null ? [] : [elementStore], slowBuild = [], slowDrop = [];
+        IOperand added = item;
+        if (elementStore == null && MemCpyItem(straight, body, slow, call, items, sizeLocal, resize) is var (fastCopy, slowCopy, source))
+        {
+            // A wide struct item is copied whole, with MemCpy, from one stack slot into items[size] or the argument.
+            fastWrites = [fastCopy];
+            slowDrop = [slowCopy];
+            added = source;
+        }
+        else if (elementStore == null && !StructItem(graph, straight, body, slow, call, items, sizeLocal, item, resize, out fastWrites, out slowBuild))
             return false;
         // Nothing past the arms reads their values, such as the incremented size or the element's address.
         var armLocals = fast.Instructions.Concat(slow.Instructions).Select(i => i.Destination).OfType<LocalVariable>().ToHashSet();
@@ -109,7 +126,11 @@ public static class InlinedListAddRecovery
             .Any(i => DeadCodeEliminator.UsedLocals(i).Any(armLocals.Contains)))
             return false;
         var fastRest = body.Except([increment, sizeStore, .. fastWrites]).Where(i => !IsArithmetic(i)).ToList();
-        var slowRest = slow.Instructions.Where(i => i.OpCode != OpCode.Nop && i != call && !IsArithmetic(i)).Except(slowBuild).ToList();
+        var slowRest = slow.Instructions.Where(i => i.OpCode != OpCode.Nop && i != call && !IsArithmetic(i)).Except(slowBuild).Except(slowDrop).ToList();
+
+        // A jump-only bridge between an arm and the join belongs to the arm.
+        SkipBridge(graph, fast);
+        SkipBridge(graph, slow);
 
         // Both arms continue alike: to one block, or by returning the same value.
         Instruction continuation;
@@ -138,7 +159,7 @@ public static class InlinedListAddRecovery
         versionStore.SetOperands();
         head.Instructions.InsertRange(head.Instructions.IndexOf(branch), slowBuild);
         branch.OpCode = OpCode.CallVoid;
-        branch.SetOperands(add, list, item);
+        branch.SetOperands(add, list, added);
         branch.DeclaredArguments = 2;
         branch.NativeAddress = call.NativeAddress;
         head.Instructions.Add(continuation);
@@ -162,6 +183,23 @@ public static class InlinedListAddRecovery
         head.Successors.AddRange(next);
         head.CalculateBlockType();
         return true;
+    }
+
+    // Folds jump-only blocks reached only from the block into it: it goes straight on to where they went.
+    private static void SkipBridge(ISILControlFlowGraph graph, Block block)
+    {
+        while (block.Successors is [var bridge] && bridge != graph.ExitBlock && bridge.Predecessors is [_]
+               && bridge.Instructions.All(i => i.OpCode is OpCode.Nop or OpCode.Jump) && bridge.Successors is [var next]
+               && next != bridge && next != block && !next.Instructions.Any(i => i.OpCode == OpCode.Phi && next.Predecessors.Contains(block)))
+        {
+            next.Predecessors[next.Predecessors.IndexOf(bridge)] = block;
+            block.Successors[0] = next;
+            foreach (var jump in block.Instructions.Where(i => i.OpCode == OpCode.Jump && i.Operands is [Block target] && target == bridge))
+                jump.SetOperands(next);
+            bridge.Predecessors.Clear();
+            bridge.Successors.Clear();
+            graph.Blocks.Remove(bridge);
+        }
     }
 
     // The code on the only way into a block: its single predecessors back to a join, past checks that otherwise throw.
@@ -214,6 +252,42 @@ public static class InlinedListAddRecovery
     }
 
     // Not yet recovered as items[size]: [items + (size << log2(element size)) + array header], at the element's width.
+    // MemCpy(items + size * width + header, &source, width) in the fast arm, MemCpy(&argument, &source, width) before
+    // AddWithResize(list, argument) in the slow one: the item is the struct in source.
+    private static (Instruction Fast, Instruction Slow, LocalVariable Source)? MemCpyItem(List<Instruction> straight, List<Instruction> body, Block slow,
+        Instruction call, LocalVariable items, LocalVariable size, MethodAnalysisContext resize)
+    {
+        if (resize is not ConcreteGenericMethodAnalysisContext { TypeGenericParameters: [{ IsValueType: true } element] })
+            return null;
+        var pointerSize = element.AppContext.Binary.PointerSizeBytes;
+        static bool IsMemCpy(Instruction i) => i is { OpCode: OpCode.CallVoid, Operands: [MethodAnalysisContext { Name: "MemCpy" } m, _, AddressOf { Target: LocalVariable }, Immediate] }
+                                               && m.DeclaringType?.Name == "UnsafeUtility";
+        // The copy's length is the element's width, as the array's stride.
+        if (body.FirstOrDefault(IsMemCpy) is not { Operands: [_, LocalVariable destination, AddressOf { Target: LocalVariable source }, Immediate { Value: var width }] } fast
+            || width <= 8
+            || slow.Instructions.FirstOrDefault(IsMemCpy) is not { Operands: [_, AddressOf { Target: LocalVariable argument }, AddressOf { Target: var copied }, Immediate { Value: var slowLength }] } slowCopy
+            || copied != source || slowLength != width
+            || (call.Operands[2] is AddressOf { Target: LocalVariable byRef } ? byRef : call.Operands[2] as LocalVariable) != argument
+            || slow.Instructions.IndexOf(slowCopy) > slow.Instructions.IndexOf(call))
+            return null;
+
+        // The destination: items + size * width, plus the array header, walked through constant additions.
+        var instructions = straight.Concat(body).ToList();
+        var address = destination;
+        long offset = 0;
+        for (var steps = 0; steps < 4 && Definition(instructions, address) is { OpCode: OpCode.Add, Operands: [_, LocalVariable inner, Immediate constant] }; steps++)
+        {
+            offset += constant.Value;
+            address = inner;
+        }
+        if (offset != 4L * pointerSize || Definition(instructions, address) is not { OpCode: OpCode.Add, Operands: [_, var left, var right] })
+            return null;
+        var scaled = left == items ? right : right == items ? left : null;
+        return scaled is LocalVariable product && Definition(instructions, product) is { OpCode: OpCode.Multiply, Operands: [_, var index, Immediate { Value: var stride }] }
+               && index == size && stride == width
+            ? (fast, slowCopy, source) : null;
+    }
+
     private static bool IsElementAddress(List<Instruction> instructions, MemoryOperand memory, LocalVariable items, LocalVariable size, MethodAnalysisContext resize)
     {
         if (memory is not { Base: LocalVariable address, Index: null } || resize is not ConcreteGenericMethodAnalysisContext { TypeGenericParameters: [var element] })
@@ -242,10 +316,15 @@ public static class InlinedListAddRecovery
     private static Instruction? SlowCall(Block block)
     {
         var body = block.Instructions.Where(i => i.OpCode != OpCode.Nop).ToList();
-        var index = body.FindIndex(i => i.OpCode != OpCode.Move || i.Operands[0] is not FieldReference { IsNested: false });
-        return index >= 0 && body[index] is { OpCode: OpCode.CallVoid, Operands: [MethodAnalysisContext { Name: "AddWithResize" } m, LocalVariable, var item] } call
-               && IsList(Base(m).DeclaringType)
-               && body.Take(index).All(i => ((FieldReference)i.Operands[0]).Local == item) ? call : null;
+        // The argument built member by member, or copied whole with MemCpy, before the call.
+        var index = body.FindIndex(i => (i.OpCode != OpCode.Move || i.Operands[0] is not FieldReference { IsNested: false })
+                                        && i is not { OpCode: OpCode.CallVoid, Operands: [MethodAnalysisContext { Name: "MemCpy" }, AddressOf, AddressOf, Immediate] });
+        if (index < 0 || body[index] is not { OpCode: OpCode.CallVoid, Operands: [MethodAnalysisContext { Name: "AddWithResize" } m, LocalVariable, var item] } call
+            || !IsList(Base(m).DeclaringType))
+            return null;
+        var argument = item is AddressOf { Target: LocalVariable byRef } ? byRef : item;
+        return body.Take(index).All(i => i.OpCode == OpCode.Move ? ((FieldReference)i.Operands[0]).Local == item
+                                         : i.Operands[1] is AddressOf { Target: var copiedInto } && copiedInto == argument) ? call : null;
     }
 
     private static MethodAnalysisContext? Add(MethodAnalysisContext resize)
