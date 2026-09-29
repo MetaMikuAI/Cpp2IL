@@ -602,6 +602,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // A struct copied member by member from another's pieces.
         if (MemberwiseCopyMerging.Run(this))
             DeadCodeEliminator.Run(this);
+        // A stack struct's member addressed as the struct's address plus its offset.
+        StackFieldAddressRecovery.Run(this);
         // A byref's referent reached as a field of an unrelated type.
         ByRefFieldAccessRecovery.Run(this);
         // Pieces of a struct spilled to a stack slot nothing reads.
