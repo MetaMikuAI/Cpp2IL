@@ -98,8 +98,11 @@ public static class MemberwiseCopyMerging
         return null;
     }
 
-    // The value is written, or its address taken, between its member read and the store.
+    // The value is written between its member read and the store: directly, or by a call when its address is taken.
     private static bool Written(List<Instruction> straight, int from, int to, LocalVariable value)
-        => from < 0 || straight.Skip(from + 1).Take(to - from - 1).Any(i => i.Destination == value || i.IsCall
-            || i.Operands.Any(o => o is AddressOf { Target: var t } && t == value));
+        => from < 0 || straight.Skip(from + 1).Take(to - from - 1).Any(i => i.Destination == value
+            || i.IsCall && Addressed(straight, value) || i.Operands.Any(o => o is AddressOf { Target: var t } && t == value));
+
+    private static bool Addressed(List<Instruction> straight, LocalVariable value)
+        => value.Register.Name.StartsWith("stack_") || straight.Any(i => i.Operands.Any(o => o is AddressOf { Target: var t } && t == value));
 }

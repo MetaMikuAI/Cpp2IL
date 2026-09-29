@@ -26,7 +26,11 @@ public static class UniTaskBuilderRecovery
         foreach (var block in graph.Blocks.ToList())
             changed |= graph.Blocks.Contains(block) && TryRecover(graph, block);
         if (changed)
+        {
+            // What only fed the replaced checks may now only go round loops in phis.
+            DeadCodeEliminator.RemoveDeadCopyCycles(graph);
             DeadCodeEliminator.Run(method);
+        }
         return changed;
     }
 

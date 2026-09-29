@@ -35,7 +35,11 @@ public static class UniTaskAwaiterRecovery
         foreach (var block in graph.Blocks.ToList())
             changed |= graph.Blocks.Contains(block) && (TryIsCompleted(graph, block, defined) || TryGetResult(graph, block, defined));
         if (changed)
+        {
+            // What only fed the replaced checks may now only go round loops in phis.
+            DeadCodeEliminator.RemoveDeadCopyCycles(graph);
             DeadCodeEliminator.Run(method);
+        }
         return changed;
     }
 
