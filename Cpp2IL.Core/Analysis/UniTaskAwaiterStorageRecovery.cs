@@ -37,9 +37,12 @@ public static class UniTaskAwaiterStorageRecovery
         return changed;
     }
 
-    // The task whose source the value copies, unchanged since.
+    // The task whose source the value copies, unchanged since, or the value when it is the task itself.
     private static LocalVariable? Task(List<Instruction> straight, int at, LocalVariable value)
     {
+        if (value.Type is { } type && ((type as GenericInstanceTypeAnalysisContext)?.GenericType ?? type).FullName
+                is "Cysharp.Threading.Tasks.UniTask" or "Cysharp.Threading.Tasks.UniTask`1")
+            return value;
         for (var index = at - 1; index >= 0; index--)
         {
             var instruction = straight[index];

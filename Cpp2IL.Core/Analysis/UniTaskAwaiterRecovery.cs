@@ -154,15 +154,23 @@ public static class UniTaskAwaiterRecovery
         if (head.Successors.Count != 2 || head.Instructions.LastOrDefault(i => i.OpCode != OpCode.Nop) is not
                 { OpCode: OpCode.ConditionalJump, Operands: [Block target, LocalVariable condition] } branch
             || head.Instructions.LastOrDefault(i => i.Destination == condition) is not
-                { OpCode: OpCode.CheckEqual or OpCode.CheckNotEqual, Operands: [_, LocalVariable { Type: { } type } local, Immediate { Value: 0 }] } test
-            || !IsAwaiter(type)
+                { OpCode: OpCode.CheckEqual or OpCode.CheckNotEqual, Operands: [_, LocalVariable local, Immediate { Value: 0 }] } test
+            // The tested register holds the source loaded from the awaiter's storage, whatever it was typed as.
             || InlinedListAddRecovery.StraightLine(head).LastOrDefault(i => i.Destination == local) is not { OpCode: OpCode.Move, Operands: [_, var storage] }
+            || StorageType(storage) is not { } type || !IsAwaiter(type)
             || Receiver(storage, type) is not { } receiver)
             return null;
         // if (a == null) goto whenNull, or if (a != null) goto on with whenNull the other way.
         var whenNull = test.OpCode == OpCode.CheckEqual ? target : head.Successors.FirstOrDefault(s => s != target);
         return whenNull == null ? null : (branch, new AwaiterValue(local, receiver, type), whenNull);
     }
+
+    private static TypeAnalysisContext? StorageType(IOperand storage) => storage switch
+    {
+        LocalVariable slot => slot.Type,
+        FieldReference field => field.Field.FieldType,
+        _ => null,
+    };
 
     // The awaiter's storage: a stack slot or a field of the same type, whose address the members take.
     private static IOperand? Receiver(IOperand storage, TypeAnalysisContext type) => storage switch
