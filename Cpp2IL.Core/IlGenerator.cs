@@ -629,15 +629,28 @@ public static class IlGenerator
         // native int arithmetic.
         bool Reference(IOperand operand) => operand is LocalVariable local
             && (Untyped(local) ? !result.Contains(local) && !context.ParameterLocals.Contains(local) : IsObjectReference(local));
+        // A struct packed in one register, which arithmetic reads as an integer of its size (see LoadPackedStruct).
+        bool PackedStruct(object operand) => operand is LocalVariable { IsThis: false, Type: { IsValueType: true, IsEnumType: false } packed } local
+            && !context.ParameterLocals.Contains(local)
+            && packed.Type is Il2CppTypeEnum.IL2CPP_TYPE_VALUETYPE or Il2CppTypeEnum.IL2CPP_TYPE_GENERICINST
+            && TypeSizes.UnboxedSize(packed, context.AppContext.Binary.PointerSizeBytes) is 1 or 2 or 4 or 8;
         bool ArithmeticValue(Instruction definition, object operand)
-            => IntegerValue(operand) || operand is IOperand value && Reference(value) && IsPointerArithmetic(definition, Reference);
+            => IntegerValue(operand) || operand is IOperand value && Reference(value) && IsPointerArithmetic(definition, Reference)
+               || definition.OpCode != OpCode.Move && PackedStruct(operand);
+        // The result of a call returning an integer, or a read of an integer field.
+        bool IntegerSource(Instruction definition) => definition switch
+        {
+            { OpCode: OpCode.Call, Operands: [MethodAnalysisContext { ReturnType: var returned }, ..] } => IntegerType(returned),
+            { OpCode: OpCode.Move, Operands: [_, FieldReference { Field.FieldType: var fieldType }] } => IntegerType(fieldType),
+            _ => false,
+        };
 
         for (var changed = true; changed;)
         {
             changed = false;
             foreach (var local in result.ToList())
             {
-                if (definitions[local].All(d => d.OpCode is OpCode.Move or OpCode.Add or OpCode.Subtract or OpCode.Multiply
+                if (definitions[local].All(d => IntegerSource(d) || d.OpCode is OpCode.Move or OpCode.Add or OpCode.Subtract or OpCode.Multiply
                         or OpCode.Divide or OpCode.Modulo or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.And or OpCode.Or
                         or OpCode.Xor or OpCode.Not or OpCode.Negate
                     && (d.OpCode != OpCode.Move || d.Operands[1] is Immediate or LocalVariable || IsUnmanagedLoad(d.Operands[1]))
