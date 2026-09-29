@@ -1561,7 +1561,10 @@ public static class IlGenerator
                     && staticOwner is not GenericInstanceTypeAnalysisContext
                     && staticOwner.Fields.Where(f => f.IsStatic && f.Offset == memory.Addend && (f.Attributes & System.Reflection.FieldAttributes.Literal) == 0).ToList() is [var staticField])
                 {
-                    instructions.Add(CilOpCodes.Ldsfld, staticField.ToFieldDescriptor());
+                    if (UnityFieldReadRecovery.TryGetStaticGetter(staticField, method) is { } staticFieldGetter)
+                        instructions.Add(CilOpCodes.Call, staticFieldGetter.ToMethodDescriptor());
+                    else
+                        instructions.Add(CilOpCodes.Ldsfld, staticField.ToFieldDescriptor());
                     break;
                 }
                 if (memory.Index == null && memory.Addend == 0 && memory.Scale == 0
