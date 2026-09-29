@@ -18,8 +18,9 @@ public static class StackFieldAddressRecovery
     {
         AddressOf { Target: LocalVariable { Type: { IsValueType: true } type } storage }
             when method.StackAggregates.ContainsKey(storage.Register.Number) || storage.Register.Name.StartsWith("stack_") => (storage, type),
-        // A generic owner's own fields would come out unbound.
-        LocalVariable { IsThis: true } self when method.DeclaringType is { IsValueType: true, GenericParameters.Count: 0 } owner => (self, owner),
+        // A generic owner's own fields are bound to it over its own type parameters, as IL references them.
+        LocalVariable { IsThis: true } self when method.DeclaringType is { IsValueType: true } owner
+            => (self, owner.GenericParameters.Count == 0 ? owner : new GenericInstanceTypeAnalysisContext(owner, owner.GenericParameters)),
         _ => null,
     };
 
