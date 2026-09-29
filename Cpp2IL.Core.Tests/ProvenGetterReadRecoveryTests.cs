@@ -56,6 +56,34 @@ public class ProvenGetterReadRecoveryTests
         return getter;
     }
 
+    [TestCase(true, true)]
+    [TestCase(false, false)]
+    public void StructGetter_IsCalledOnlyThroughAnAddress(bool throughAddress, bool recovered)
+    {
+        var module = new ModuleDefinition("Struct" + Guid.NewGuid().ToString("N") + ".dll", new AssemblyReference("mscorlib", new Version(4, 0, 0, 0)));
+        new AssemblyDefinition(module.Name!, new Version(1, 0)).Modules.Add(module);
+        var valueType = module.CorLibTypeFactory.CorLibScope.CreateTypeReference("System", "ValueType");
+        var owner = new TypeDefinition("Tests", "Target", TypeAttributes.Public | TypeAttributes.Sealed, valueType);
+        module.TopLevelTypes.Add(owner);
+        var field = new FieldDefinition("value", FieldAttributes.Private, new FieldSignature(module.CorLibTypeFactory.Int32));
+        owner.Fields.Add(field);
+        var getter = AddGetter(owner, field, "Value");
+        var caller = new TypeDefinition("Tests", "Caller", TypeAttributes.Public, module.CorLibTypeFactory.Object.Type);
+        module.TopLevelTypes.Add(caller);
+        var reader = new MethodDefinition("Read", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Int32, [owner.ToTypeSignature()]));
+        caller.Methods.Add(reader);
+        reader.CilMethodBody = new CilMethodBody { ComputeMaxStackOnBuild = true };
+        reader.CilMethodBody.Instructions.Add(throughAddress ? CilOpCodes.Ldarga_S : CilOpCodes.Ldarg, reader.Parameters[0]);
+        var read = new CilInstruction(CilOpCodes.Ldfld, field);
+        reader.CilMethodBody.Instructions.Add(read);
+        reader.CilMethodBody.Instructions.Add(CilOpCodes.Ret);
+
+        Assert.That(ProvenGetterReadRecovery.Recover(module).Reads, Is.EqualTo(recovered ? 1 : 0));
+        if (recovered)
+            Assert.That((read.OpCode, read.Operand), Is.EqualTo((CilOpCodes.Call, (object)getter)), "a struct's getter is called, not called virtually");
+    }
+
     [Test]
     public void InstanceRead_ExecutesWithNullCheckAndPreservesBranchTarget()
     {

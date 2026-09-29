@@ -20,7 +20,7 @@ public static class ProvenGetterReadRecovery
             if (getter is not { IsPublic: true, IsVirtual: false, GenericParameters.Count: 0, CilMethodBody: { } body }
                 || getter.IsPInvokeImpl || (getter.ImplAttributes & MethodImplAttributes.Synchronized) != 0
                 || getter.Signature is not { ParameterTypes.Count: 0, ReturnType: not ByReferenceTypeSignature }
-                || getter.DeclaringType is not { IsValueType: false, GenericParameters.Count: 0 } owner
+                || getter.DeclaringType is not { GenericParameters.Count: 0 } owner
                 || body.ExceptionHandlers.Count != 0)
                 continue;
 
@@ -56,14 +56,23 @@ public static class ProvenGetterReadRecovery
                     || instruction.Operand is not FieldDefinition field || !getters.TryGetValue(field, out var getter)
                     || method == getter || method.DeclaringModule != getter.DeclaringModule)
                     continue;
+                // A struct's getter takes its receiver by address, which the read must already have.
+                var byAddress = !getter.IsStatic && getter.DeclaringType!.IsValueType;
+                if (byAddress && !(i > 0 && PushesAddress(il[i - 1], method)))
+                    continue;
                 reads++;
                 if (apply)
                 {
-                    instruction.OpCode = getter.IsStatic ? CilOpCodes.Call : CilOpCodes.Callvirt;
+                    instruction.OpCode = getter.IsStatic || byAddress ? CilOpCodes.Call : CilOpCodes.Callvirt;
                     instruction.Operand = getter;
                 }
             }
         }
         return new Result(getters.Count, reads);
     }
+
+    private static bool PushesAddress(CilInstruction instruction, MethodDefinition method)
+        => instruction.OpCode.Code is CilCode.Ldloca or CilCode.Ldloca_S or CilCode.Ldflda or CilCode.Ldarga or CilCode.Ldarga_S or CilCode.Ldsflda
+           // a struct method's this is its address
+           || instruction.OpCode.Code == CilCode.Ldarg_0 && !method.IsStatic && method.DeclaringType is { IsValueType: true };
 }
