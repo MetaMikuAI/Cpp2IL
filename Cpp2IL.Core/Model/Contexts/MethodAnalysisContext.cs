@@ -610,6 +610,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         if (UnreadAggregateStoreElimination.Run(this))
             DeadCodeEliminator.Run(this);
 
+        // A base constructor that observes nothing, run before initializers the decompiler keeps as statements.
+        BaseConstructorHoisting.Run(this);
+
         LocalVariables.RemoveUnused(this);
     }
 
