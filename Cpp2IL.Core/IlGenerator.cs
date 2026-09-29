@@ -822,7 +822,13 @@ public static class IlGenerator
                     break;
                 }
 
-                LoadOperand(instruction.Operands[1], method, locals, writeLine, DestinationType(instruction.Operands[0]));
+                // A class pointer kept in an integer register (untyped, or typed as the class itself).
+                if (instruction.Operands is [LocalVariable integer, TypeAnalysisContext classPointer]
+                    && locals.TryGetValue(integer, out var integerLocal) && integerLocal.VariableType.ElementType == ElementType.I
+                    && IsPlainType(classPointer))
+                    LoadTypeHandleValue(classPointer, method);
+                else
+                    LoadOperand(instruction.Operands[1], method, locals, writeLine, DestinationType(instruction.Operands[0]));
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine);
                 break;
 
@@ -1596,6 +1602,11 @@ public static class IlGenerator
             case TypeAnalysisContext handleType when expectedType?.FullName == "System.RuntimeTypeHandle":
                 instructions.Add(CilOpCodes.Ldtoken, handleType.ToTypeSignature().ToTypeDefOrRef());
                 break;
+            // A type's class pointer used as an address, e.g. compared with an object's klass: its handle's value.
+            case TypeAnalysisContext handleType when IsPlainType(handleType)
+                                                     && (expectedType is PointerTypeAnalysisContext || expectedType?.FullName is "System.IntPtr" or "System.UIntPtr"):
+                LoadTypeHandleValue(handleType, method);
+                break;
             case TypeAnalysisContext type:
                 //typeof(T)
                 var corLibScope = module.CorLibTypeFactory.CorLibScope;
@@ -1873,6 +1884,27 @@ public static class IlGenerator
         method.CilMethodBody.Instructions.Add(CilOpCodes.Stloc, temporary);
         method.CilMethodBody.Instructions.Add(CilOpCodes.Ldloca, temporary);
         method.CilMethodBody.Instructions.Add(CilOpCodes.Call, call.ToMethodDescriptor());
+    }
+
+    // A type operand itself, not one of the runtime structures (class, RGCTX, static storage) modelled as types.
+    private static bool IsPlainType(TypeAnalysisContext type)
+        => type is not (RuntimeClassTypeAnalysisContext or RgctxTableTypeAnalysisContext or MethodRgctxTableTypeAnalysisContext
+            or StaticFieldStorageTypeAnalysisContext or RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext);
+
+    // typeof(T).TypeHandle.Value: the address that identifies T at run time, standing in for its class pointer.
+    private static void LoadTypeHandleValue(TypeAnalysisContext type, MethodDefinition method)
+    {
+        var instructions = method.CilMethodBody!.Instructions;
+        var module = method.DeclaringModule!;
+        var scope = module.CorLibTypeFactory.CorLibScope;
+        var runtimeTypeHandle = scope.CreateTypeReference("System", "RuntimeTypeHandle");
+        var handle = new CilLocalVariable(runtimeTypeHandle.ToTypeSignature(true));
+        method.CilMethodBody.LocalVariables.Add(handle);
+        instructions.Add(CilOpCodes.Ldtoken, type.ToTypeSignature().ToTypeDefOrRef());
+        instructions.Add(CilOpCodes.Stloc, handle);
+        instructions.Add(CilOpCodes.Ldloca, handle);
+        instructions.Add(CilOpCodes.Call, runtimeTypeHandle.CreateMemberReference("get_Value",
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.IntPtr)));
     }
 
     private static TypeAnalysisContext? DestinationType(IOperand destination) =>
