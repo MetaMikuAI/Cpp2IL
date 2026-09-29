@@ -8,7 +8,8 @@ namespace Cpp2IL.Core.Analysis;
 /// Native code can spill a struct's registers into a stack slot nothing reads again, such as a UniTask
 /// returned in registers whose pieces are stored but never used (<c>uniTask.token = token;
 /// uniTask.source = source</c>). Those stores name private members for nothing: drop every member store
-/// to a stack aggregate that is never read, has its address taken or is used whole.
+/// to a stack aggregate that is never read, has its address taken or is used whole. Likewise stores into the
+/// hidden return buffer of a method whose every return hands back the value itself.
 /// </summary>
 public static class UnreadAggregateStoreElimination
 {
@@ -25,6 +26,13 @@ public static class UnreadAggregateStoreElimination
                 && instruction.Operands.Skip(1).All(o => !Mentions(o, stored)))
                 continue;
             candidates.RemoveWhere(c => instruction.Operands.Any(o => Mentions(o, c)));
+        }
+        // The hidden return buffer is written for nothing when every return hands back its value.
+        if (!method.IsVoid && instructions.Where(i => i.OpCode == OpCode.Return).All(i => i.Operands.Count == 1))
+        {
+            var buffer = instructions.Select(Store).OfType<LocalVariable>().FirstOrDefault(l => l.Name == "returnBuffer" && method.ParameterLocals.Contains(l) == false);
+            if (buffer != null && instructions.All(i => Store(i) == buffer ? i.Operands.Skip(1).All(o => !Mentions(o, buffer)) : !i.Operands.Any(o => Mentions(o, buffer))))
+                candidates.Add(buffer);
         }
         if (candidates.Count == 0)
             return false;

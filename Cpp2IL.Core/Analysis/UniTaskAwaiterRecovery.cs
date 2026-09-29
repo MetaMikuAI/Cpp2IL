@@ -65,6 +65,7 @@ public static class UniTaskAwaiterRecovery
         test.OpCode = OpCode.Call;
         test.SetOperands(isCompleted, completed, awaiter.Receiver);
         test.DeclaredArguments = 1;
+        branch.SetOperand(0, whenNull);
         Replace(graph, head, check, rejoin.LastOrDefault() ?? check, whenNull, suspend);
         foreach (var block in passed.Concat(rejoin))
             graph.Blocks.Remove(block);
@@ -151,14 +152,16 @@ public static class UniTaskAwaiterRecovery
     private static (Instruction Branch, AwaiterValue Awaiter, Block WhenNull)? NullTest(Block head)
     {
         if (head.Successors.Count != 2 || head.Instructions.LastOrDefault(i => i.OpCode != OpCode.Nop) is not
-                { OpCode: OpCode.ConditionalJump, Operands: [Block whenNull, LocalVariable condition] } branch
+                { OpCode: OpCode.ConditionalJump, Operands: [Block target, LocalVariable condition] } branch
             || head.Instructions.LastOrDefault(i => i.Destination == condition) is not
-                { OpCode: OpCode.CheckEqual, Operands: [_, LocalVariable { Type: { } type } local, Immediate { Value: 0 }] }
+                { OpCode: OpCode.CheckEqual or OpCode.CheckNotEqual, Operands: [_, LocalVariable { Type: { } type } local, Immediate { Value: 0 }] } test
             || !IsAwaiter(type)
             || InlinedListAddRecovery.StraightLine(head).LastOrDefault(i => i.Destination == local) is not { OpCode: OpCode.Move, Operands: [_, var storage] }
             || Receiver(storage, type) is not { } receiver)
             return null;
-        return (branch, new AwaiterValue(local, receiver, type), whenNull);
+        // if (a == null) goto whenNull, or if (a != null) goto on with whenNull the other way.
+        var whenNull = test.OpCode == OpCode.CheckEqual ? target : head.Successors.FirstOrDefault(s => s != target);
+        return whenNull == null ? null : (branch, new AwaiterValue(local, receiver, type), whenNull);
     }
 
     // The awaiter's storage: a stack slot or a field of the same type, whose address the members take.
