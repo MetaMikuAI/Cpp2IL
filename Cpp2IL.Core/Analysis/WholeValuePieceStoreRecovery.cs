@@ -71,6 +71,16 @@ public static class WholeValuePieceStoreRecovery
                     instruction.SetOperand(i, copiedWhole);
                     changed = true;
                 }
+                // A struct too wide for registers is copied to the stack and passed by its address; only the first
+                // member's copy is modelled: frameID = info.m_FrameID; ProcessFrame(&frameID). The copy is info.
+                else if (instruction.Operands[i] is AddressOf { Target: LocalVariable { Type: { } slotType } slot }
+                         && parameterType is { IsValueType: true, IsEnumType: false } && slotType.FullName != parameterType.FullName
+                         && slot.Register.Name?.StartsWith("stack_") == true
+                         && CopiedWhole(slot, parameterType, block, instruction) is { } passedWhole)
+                {
+                    instruction.SetOperand(i, passedWhole);
+                    changed = true;
+                }
             }
         }
         return changed;
