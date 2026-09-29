@@ -33,6 +33,15 @@ public static class WholeValuePieceStoreRecovery
                 changed = true;
                 continue;
             }
+            // The first member copied to a local only to be stored here: tween = result.tween; awaiter = tween.
+            if (instruction is { OpCode: OpCode.Move, Operands: [var copyTarget, LocalVariable stored] }
+                && TargetType(copyTarget) is { IsValueType: true } copyTargetType && CopiedWhole(stored, copyTargetType, block, instruction) is { } storedWhole
+                && !(copyTarget is LocalVariable same && same == storedWhole))
+            {
+                instruction.SetOperands(copyTarget, storedWhole);
+                changed = true;
+                continue;
+            }
 
             // A struct argument: the parameter's type names what the registers hold.
             if (instruction is not { OpCode: OpCode.Call or OpCode.CallVoid } || instruction.Operands[0] is not MethodAnalysisContext callee)
@@ -47,10 +56,8 @@ public static class WholeValuePieceStoreRecovery
                     changed = true;
                 }
                 // The first member copied to a local only to be passed here: float r = color.r; ... SetColor(r).
-                else if (instruction.Operands[i] is LocalVariable copy && uses.GetValueOrDefault(copy) == 1
-                         && definitions.GetValueOrDefault(copy) is [{ OpCode: OpCode.Move, Operands: [_, FieldReference copied] } definition]
-                         && Whole(copied, parameterType) is { } copiedWhole
-                         && Unchanged(block, definition, instruction, copied))
+                else if (instruction.Operands[i] is LocalVariable copy
+                         && CopiedWhole(copy, parameterType, block, instruction) is { } copiedWhole)
                 {
                     instruction.SetOperand(i, copiedWhole);
                     changed = true;
@@ -58,6 +65,13 @@ public static class WholeValuePieceStoreRecovery
             }
         }
         return changed;
+
+        // The whole value behind a local holding only its first member, copied once and read only here.
+        IOperand? CopiedWhole(LocalVariable copy, TypeAnalysisContext expected, Block block, Instruction user)
+            => uses.GetValueOrDefault(copy) == 1
+               && definitions.GetValueOrDefault(copy) is [{ OpCode: OpCode.Move, Operands: [_, FieldReference copied] } definition]
+               && Whole(copied, expected) is { } copiedWhole && Unchanged(block, definition, user, copied)
+                ? copiedWhole : null;
     }
 
     // The copy and the call on one straight line, with nothing between that may write the value copied from:

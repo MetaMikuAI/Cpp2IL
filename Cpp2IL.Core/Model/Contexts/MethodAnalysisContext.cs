@@ -602,7 +602,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         if (UniTaskAwaiterStorageRecovery.Run(this))
             DeadCodeEliminator.Run(this);
         // A struct returned in registers is spilled whole, not as its first member.
-        WholeValuePieceStoreRecovery.Run(this);
+        if (WholeValuePieceStoreRecovery.Run(this))
+            DeadCodeEliminator.Run(this);
         // An awaiter's source called on the path where it is set: the awaiter's own GetResult.
         UniTaskAwaiterRecovery.RetargetSourceCalls(this);
         // A struct copied member by member from another's pieces.
