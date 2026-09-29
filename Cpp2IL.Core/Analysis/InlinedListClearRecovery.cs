@@ -23,6 +23,10 @@ public static class InlinedListClearRecovery
     public static bool Run(MethodAnalysisContext method)
     {
         var graph = method.ControlFlowGraph!;
+        if (!graph.Instructions.Any(i => i is { OpCode: OpCode.Move, Operands: [FieldReference { Field.Name: "_size" }, Immediate { Value: 0 }] }))
+            return false;
+        // Argument registers merge at the join in phis, often only feeding each other round a loop.
+        DeadCodeEliminator.RemoveDeadCopyCycles(graph);
         var changed = false;
         foreach (var block in graph.Blocks.ToList())
             changed |= graph.Blocks.Contains(block) && TryRecover(graph, block);
