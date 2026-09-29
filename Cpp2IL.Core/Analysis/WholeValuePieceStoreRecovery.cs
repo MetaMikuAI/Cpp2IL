@@ -1,4 +1,6 @@
+using System.Collections.Generic;
 using System.Linq;
+using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
 
@@ -16,7 +18,12 @@ public static class WholeValuePieceStoreRecovery
     public static bool Run(MethodAnalysisContext method)
     {
         var changed = false;
-        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        var instructions = method.ControlFlowGraph!.Instructions;
+        var definitions = instructions.Where(i => i.Destination is LocalVariable).GroupBy(i => (LocalVariable)i.Destination!)
+            .ToDictionary(g => g.Key, g => g.ToList());
+        var uses = instructions.SelectMany(i => DeadCodeEliminator.UsedLocals(i)).GroupBy(l => l).ToDictionary(g => g.Key, g => g.Count());
+        foreach (var block in method.ControlFlowGraph.Blocks)
+        foreach (var instruction in block.Instructions)
         {
             if (instruction is { OpCode: OpCode.Move, Operands: [var target, FieldReference piece] }
                 && TargetType(target) is { } targetType && Whole(piece, targetType) is { } whole
@@ -33,10 +40,19 @@ public static class WholeValuePieceStoreRecovery
             var first = (instruction.OpCode == OpCode.Call ? 2 : 1) + (callee.IsStatic ? 0 : 1);
             for (var i = first; i < instruction.Operands.Count && i - first < callee.Parameters.Count; i++)
             {
-                if (instruction.Operands[i] is FieldReference argument
-                    && Whole(argument, callee.Parameters[i - first].ParameterType) is { } wholeArgument)
+                var parameterType = callee.Parameters[i - first].ParameterType;
+                if (instruction.Operands[i] is FieldReference argument && Whole(argument, parameterType) is { } wholeArgument)
                 {
                     instruction.SetOperand(i, wholeArgument);
+                    changed = true;
+                }
+                // The first member copied to a local only to be passed here: float r = color.r; ... SetColor(r).
+                else if (instruction.Operands[i] is LocalVariable copy && uses.GetValueOrDefault(copy) == 1
+                         && definitions.GetValueOrDefault(copy) is [{ OpCode: OpCode.Move, Operands: [_, FieldReference copied] } definition]
+                         && Whole(copied, parameterType) is { } copiedWhole
+                         && Unchanged(block, definition, instruction, copied))
+                {
+                    instruction.SetOperand(i, copiedWhole);
                     changed = true;
                 }
             }
@@ -44,10 +60,27 @@ public static class WholeValuePieceStoreRecovery
         return changed;
     }
 
+    // The copy and the call on one straight line, with nothing between that may write the value copied from:
+    // a struct local is written only directly or through its address, anything else by any call or store.
+    private static bool Unchanged(Block block, Instruction definition, Instruction call, FieldReference copied)
+    {
+        var straight = InlinedListAddRecovery.StraightLine(block);
+        var from = straight.IndexOf(definition);
+        var to = straight.IndexOf(call);
+        if (from < 0 || to < from)
+            return false;
+        var between = straight.Skip(from + 1).Take(to - from - 1);
+        var root = copied.Local;
+        if (!copied.IsStatic && root is { IsThis: false, Type.IsValueType: true } && root.Register.Name?.StartsWith("stack_") != true)
+            return !between.Any(i => i.Destination == root || i.Destination is FieldReference f && f.Local == root
+                                     || i.Operands.Any(o => o is AddressOf { Target: var t } && t == root));
+        return !between.Any(i => i.IsCall || i.Destination is FieldReference or MemoryOperand or ArrayAccess);
+    }
+
     // The whole value a first-member read reads from, when that value has the expected struct type.
     private static IOperand? Whole(FieldReference piece, TypeAnalysisContext expected)
     {
-        if (piece.IsStatic || piece.Field.FieldType.FullName == expected.FullName)
+        if (piece.IsStatic && !piece.IsNested || piece.Field.FieldType.FullName == expected.FullName)
             return null;
         IOperand whole;
         TypeAnalysisContext? wholeType;
