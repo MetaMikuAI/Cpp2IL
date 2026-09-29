@@ -18,7 +18,8 @@ public static class ProvenGetterReadRecovery
         foreach (var property in module.GetAllTypes().SelectMany(t => t.Properties))
         {
             var getter = property.GetMethod;
-            if (getter is not { IsPublic: true, IsVirtual: false, GenericParameters.Count: 0, CilMethodBody: { } body }
+            // Final virtuals (interface implementations) cannot be overridden either.
+            if (getter is not { IsPublic: true, GenericParameters.Count: 0, CilMethodBody: { } body } || getter.IsVirtual && !getter.IsFinal
                 || getter.IsPInvokeImpl || (getter.ImplAttributes & MethodImplAttributes.Synchronized) != 0
                 || getter.Signature is not { ParameterTypes.Count: 0, ReturnType: not ByReferenceTypeSignature }
                 || getter.DeclaringType is not { GenericParameters.Count: 0 } owner
@@ -107,7 +108,7 @@ public static class ProvenGetterReadRecovery
         foreach (var property in module.GetAllTypes().SelectMany(t => t.Properties))
         {
             var setter = property.SetMethod;
-            if (setter is not { IsPublic: true, IsVirtual: false, GenericParameters.Count: 0, CilMethodBody: { } body }
+            if (setter is not { IsPublic: true, GenericParameters.Count: 0, CilMethodBody: { } body } || setter.IsVirtual && !setter.IsFinal
                 || setter.IsPInvokeImpl || (setter.ImplAttributes & MethodImplAttributes.Synchronized) != 0
                 || setter.Signature is not { ParameterTypes.Count: 1, ReturnType.ElementType: ElementType.Void }
                 || setter.DeclaringType is not { IsValueType: false, GenericParameters.Count: 0 } owner
