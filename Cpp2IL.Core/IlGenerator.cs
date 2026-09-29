@@ -824,6 +824,22 @@ public static class IlGenerator
                     break;
                 }
 
+                // An integer (a packed struct worked on with shifts and masks) stored back into a struct local:
+                // its bytes written through the struct's storage, *(long*)&position = value.
+                if (instruction.Operands is [LocalVariable { IsThis: false, Type: { IsValueType: true, IsEnumType: false } packedType } packedTarget, LocalVariable packedValue]
+                    && packedType.Type is Il2CppTypeEnum.IL2CPP_TYPE_VALUETYPE or Il2CppTypeEnum.IL2CPP_TYPE_GENERICINST
+                    && locals.ContainsKey(packedTarget) && locals.TryGetValue(packedValue, out var packedLocal)
+                    && packedLocal.VariableType.ElementType is ElementType.I or ElementType.I8 or ElementType.U8 or ElementType.I4 or ElementType.U4
+                    && TypeSizes.UnboxedSize(packedType, context.AppContext.Binary.PointerSizeBytes) is 4 or 8)
+                {
+                    var packedSize = TypeSizes.UnboxedSize(packedType, context.AppContext.Binary.PointerSizeBytes);
+                    instructions.Add(CilOpCodes.Ldloca, locals[packedTarget]);
+                    LoadOperand(packedValue, method, locals, writeLine);
+                    instructions.Add(packedSize == 8 ? CilOpCodes.Conv_I8 : CilOpCodes.Conv_I4);
+                    instructions.Add(packedSize == 8 ? CilOpCodes.Stind_I8 : CilOpCodes.Stind_I4);
+                    break;
+                }
+
                 // A class pointer kept in an integer register (untyped, or typed as the class itself).
                 if (instruction.Operands is [LocalVariable integer, TypeAnalysisContext classPointer]
                     && locals.TryGetValue(integer, out var integerLocal) && integerLocal.VariableType.ElementType == ElementType.I
@@ -1205,7 +1221,7 @@ public static class IlGenerator
                     && IsInteger(instruction.Operands[3 - index]);
                 if (IsClassPointer(1))
                     LoadTypeHandleValue((TypeAnalysisContext)instruction.Operands[1], method);
-                else
+                else if (!LoadPackedStruct(instruction.Operands[1], method, locals, writeLine, context.AppContext.Binary.PointerSizeBytes))
                     LoadOperand(instruction.Operands[1], method, locals, writeLine, integerLiteralType);
                 if (pointerArithmetic && IsReferenceLocal(instruction.Operands[1])) instructions.Add(CilOpCodes.Conv_I);
                 if (addressArithmetic && IsAddress(instruction.Operands[1]))
@@ -1226,7 +1242,7 @@ public static class IlGenerator
                     });
                 if (IsClassPointer(2))
                     LoadTypeHandleValue((TypeAnalysisContext)instruction.Operands[2], method);
-                else
+                else if (!LoadPackedStruct(instruction.Operands[2], method, locals, writeLine, context.AppContext.Binary.PointerSizeBytes))
                     LoadOperand(instruction.Operands[2], method, locals, writeLine, integerLiteralType);
                 if (pointerArithmetic && IsReferenceLocal(instruction.Operands[2])) instructions.Add(CilOpCodes.Conv_I);
                 if (addressArithmetic && IsAddress(instruction.Operands[2]))
@@ -1910,6 +1926,38 @@ public static class IlGenerator
         method.CilMethodBody.Instructions.Add(CilOpCodes.Stloc, temporary);
         method.CilMethodBody.Instructions.Add(CilOpCodes.Ldloca, temporary);
         method.CilMethodBody.Instructions.Add(CilOpCodes.Call, call.ToMethodDescriptor());
+    }
+
+    /// <summary>
+    /// Native code keeps a struct of up to eight bytes packed in one register and works on its members with
+    /// shifts and masks: <c>position &amp; ~0xFFFF | x</c>. Managed code has no integer view of a struct, but its
+    /// storage has one: the struct's bytes read as an integer of its size, <c>*(long*)&amp;position</c>.
+    /// Loads such an operand that way and returns true, or leaves anything else to the caller.
+    /// </summary>
+    private static bool LoadPackedStruct(IOperand operand, MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals,
+        IMethodDescriptor writeLine, int pointerSize)
+    {
+        var type = operand switch
+        {
+            LocalVariable { IsThis: false } local when locals.ContainsKey(local) => local.Type,
+            FieldReference field => field.Field.FieldType,
+            _ => null,
+        };
+        if (type is not { IsValueType: true, IsEnumType: false, Type: Il2CppTypeEnum.IL2CPP_TYPE_VALUETYPE or Il2CppTypeEnum.IL2CPP_TYPE_GENERICINST })
+            return false;
+        var size = TypeSizes.UnboxedSize(type, pointerSize);
+        if (size is not (1 or 2 or 4 or 8))
+            return false;
+
+        LoadOperand(new AddressOf(operand), method, locals, writeLine);
+        method.CilMethodBody!.Instructions.Add(size switch
+        {
+            1 => CilOpCodes.Ldind_U1,
+            2 => CilOpCodes.Ldind_U2,
+            4 => CilOpCodes.Ldind_I4,
+            _ => CilOpCodes.Ldind_I8,
+        });
+        return true;
     }
 
     // A type operand itself, not one of the runtime structures (class, RGCTX, static storage) modelled as types.
