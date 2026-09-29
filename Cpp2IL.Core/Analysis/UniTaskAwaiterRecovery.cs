@@ -45,16 +45,25 @@ public static class UniTaskAwaiterRecovery
         if (NullTest(head) is not var (branch, awaiter, whenNull) || head.Successors.SingleOrDefault(s => s != whenNull) is not { } entry
             || Through(entry) is not ({ Predecessors: [_] } check, var passed))
             return false;
+        // st = a.GetStatus(token); then a branch on st == Pending, or on its negation.
         var body = Real(check);
-        if (body is not [{ OpCode: OpCode.Call, Operands: [MethodAnalysisContext { Name: "GetStatus" } getStatus, LocalVariable status, var source, _] },
-                { OpCode: OpCode.CheckEqual, Operands: [LocalVariable pending, var tested, Immediate { Value: 0 }] },
-                { OpCode: OpCode.ConditionalJump, Operands: [Block suspend, var condition] }]
-            || !IsSource(getStatus, "Cysharp.Threading.Tasks.IUniTaskSource") || source != awaiter.Local || tested != status || condition != pending
+        if (body is not [{ OpCode: OpCode.Call, Operands: [MethodAnalysisContext { Name: "GetStatus" } getStatus, LocalVariable status, var source, _] }, .., { OpCode: OpCode.ConditionalJump, Operands: [Block target, LocalVariable condition] }]
+            || body.Count is not (3 or 4)
+            || body[1] is not { OpCode: OpCode.CheckEqual or OpCode.CheckNotEqual, Operands: [LocalVariable pending, var tested, Immediate { Value: 0 }] } compare
+            || body.Count == 4 && body[2] is not { OpCode: OpCode.Not, Operands: [LocalVariable, var negated] } || body.Count == 4 && body[2].Operands[1] != pending)
+            return false;
+        var checkLocals = new HashSet<LocalVariable> { status, pending };
+        if (body.Count == 4)
+            checkLocals.Add((LocalVariable)body[2].Operands[0]);
+        var jumpsWhenPending = (compare.OpCode == OpCode.CheckEqual) == (body.Count == 3);
+        var suspend = jumpsWhenPending ? target : check.Successors.FirstOrDefault(b => b != target);
+        if (suspend == null || condition != (body.Count == 4 ? body[2].Operands[0] : pending)
+            || !IsSource(getStatus, "Cysharp.Threading.Tasks.IUniTaskSource") || source != awaiter.Local || tested != status
             || check.Successors.Count != 2 || !check.Successors.Contains(suspend) || suspend == whenNull
             || Through(check.Successors.Single(b => b != suspend)) is var (reached, rejoin) && reached != whenNull
             // The status is only seen by the check, and by the join's phis where a register carried it on.
             || graph.Blocks.Where(b => b != check).SelectMany(b => b.Instructions)
-                .Any(i => (i.OpCode != OpCode.Phi || !whenNull.Instructions.Contains(i)) && DeadCodeEliminator.UsedLocals(i).Any(l => l == status || l == pending))
+                .Any(i => (i.OpCode != OpCode.Phi || !whenNull.Instructions.Contains(i)) && DeadCodeEliminator.UsedLocals(i).Any(checkLocals.Contains))
             || !SameFromBoth(whenNull, head, rejoin.LastOrDefault() ?? check, status, defined)
             || Member(awaiter, "get_IsCompleted") is not { } isCompleted)
             return false;

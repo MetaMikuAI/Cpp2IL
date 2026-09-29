@@ -70,7 +70,7 @@ public static class UniTaskBuilderRecovery
             if (arguments.Count != 1 || nullArm.Predecessors is not [_] || nullArm.Successors is not [var nullNext]
                 || UniTaskAwaiterRecovery.Through(nullNext) is var (nullJoin, reached) && (nullAfter = reached) is var _ && nullJoin != join
                 || nullBody.FirstOrDefault() is not { OpCode: OpCode.Move, Operands: [FieldReference { ContainingFields: [var stored], Field.Name: "result" or "ex" } field, var value] }
-                || stored != builderField || field.Local != load.Local || !InlinedListAddRecovery.Same(Resolve(value, nullArm), arguments[0])
+                || !OverwrittenMemberStoreElimination.SameField(stored, builderField) || field.Local != load.Local || !InlinedListAddRecovery.Same(Resolve(value, nullArm), arguments[0])
                 || nullBody.Skip(1).Any(i => i.OpCode != OpCode.Jump))
                 return false;
         }
@@ -140,8 +140,9 @@ public static class UniTaskBuilderRecovery
                 return true;
             if (operand is not LocalVariable local || straight.LastOrDefault(i => i.Destination == local) is not { OpCode: OpCode.Move, Operands: [_, var source] })
                 return false;
-            if (source is FieldReference field && field.Local == load.Local && field.Field == load.Field
-                && field.ContainingFields.SequenceEqual(load.ContainingFields))
+            if (source is FieldReference field && field.Local == load.Local && OverwrittenMemberStoreElimination.SameField(field.Field, load.Field)
+                && field.ContainingFields.Count == load.ContainingFields.Count
+                && field.ContainingFields.Zip(load.ContainingFields).All(p => OverwrittenMemberStoreElimination.SameField(p.First, p.Second)))
                 return true;
             operand = source;
         }
