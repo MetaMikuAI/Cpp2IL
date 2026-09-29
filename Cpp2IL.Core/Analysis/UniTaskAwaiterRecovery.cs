@@ -28,16 +28,19 @@ public static class UniTaskAwaiterRecovery
             return false;
         // A status or source register only carried round a loop in phis would keep the checks alive.
         DeadCodeEliminator.RemoveDeadCopyCycles(graph);
+        // Locals with a value; a register a call clobbered has none.
+        var defined = graph.Instructions.Select(i => i.Destination).OfType<LocalVariable>().ToHashSet();
+        defined.UnionWith(method.ParameterLocals);
         var changed = false;
         foreach (var block in graph.Blocks.ToList())
-            changed |= graph.Blocks.Contains(block) && (TryIsCompleted(graph, block) || TryGetResult(graph, block));
+            changed |= graph.Blocks.Contains(block) && (TryIsCompleted(graph, block, defined) || TryGetResult(graph, block, defined));
         if (changed)
             DeadCodeEliminator.Run(method);
         return changed;
     }
 
     // head: if (a == null) goto join;  check: st = a.GetStatus(token); if (st == Pending) goto suspend; goto join
-    private static bool TryIsCompleted(ISILControlFlowGraph graph, Block head)
+    private static bool TryIsCompleted(ISILControlFlowGraph graph, Block head, HashSet<LocalVariable> defined)
     {
         if (NullTest(head) is not var (branch, awaiter, whenNull) || head.Successors.SingleOrDefault(s => s != whenNull) is not { } entry
             || Through(entry) is not ({ Predecessors: [_] } check, var passed))
@@ -52,7 +55,7 @@ public static class UniTaskAwaiterRecovery
             // The status is only seen by the check, and by the join's phis where a register carried it on.
             || graph.Blocks.Where(b => b != check).SelectMany(b => b.Instructions)
                 .Any(i => (i.OpCode != OpCode.Phi || !whenNull.Instructions.Contains(i)) && DeadCodeEliminator.UsedLocals(i).Any(l => l == status || l == pending))
-            || !SameFromBoth(whenNull, head, rejoin.LastOrDefault() ?? check, status)
+            || !SameFromBoth(whenNull, head, rejoin.LastOrDefault() ?? check, status, defined)
             || Member(awaiter, "get_IsCompleted") is not { } isCompleted)
             return false;
 
@@ -69,7 +72,7 @@ public static class UniTaskAwaiterRecovery
     }
 
     // head: if (a == null) goto whenNull (r = result);  other: r = a.GetResult(token);  both join
-    private static bool TryGetResult(ISILControlFlowGraph graph, Block head)
+    private static bool TryGetResult(ISILControlFlowGraph graph, Block head, HashSet<LocalVariable> defined)
     {
         if (NullTest(head) is not var (branch, awaiter, whenNull) || head.Successors.SingleOrDefault(s => s != whenNull) is not { } entry
             || Through(entry) is not ({ Predecessors: [_] } other, var passed))
@@ -104,7 +107,8 @@ public static class UniTaskAwaiterRecovery
         {
             // Only the result may differ between the paths, and nothing else sees the null path's values.
             if (!InlinedListAddRecovery.Same(phi.Operands[callSlot], phi.Operands[nullSlot])
-                && !(phi.Operands[callSlot] == result && phi.Operands[nullSlot] is LocalVariable or Immediate))
+                && !(phi.Operands[callSlot] == result && phi.Operands[nullSlot] is LocalVariable or Immediate)
+                && !(result == null && Clobbered(phi.Operands[callSlot], defined)))
                 return false;
         }
         if (graph.Blocks.Where(b => b != nullPath && b != other).SelectMany(b => b.Instructions)
@@ -208,13 +212,17 @@ public static class UniTaskAwaiterRecovery
         => graph.Blocks.Where(b => b != except).SelectMany(b => b.Instructions).Any(i => DeadCodeEliminator.UsedLocals(i).Any(locals.Contains));
 
     // The join's phis take the same value from the head as from the check, but for the check's own status.
-    private static bool SameFromBoth(Block join, Block head, Block check, LocalVariable status)
+    private static bool SameFromBoth(Block join, Block head, Block check, LocalVariable status, HashSet<LocalVariable> defined)
     {
         var fromHead = join.Predecessors.IndexOf(head) + 1;
         var fromCheck = join.Predecessors.IndexOf(check) + 1;
         return join.Instructions.Where(i => i.OpCode == OpCode.Phi)
-            .All(phi => phi.Operands[fromCheck] == status || InlinedListAddRecovery.Same(phi.Operands[fromHead], phi.Operands[fromCheck]));
+            .All(phi => phi.Operands[fromCheck] == status || Clobbered(phi.Operands[fromCheck], defined)
+                        || InlinedListAddRecovery.Same(phi.Operands[fromHead], phi.Operands[fromCheck]));
     }
+
+    // A register version the call's clobbering made, which holds nothing the source could see.
+    private static bool Clobbered(IOperand operand, HashSet<LocalVariable> defined) => operand is LocalVariable local && !defined.Contains(local);
 
     // The head branches to join (completed) or falls to suspend; the check block goes.
     private static void Replace(ISILControlFlowGraph graph, Block head, Block check, Block checkEdge, Block join, Block suspend)
