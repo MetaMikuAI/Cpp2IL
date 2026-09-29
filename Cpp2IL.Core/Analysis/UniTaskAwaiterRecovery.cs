@@ -49,7 +49,10 @@ public static class UniTaskAwaiterRecovery
             || !IsSource(getStatus, "Cysharp.Threading.Tasks.IUniTaskSource") || source != awaiter.Local || tested != status || condition != pending
             || check.Successors.Count != 2 || !check.Successors.Contains(suspend) || suspend == whenNull
             || Through(check.Successors.Single(b => b != suspend)) is var (reached, rejoin) && reached != whenNull
-            || Uses(graph, check, status, pending) || !SameFromBoth(whenNull, head, rejoin.LastOrDefault() ?? check)
+            // The status is only seen by the check, and by the join's phis where a register carried it on.
+            || graph.Blocks.Where(b => b != check).SelectMany(b => b.Instructions)
+                .Any(i => (i.OpCode != OpCode.Phi || !whenNull.Instructions.Contains(i)) && DeadCodeEliminator.UsedLocals(i).Any(l => l == status || l == pending))
+            || !SameFromBoth(whenNull, head, rejoin.LastOrDefault() ?? check, status)
             || Member(awaiter, "get_IsCompleted") is not { } isCompleted)
             return false;
 
@@ -204,12 +207,13 @@ public static class UniTaskAwaiterRecovery
     private static bool Uses(ISILControlFlowGraph graph, Block except, params LocalVariable[] locals)
         => graph.Blocks.Where(b => b != except).SelectMany(b => b.Instructions).Any(i => DeadCodeEliminator.UsedLocals(i).Any(locals.Contains));
 
-    // The join's phis take the same value from the head as from the check.
-    private static bool SameFromBoth(Block join, Block head, Block check)
+    // The join's phis take the same value from the head as from the check, but for the check's own status.
+    private static bool SameFromBoth(Block join, Block head, Block check, LocalVariable status)
     {
         var fromHead = join.Predecessors.IndexOf(head) + 1;
         var fromCheck = join.Predecessors.IndexOf(check) + 1;
-        return join.Instructions.Where(i => i.OpCode == OpCode.Phi).All(phi => InlinedListAddRecovery.Same(phi.Operands[fromHead], phi.Operands[fromCheck]));
+        return join.Instructions.Where(i => i.OpCode == OpCode.Phi)
+            .All(phi => phi.Operands[fromCheck] == status || InlinedListAddRecovery.Same(phi.Operands[fromHead], phi.Operands[fromCheck]));
     }
 
     // The head branches to join (completed) or falls to suspend; the check block goes.
