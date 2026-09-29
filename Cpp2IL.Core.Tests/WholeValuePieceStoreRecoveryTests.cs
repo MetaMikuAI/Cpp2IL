@@ -48,4 +48,19 @@ public class WholeValuePieceStoreRecoveryTests
         Assert.That(WholeValuePieceStoreRecovery.Run(method), Is.EqualTo(recovered));
         Assert.That(store.Operands[1], recovered ? Is.SameAs(result) : Is.InstanceOf<FieldReference>());
     }
+
+    [Test]
+    public void FirstMemberReturned_FromAMethodReturningTheStruct_IsTheWholeValue()
+    {
+        var result = Local("result", pair);
+        var ret = new Instruction(0, OpCode.Return, new FieldReference(first, result, 0));
+        var method = new InjectedMethodAnalysisContext(app.SystemTypes.SystemObjectType, "Get", pair, MethodAttributes.Public | MethodAttributes.Static, [])
+        {
+            Locals = [result], ParameterLocals = [],
+            ControlFlowGraph = new ISILControlFlowGraph(new List<Instruction> { ret }),
+        };
+
+        Assert.That(WholeValuePieceStoreRecovery.Run(method), Is.True);
+        Assert.That(ret.Operands[0], Is.SameAs(result));
+    }
 }

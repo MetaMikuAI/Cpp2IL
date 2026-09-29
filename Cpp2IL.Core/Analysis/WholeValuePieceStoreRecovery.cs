@@ -43,6 +43,15 @@ public static class WholeValuePieceStoreRecovery
                 continue;
             }
 
+            // A struct returned in registers: the return type names what they hold.
+            if (instruction is { OpCode: OpCode.Return, Operands: [FieldReference returned] }
+                && method.ReturnType is { IsValueType: true } returnType && Whole(returned, returnType) is { } wholeReturned)
+            {
+                instruction.SetOperands(wholeReturned);
+                changed = true;
+                continue;
+            }
+
             // A struct argument: the parameter's type names what the registers hold.
             if (instruction is not { OpCode: OpCode.Call or OpCode.CallVoid } || instruction.Operands[0] is not MethodAnalysisContext callee)
                 continue;
@@ -112,9 +121,12 @@ public static class WholeValuePieceStoreRecovery
             whole = piece.Local;
             wholeType = piece.Local.Type;
         }
-        return wholeType is { IsValueType: true } && wholeType.FullName == expected.FullName
-               && FirstMember(wholeType) is { } firstMember && firstMember.Name == piece.Field.Name
-            ? whole : null;
+        if (wholeType is not { IsValueType: true } || FirstMember(wholeType) is not { } firstMember || firstMember.Name != piece.Field.Name)
+            return null;
+        if (wholeType.FullName == expected.FullName)
+            return whole;
+        // The first member of a first member: playable.m_Handle.m_Handle is still the playable.
+        return whole is FieldReference outer ? Whole(outer, expected) : null;
     }
 
     private static TypeAnalysisContext? TargetType(IOperand target) => target switch
@@ -124,13 +136,13 @@ public static class WholeValuePieceStoreRecovery
         _ => null,
     };
 
-    // The member at offset 0: the first instance field, of a struct with more than one.
+    // The member at offset 0: the first instance field of a struct.
     private static FieldAnalysisContext? FirstMember(TypeAnalysisContext type)
     {
         var definition = (type as GenericInstanceTypeAnalysisContext)?.GenericType ?? type;
         if (definition.IsEnumType)
             return null;
         var fields = definition.Fields.Where(f => !f.IsStatic).ToList();
-        return fields.Count > 1 ? fields[0] : null;
+        return fields.Count > 0 ? fields[0] : null;
     }
 }
