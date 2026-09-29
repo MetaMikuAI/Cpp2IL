@@ -77,7 +77,7 @@ public static class InlinedListAddRecovery
             };
         if (size is not LocalVariable sizeLocal || length is not ArrayLength { Array: var items }
             || target != (jumpsWhenFull ? slow : fast)
-            || !Loads(straight, sizeLocal, list, "_size") || !Loads(straight, items, list, "_items"))
+            || !Loads(graph, straight, sizeLocal, list, "_size") || !Loads(graph, straight, items, list, "_items"))
             return false;
 
         // list._version = list._version + 1, on the way to the branch.
@@ -85,7 +85,7 @@ public static class InlinedListAddRecovery
                                                                    && IsListField(f, list, "_version"));
         if (versionStore == null || Definition(straight, (LocalVariable)versionStore.Operands[1]) is not
                 { OpCode: OpCode.Add, Operands: [_, LocalVariable oldVersion, Immediate { Value: 1 }] }
-            || !Loads(straight, oldVersion, list, "_version"))
+            || !Loads(graph, straight, oldVersion, list, "_version"))
             return false;
 
         // The fast arm: size + 1 into list._size, the item into items[size].
@@ -266,6 +266,28 @@ public static class InlinedListAddRecovery
 
     internal static bool Loads(List<Instruction> instructions, LocalVariable local, LocalVariable list, string field)
         => Definition(instructions, local) is { OpCode: OpCode.Move, Operands: [_, FieldReference f] } && IsListField(f, list, field);
+
+    // As above, or a phi of such loads: the paths into a join each read the field, nothing after the read
+    // on its path (a call) able to change it before the join.
+    private static bool Loads(ISILControlFlowGraph graph, List<Instruction> instructions, LocalVariable local, LocalVariable list, string field)
+    {
+        if (Loads(instructions, local, list, field))
+            return true;
+        if (Definition(instructions, local) is not { OpCode: OpCode.Phi } phi
+            || graph.Blocks.FirstOrDefault(b => b.Instructions.Contains(phi)) is not { } join
+            || phi.Operands.Count != join.Predecessors.Count + 1)
+            return false;
+        for (var i = 1; i < phi.Operands.Count; i++)
+        {
+            var path = join.Predecessors[i - 1].Instructions;
+            if (phi.Operands[i] is not LocalVariable incoming
+                || path.LastOrDefault(x => x.Destination == incoming) is not { OpCode: OpCode.Move, Operands: [_, FieldReference f] } read
+                || !IsListField(f, list, field)
+                || path.Skip(path.IndexOf(read) + 1).Any(x => x.IsCall))
+                return false;
+        }
+        return true;
+    }
 
     internal static bool IsListField(FieldReference reference, LocalVariable list, string name)
     {
