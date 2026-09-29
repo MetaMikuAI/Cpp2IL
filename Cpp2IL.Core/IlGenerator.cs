@@ -1195,7 +1195,16 @@ public static class IlGenerator
                     && (DestinationType(instruction.Operands[0]) is not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext)
                         || IsAddress(instruction.Operands[1]) && instruction.Operands[2] is not Immediate
                         || IsAddress(instruction.Operands[2]) && instruction.Operands[1] is not Immediate);
-                LoadOperand(instruction.Operands[1], method, locals, writeLine, integerLiteralType);
+                // A class pointer against an integer, e.g. a klass read or its null check: the type's handle value.
+                bool IsInteger(IOperand operand) => operand is Immediate
+                    || operand is LocalVariable integer && locals.TryGetValue(integer, out var cil)
+                    && cil.VariableType.ElementType is ElementType.I or ElementType.U or ElementType.Ptr;
+                bool IsClassPointer(int index) => instruction.Operands[index] is TypeAnalysisContext type && IsPlainType(type)
+                    && IsInteger(instruction.Operands[3 - index]);
+                if (IsClassPointer(1))
+                    LoadTypeHandleValue((TypeAnalysisContext)instruction.Operands[1], method);
+                else
+                    LoadOperand(instruction.Operands[1], method, locals, writeLine, integerLiteralType);
                 if (pointerArithmetic && IsReferenceLocal(instruction.Operands[1])) instructions.Add(CilOpCodes.Conv_I);
                 if (addressArithmetic && IsAddress(instruction.Operands[1]))
                     instructions.Add(CilOpCodes.Conv_U);
@@ -1213,7 +1222,10 @@ public static class IlGenerator
                         "System.UInt64" => CilOpCodes.Conv_U8,
                         _ => throw new InvalidOperationException($"Invalid native shift type: {shiftType}")
                     });
-                LoadOperand(instruction.Operands[2], method, locals, writeLine, integerLiteralType);
+                if (IsClassPointer(2))
+                    LoadTypeHandleValue((TypeAnalysisContext)instruction.Operands[2], method);
+                else
+                    LoadOperand(instruction.Operands[2], method, locals, writeLine, integerLiteralType);
                 if (pointerArithmetic && IsReferenceLocal(instruction.Operands[2])) instructions.Add(CilOpCodes.Conv_I);
                 if (addressArithmetic && IsAddress(instruction.Operands[2]))
                     instructions.Add(CilOpCodes.Conv_U);
