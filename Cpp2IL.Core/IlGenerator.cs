@@ -1184,11 +1184,14 @@ public static class IlGenerator
                 static bool IsAddress(IOperand operand) => operand is AddressOf or LocalVariable { Type: ByRefTypeAnalysisContext };
                 var addressArithmetic = instruction.OpCode is OpCode.Add or OpCode.Subtract
                     && (DestinationType(instruction.Operands[0]) is not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext)
-                        || IsAddress(instruction.Operands[1]) && IsAddress(instruction.Operands[2]));
+                        || IsAddress(instruction.Operands[1]) && instruction.Operands[2] is not Immediate
+                        || IsAddress(instruction.Operands[2]) && instruction.Operands[1] is not Immediate);
                 LoadOperand(instruction.Operands[1], method, locals, writeLine, integerLiteralType);
                 if (pointerArithmetic && IsReferenceLocal(instruction.Operands[1])) instructions.Add(CilOpCodes.Conv_I);
-                if (addressArithmetic && (instruction.Operands[1] is AddressOf || IsAddress(instruction.Operands[1]) && IsAddress(instruction.Operands[2])))
+                if (addressArithmetic && IsAddress(instruction.Operands[1]))
                     instructions.Add(CilOpCodes.Conv_U);
+                else if (addressArithmetic && instruction.Operands[1] is LocalVariable && IsAddress(instruction.Operands[2]))
+                    instructions.Add(CilOpCodes.Conv_I);
                 if (comparisonConversion is { } compareConv1) instructions.Add(compareConv1);
                 if (floatConversion is { } conv1)
                     instructions.Add(conv1);
@@ -1203,8 +1206,10 @@ public static class IlGenerator
                     });
                 LoadOperand(instruction.Operands[2], method, locals, writeLine, integerLiteralType);
                 if (pointerArithmetic && IsReferenceLocal(instruction.Operands[2])) instructions.Add(CilOpCodes.Conv_I);
-                if (addressArithmetic && (instruction.Operands[2] is AddressOf || IsAddress(instruction.Operands[1]) && IsAddress(instruction.Operands[2])))
+                if (addressArithmetic && IsAddress(instruction.Operands[2]))
                     instructions.Add(CilOpCodes.Conv_U);
+                else if (addressArithmetic && instruction.Operands[2] is LocalVariable && IsAddress(instruction.Operands[1]))
+                    instructions.Add(CilOpCodes.Conv_I);
                 if (comparisonConversion is { } compareConv2) instructions.Add(compareConv2);
                 if (floatConversion is { } conv2)
                     instructions.Add(conv2);

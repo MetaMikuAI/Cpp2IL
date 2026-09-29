@@ -150,38 +150,69 @@ public static class MergedBaseSplitRecovery
         for (var index = 0; index < block.Instructions.Count; index++)
         {
             var load = block.Instructions[index];
-            if (load is not { OpCode: OpCode.Move, Operands: [LocalVariable loaded, MemoryOperand { Base: LocalVariable { Type: { } baseType } baseLocal, Index: LocalVariable offsetLocal, Scale: 0 or 1 } memory] }
+            // A read into a local, or returned straight away.
+            var (operandIndex, loadedType) = load switch
+            {
+                { OpCode: OpCode.Move, Operands: [LocalVariable l, MemoryOperand] } => (1, l.Type),
+                { OpCode: OpCode.Return, Operands: [MemoryOperand] } => (0, method.ReturnType),
+                _ => (-1, null),
+            };
+            if (operandIndex < 0 || load.Operands[operandIndex] is not MemoryOperand { Base: LocalVariable { Type: { } baseType } baseLocal, Index: LocalVariable offsetLocal, Scale: 0 or 1 } memory
                 || !IsBase(baseType) || !picked.TryGetValue(offsetLocal, out var pick))
                 continue;
             var merge = pick.Merge;
             dominators ??= new DominatorInfo(graph);
-            // The base must be available on every path into the merge.
+            // The base must be available on every path into the merge, or be a class's static storage loaded
+            // in the merge from the class merged in a phi, which each path can load from its own class value.
+            List<IOperand>? classes = null;
+            MemoryOperand storageLoad = default;
             if (definitions.TryGetValue(baseLocal, out var baseDefinition)
                 && (!home.TryGetValue(baseDefinition, out var baseBlock) || baseBlock == merge || !dominators.Dominates(baseBlock, merge)))
-                continue;
+            {
+                if (baseType is not StaticFieldStorageTypeAnalysisContext || baseBlock != merge
+                    || baseDefinition is not { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Base: LocalVariable klass, Index: null, Scale: 0 } fromClass] }
+                    || !definitions.TryGetValue(klass, out var classDefinition) || classDefinition.OpCode != OpCode.Phi
+                    || !home.TryGetValue(classDefinition, out var classBlock) || classBlock != merge
+                    || classDefinition.Operands.Count - 1 != merge.Predecessors.Count
+                    || merge.Instructions.IndexOf(baseDefinition) > (merge == block ? index : merge.Instructions.Count))
+                    continue;
+                classes = classDefinition.Operands.Skip(1).ToList();
+                storageLoad = fromClass;
+            }
             if (!dominators.Dominates(merge, block) || !Quiet(merge, block, load))
                 continue;
 
             var values = new List<IOperand>();
             for (var i = 0; i < merge.Predecessors.Count; i++)
             {
+                var storage = baseLocal;
+                if (classes != null)
+                {
+                    var storageName = $"splitStorage{method.Locals.Count}";
+                    storage = new LocalVariable(storageName, new Register(null, storageName), baseType);
+                    method.Locals.Add(storage);
+                    var storageRead = new Instruction(load.Index, OpCode.Move, storage,
+                        new MemoryOperand(classes[i], null, storageLoad.Addend, 0, storageLoad.AccessSize)) { NativeAddress = load.NativeAddress };
+                    InsertBeforeTerminator(merge.Predecessors[i], storageRead);
+                    home[storageRead] = merge.Predecessors[i];
+                }
                 var name = $"splitRead{method.Locals.Count}";
-                var value = new LocalVariable(name, new Register(null, name), loaded.Type);
+                var value = new LocalVariable(name, new Register(null, name), loadedType);
                 method.Locals.Add(value);
                 var read = new Instruction(load.Index, OpCode.Move, value,
-                    new MemoryOperand(baseLocal, null, pick.Offsets[i] + memory.Addend, 0, memory.AccessSize)) { NativeAddress = load.NativeAddress };
+                    new MemoryOperand(storage, null, pick.Offsets[i] + memory.Addend, 0, memory.AccessSize)) { NativeAddress = load.NativeAddress };
                 InsertBeforeTerminator(merge.Predecessors[i], read);
                 home[read] = merge.Predecessors[i];
                 values.Add(value);
             }
             var phiName = $"splitPhi{method.Locals.Count}";
-            var joined = new LocalVariable(phiName, new Register(null, phiName), loaded.Type);
+            var joined = new LocalVariable(phiName, new Register(null, phiName), loadedType);
             method.Locals.Add(joined);
             var join = new Instruction(-1, OpCode.Phi, [joined, .. values]);
             merge.Instructions.Insert(merge.Instructions.FindLastIndex(i => i.OpCode == OpCode.Phi) + 1, join);
             home[join] = merge;
             if (merge == block) index++;
-            load.SetOperands(loaded, joined);
+            load.SetOperand(operandIndex, joined);
             changed = true;
         }
         return changed;
