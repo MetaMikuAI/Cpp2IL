@@ -100,8 +100,9 @@ public class StackBoxingRecoveryTests
             case "headerWidth": header.SetOperand(0, new StackOffset(-32, 4)); break;
             case "payloadWidth": payload.SetOperand(0, new StackOffset(-16, 8)); break;
             case "missingPath": payload.OpCode = OpCode.Nop; payload.SetOperands(); break;
-            case "indirectCall": block.Instructions.Insert(0, new(9, OpCode.IndirectCall, new Register(null, "callee"), new Register(null, "result"))); break;
-            case "call": block.Instructions.Insert(0, new(9, OpCode.CallVoid, new Immediate(123))); break;
+            // A call that is handed the box's address could write it.
+            case "indirectCall": block.Instructions.Insert(0, new(9, OpCode.IndirectCall, new Register(null, "callee"), new Register(null, "result"), new AddressOf(new StackOffset(-32)))); break;
+            case "call": block.Instructions.Insert(0, new(9, OpCode.CallVoid, new Immediate(123), new AddressOf(new StackOffset(-32)))); break;
             case "unknownWrite": block.Instructions.Insert(0, new(9, OpCode.Move, new MemoryOperand(new Register(null, "pointer")), new Immediate(0))); break;
             case "partialOverwrite": block.Instructions.Insert(0, new(9, OpCode.Move, new StackOffset(-15, 1), new Immediate(0))); break;
             case "otherMethod": call.SetOperand(0, _app.SystemTypes.EnumType.Methods.Single(m => m.Name == "GetHashCode")); break;
@@ -109,6 +110,16 @@ public class StackBoxingRecoveryTests
         }
         StackBoxingRecovery.Run(method);
         Assert.That(method.ControlFlowGraph.Instructions.Any(i => i.OpCode == OpCode.Box), Is.False);
+    }
+
+    [Test]
+    public void CallsThatNeverSeeTheBoxAddress_DoNotInvalidateIt()
+    {
+        var (method, call, _, _, _) = Create(branch: true);
+        var block = method.ControlFlowGraph!.Blocks.Single(b => b.Instructions.Contains(call));
+        block.Instructions.Insert(0, new(9, OpCode.CallVoid, new Immediate(123)));
+        StackBoxingRecovery.Run(method);
+        Assert.That(method.ControlFlowGraph.Instructions.Any(i => i.OpCode == OpCode.Box), Is.True);
     }
 
     [TestCase(false)]
