@@ -1300,7 +1300,8 @@ public static class IlGenerator
                     case OpCode.Xor: instructions.Add(CilOpCodes.Xor); break;
                 }
 
-                StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+                if (!StorePackedStruct(instruction.Operands[0], method, locals, context.AppContext.Binary.PointerSizeBytes))
+                    StoreToOperand(instruction.Operands[0], method, locals, writeLine);
                 break;
 
             case OpCode.Not:
@@ -1926,6 +1927,26 @@ public static class IlGenerator
         method.CilMethodBody.Instructions.Add(CilOpCodes.Stloc, temporary);
         method.CilMethodBody.Instructions.Add(CilOpCodes.Ldloca, temporary);
         method.CilMethodBody.Instructions.Add(CilOpCodes.Call, call.ToMethodDescriptor());
+    }
+
+    // An integer on the stack stored into a packed struct local: its bytes written through the struct's
+    // storage, *(long*)&position = value. Returns false for any other destination.
+    private static bool StorePackedStruct(IOperand destination, MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals, int pointerSize)
+    {
+        if (destination is not LocalVariable { IsThis: false, Type: { IsValueType: true, IsEnumType: false } type } local
+            || type.Type is not (Il2CppTypeEnum.IL2CPP_TYPE_VALUETYPE or Il2CppTypeEnum.IL2CPP_TYPE_GENERICINST)
+            || !locals.TryGetValue(local, out var target) || TypeSizes.UnboxedSize(type, pointerSize) is not (4 or 8) and var _)
+            return false;
+        var size = TypeSizes.UnboxedSize(type, pointerSize);
+        var body = method.CilMethodBody!;
+        var value = new CilLocalVariable(size == 8 ? method.DeclaringModule!.CorLibTypeFactory.Int64 : method.DeclaringModule!.CorLibTypeFactory.Int32);
+        body.LocalVariables.Add(value);
+        body.Instructions.Add(size == 8 ? CilOpCodes.Conv_I8 : CilOpCodes.Conv_I4);
+        body.Instructions.Add(CilOpCodes.Stloc, value);
+        body.Instructions.Add(CilOpCodes.Ldloca, target);
+        body.Instructions.Add(CilOpCodes.Ldloc, value);
+        body.Instructions.Add(size == 8 ? CilOpCodes.Stind_I8 : CilOpCodes.Stind_I4);
+        return true;
     }
 
     /// <summary>
