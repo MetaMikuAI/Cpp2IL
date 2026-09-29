@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Linq;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using AsmResolver.DotNet;
@@ -82,6 +83,41 @@ public class ProvenGetterReadRecoveryTests
         Assert.That(ProvenGetterReadRecovery.Recover(module).Reads, Is.EqualTo(recovered ? 1 : 0));
         if (recovered)
             Assert.That((read.OpCode, read.Operand), Is.EqualTo((CilOpCodes.Call, (object)getter)), "a struct's getter is called, not called virtually");
+    }
+
+    [TestCase(true)]
+    [TestCase(false)]
+    public void StoreFromAnotherType_GoesThroughTheProvenSetter(bool trivial)
+    {
+        var (module, field, _, reader, _) = Build();
+        var owner = field.DeclaringType!;
+        var setter = new MethodDefinition("set_Value", MethodAttributes.Public | MethodAttributes.SpecialName,
+            MethodSignature.CreateInstance(module.CorLibTypeFactory.Void, [module.CorLibTypeFactory.Int32]));
+        owner.Methods.Add(setter);
+        setter.CilMethodBody = new CilMethodBody { ComputeMaxStackOnBuild = true };
+        setter.CilMethodBody.Instructions.Add(CilOpCodes.Ldarg_0);
+        // As generated: the value parameter in its long form.
+        setter.CilMethodBody.Instructions.Add(CilOpCodes.Ldarg, setter.Parameters[0]);
+        if (!trivial)
+        {
+            setter.CilMethodBody.Instructions.Add(CilOpCodes.Ldc_I4_1);
+            setter.CilMethodBody.Instructions.Add(CilOpCodes.Add);
+        }
+        setter.CilMethodBody.Instructions.Add(CilOpCodes.Stfld, field);
+        setter.CilMethodBody.Instructions.Add(CilOpCodes.Ret);
+        owner.Properties.Single(p => p.Name == "Value").SetMethod = setter;
+        var writer = new MethodDefinition("Write", MethodAttributes.Public | MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Void, [owner.ToTypeSignature()]));
+        reader.DeclaringType!.Methods.Add(writer);
+        writer.CilMethodBody = new CilMethodBody { ComputeMaxStackOnBuild = true };
+        writer.CilMethodBody.Instructions.Add(CilOpCodes.Ldarg_0);
+        writer.CilMethodBody.Instructions.Add(CilOpCodes.Ldc_I4_5);
+        var store = writer.CilMethodBody.Instructions.Add(CilOpCodes.Stfld, field);
+        writer.CilMethodBody.Instructions.Add(CilOpCodes.Ret);
+
+        ProvenGetterReadRecovery.Recover(module);
+
+        Assert.That(store.OpCode, Is.EqualTo(trivial ? CilOpCodes.Callvirt : CilOpCodes.Stfld));
     }
 
     [Test]
