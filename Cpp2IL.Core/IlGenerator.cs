@@ -605,10 +605,12 @@ public static class IlGenerator
     {
         var types = context.AppContext.SystemTypes;
         bool Untyped(LocalVariable local) => local.Type == null || local.Type == types.SystemVoidType;
+        // Booleans, chars and enums are integers on the evaluation stack too, e.g. a flag masked with & 1.
         bool IntegerType(TypeAnalysisContext? type) => type != null && (type == types.SystemInt32Type || type == types.SystemInt64Type
             || type == types.SystemUInt32Type || type == types.SystemUInt64Type || type == types.SystemIntPtrType
             || type == types.SystemUIntPtrType || type == types.SystemInt16Type || type == types.SystemUInt16Type
-            || type == types.SystemByteType || type == types.SystemSByteType);
+            || type == types.SystemByteType || type == types.SystemSByteType
+            || type == types.SystemBooleanType || type == types.SystemCharType || type.IsEnumType);
 
         var definitions = new Dictionary<LocalVariable, List<Instruction>>();
         foreach (var instruction in context.ControlFlowGraph!.Instructions)
